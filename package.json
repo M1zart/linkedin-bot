@@ -1,0 +1,12 @@
+{
+  "name": "linkedin-post-generator",
+  "version": "1.0.0",
+  "description": "LinkedIn post generator mini app",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
