@@ -655,6 +655,7 @@ Pragmatic выбрали честность перед собой. Редкое 
       toast.classList.add('show');
       setTimeout(() => toast.classList.remove('show'), 2000);
     }
+    function showResult(text) {
       const box = document.getElementById('result-box');
       document.getElementById('result-text').textContent = text;
       document.getElementById('char-count').textContent = text.length + ' символов';
