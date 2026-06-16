@@ -302,6 +302,42 @@
     .error-msg.show {
       display: block;
     }
+
+    .comments-result-box {
+      display: none;
+    }
+
+    .comments-result-box.show {
+      display: block;
+    }
+
+    .comment-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 14px;
+      margin-bottom: 12px;
+    }
+
+    .comment-card-label {
+      font-size: 11px;
+      font-weight: 700;
+      color: var(--accent);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      margin-bottom: 8px;
+    }
+
+    .comment-card-text {
+      font-size: 14px;
+      line-height: 1.5;
+      margin-bottom: 12px;
+      white-space: pre-wrap;
+    }
+
+    .comment-copy-btn {
+      width: 100%;
+    }
   </style>
 </head>
 <body>
@@ -317,6 +353,7 @@
   <div class="mode-tabs">
     <button class="tab active" onclick="switchMode('topic')">По теме</button>
     <button class="tab" onclick="switchMode('thought')">Из мысли</button>
+    <button class="tab" onclick="switchMode('comment')">Комментарий</button>
   </div>
 
   <!-- Режим 1: По теме -->
@@ -349,6 +386,14 @@
     <button class="generate-btn" onclick="generate('thought')">Оформить в пост</button>
   </div>
 
+  <!-- Режим 3: Комментарий -->
+  <div id="mode-comment" class="mode-panel">
+    <div class="field-label">Пост на который комментируешь</div>
+    <textarea id="comment-input" placeholder="Вставь текст чужого поста целиком..."></textarea>
+
+    <button class="generate-btn" onclick="generate('comment')">Сгенерировать комментарии</button>
+  </div>
+
   <div class="loading" id="loading">
     <div class="spinner"></div>
     <div>Пишу пост...</div>
@@ -369,6 +414,11 @@
   </div>
 
   <div class="copy-toast" id="copy-toast">Скопировано!</div>
+
+  <div class="comments-result-box" id="comments-result-box">
+    <div class="result-label" style="margin-bottom: 12px;">Варианты комментариев</div>
+    <div id="comments-list"></div>
+  </div>
 
   <script>
     // Init Telegram WebApp
@@ -421,12 +471,14 @@ Pragmatic выбрали честность перед собой. Редкое 
 
     function switchMode(mode) {
       currentMode = mode;
+      const tabOrder = ['topic', 'thought', 'comment'];
       document.querySelectorAll('.tab').forEach((t, i) => {
-        t.classList.toggle('active', (i === 0 && mode === 'topic') || (i === 1 && mode === 'thought'));
+        t.classList.toggle('active', tabOrder[i] === mode);
       });
       document.querySelectorAll('.mode-panel').forEach(p => p.classList.remove('active'));
       document.getElementById(`mode-${mode}`).classList.add('active');
       hideResult();
+      hideCommentsResult();
     }
 
     document.querySelectorAll('.tone-selector').forEach(selector => {
@@ -448,26 +500,36 @@ Pragmatic выбрали честность перед собой. Редкое 
     let lastTone = '';
 
     async function generate(mode) {
-      const input = mode === 'topic'
-        ? document.getElementById('topic-input').value.trim()
-        : document.getElementById('thought-input').value.trim();
+      let input;
+      if (mode === 'topic') input = document.getElementById('topic-input').value.trim();
+      else if (mode === 'thought') input = document.getElementById('thought-input').value.trim();
+      else input = document.getElementById('comment-input').value.trim();
 
       if (!input) {
-        showError(mode === 'topic' ? 'Введи тему поста' : 'Накидай мысль');
+        const msg = mode === 'topic' ? 'Введи тему поста' : mode === 'thought' ? 'Накидай мысль' : 'Вставь текст поста';
+        showError(msg);
         return;
       }
 
-      const tone = getSelectedTone(mode);
+      const tone = mode === 'comment' ? '' : getSelectedTone(mode);
       lastMode = mode;
       lastInput = input;
       lastTone = tone;
 
-      await callAPI(mode, input, tone);
+      if (mode === 'comment') {
+        await callCommentsAPI(input);
+      } else {
+        await callAPI(mode, input, tone);
+      }
     }
 
     async function regenerate() {
       if (lastInput) {
-        await callAPI(lastMode, lastInput, lastTone);
+        if (lastMode === 'comment') {
+          await callCommentsAPI(lastInput);
+        } else {
+          await callAPI(lastMode, lastInput, lastTone);
+        }
       }
     }
 
@@ -506,7 +568,93 @@ Pragmatic выбрали честность перед собой. Редкое 
       }
     }
 
-    function showResult(text) {
+    async function callCommentsAPI(postText) {
+      showLoading();
+      hideResult();
+      hideCommentsResult();
+      hideError();
+
+      try {
+        const response = await fetch('/api/comments', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ postText })
+        });
+
+        const data = await response.json();
+
+        if (!response.ok || data.error) {
+          throw new Error(data.error || 'Ошибка API');
+        }
+
+        const comments = data.comments;
+        if (!comments || !comments.length) throw new Error('Пустой ответ');
+
+        showCommentsResult(comments);
+
+      } catch (err) {
+        showError('Ошибка: ' + err.message);
+      } finally {
+        hideLoading();
+      }
+    }
+
+    function showCommentsResult(comments) {
+      const box = document.getElementById('comments-result-box');
+      const list = document.getElementById('comments-list');
+      list.innerHTML = '';
+
+      comments.forEach((c, i) => {
+        const card = document.createElement('div');
+        card.className = 'comment-card';
+        card.innerHTML = `
+          <div class="comment-card-label">${c.label || 'Вариант ' + (i + 1)}</div>
+          <div class="comment-card-text">${escapeHtml(c.text)}</div>
+          <button class="action-btn primary comment-copy-btn" data-text="${escapeAttr(c.text)}">📋 Копировать</button>
+        `;
+        list.appendChild(card);
+      });
+
+      document.querySelectorAll('.comment-copy-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+          copyText(btn.dataset.text);
+        });
+      });
+
+      box.classList.add('show');
+      box.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    }
+
+    function hideCommentsResult() {
+      const box = document.getElementById('comments-result-box');
+      if (box) box.classList.remove('show');
+    }
+
+    function escapeHtml(str) {
+      const div = document.createElement('div');
+      div.textContent = str;
+      return div.innerHTML;
+    }
+
+    function escapeAttr(str) {
+      return str.replace(/"/g, '&quot;');
+    }
+
+    async function copyText(text) {
+      try {
+        await navigator.clipboard.writeText(text);
+      } catch {
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand('copy');
+        document.body.removeChild(ta);
+      }
+      const toast = document.getElementById('copy-toast');
+      toast.classList.add('show');
+      setTimeout(() => toast.classList.remove('show'), 2000);
+    }
       const box = document.getElementById('result-box');
       document.getElementById('result-text').textContent = text;
       document.getElementById('char-count').textContent = text.length + ' символов';
