@@ -79,6 +79,11 @@ const server = http.createServer(async (req, res) => {
       try {
         const { postText } = JSON.parse(body);
 
+        const detectedLang = detectLanguage(postText);
+        const langInstruction = detectedLang === 'uk' ? 'Всі 7 коментарів пиши ВИКЛЮЧНО українською мовою.' 
+          : detectedLang === 'en' ? 'Write ALL 7 comments EXCLUSIVELY in English.'
+          : 'Все 7 комментариев пиши ИСКЛЮЧИТЕЛЬНО на русском языке.';
+
         const response = await fetch('https://api.anthropic.com/v1/messages', {
           method: 'POST',
           headers: {
@@ -90,7 +95,7 @@ const server = http.createServer(async (req, res) => {
             model: 'claude-sonnet-4-5',
             max_tokens: 1200,
             system: getCommentsSystemPrompt(),
-            messages: [{ role: 'user', content: `Вот пост на который нужно написать комментарии:\n\n"${postText}"\n\nНапомню: все 7 комментариев должны быть на том же языке на котором написан этот пост.` }]
+            messages: [{ role: 'user', content: `${langInstruction}\n\nВот пост:\n\n"${postText}"` }]
           })
         });
 
@@ -119,6 +124,21 @@ const server = http.createServer(async (req, res) => {
   res.writeHead(404);
   res.end('Not found');
 });
+
+function detectLanguage(text) {
+  const sample = text.slice(0, 500);
+  // Count Ukrainian-specific chars
+  const ukChars = (sample.match(/[іїєґІЇЄҐ]/g) || []).length;
+  // Count Cyrillic chars
+  const cyrillicChars = (sample.match(/[а-яёА-ЯЁ]/g) || []).length;
+  // Count Latin chars
+  const latinChars = (sample.match(/[a-zA-Z]/g) || []).length;
+
+  if (ukChars >= 2) return 'uk';
+  if (cyrillicChars > latinChars) return 'ru';
+  if (latinChars > cyrillicChars * 2) return 'en';
+  return 'ru';
+}
 
 function parseComments(raw) {
   // Expects format: [LABEL] text \n\n [LABEL] text ...
