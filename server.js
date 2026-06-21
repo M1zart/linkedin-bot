@@ -4,6 +4,8 @@ const path = require('path');
 
 const PORT = process.env.PORT || 3000;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+const NOTION_API_KEY = process.env.NOTION_API_KEY;
+const NOTION_DATABASE_ID = 'a81c0118449d47388b3fb612a509cd38';
 
 const server = http.createServer(async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -112,6 +114,108 @@ const server = http.createServer(async (req, res) => {
 
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ comments }));
+
+      } catch (err) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    });
+    return;
+  }
+
+  if (req.method === 'POST' && req.url === '/api/save-case') {
+    let body = '';
+    req.on('data', chunk => body += chunk);
+    req.on('end', async () => {
+      try {
+        const { storyType, company, answers, makePost } = JSON.parse(body);
+
+        // Build full answers text
+        const fullAnswersText = answers.map((a, i) => `${i + 1}. ${a.question}\n${a.answer}`).join('\n\n');
+
+        // Get a short summary + tags from Claude
+        const analysisResponse = await fetch('https://api.anthropic.com/v1/messages', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-api-key': ANTHROPIC_API_KEY,
+            'anthropic-version': '2023-06-01',
+          },
+          body: JSON.stringify({
+            model: 'claude-sonnet-4-5',
+            max_tokens: 300,
+            system: `Ты помогаешь каталогизировать истории из карьеры Дмитрия, Head of Sportsbook в iGaming. По ответам на вопросы интервью сформируй:
+1. Короткий заголовок истории (5-8 слов, без кавычек)
+2. Выжимку в 1-2 предложения для быстрого скана списка
+3. До 4 тегов из набора: риск, CRM, трейдинг, продукт, лидерство, платежи, бонусы, команда
+
+Формат ответа строго JSON без markdown форматирования:
+{"title": "...", "summary": "...", "tags": ["...", "..."]}`,
+            messages: [{ role: 'user', content: fullAnswersText }]
+          })
+        });
+
+        const analysisData = await analysisResponse.json();
+        const analysisText = analysisData.content?.[0]?.text || '{}';
+        let analysis;
+        try {
+          analysis = JSON.parse(analysisText.replace(/```json\n?|```/g, '').trim());
+        } catch {
+          analysis = { title: storyType + ' — ' + company, summary: '', tags: [] };
+        }
+
+        // Save to Notion
+        const notionResponse = await fetch('https://api.notion.com/v1/pages', {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${NOTION_API_KEY}`,
+            'Content-Type': 'application/json',
+            'Notion-Version': '2022-06-28',
+          },
+          body: JSON.stringify({
+            parent: { data_source_id: 'a81c0118-449d-4738-8b3f-b612a509cd38' },
+            properties: {
+              'Title': { title: [{ text: { content: analysis.title || (storyType + ' — ' + company) } }] },
+              'Story Type': { select: { name: storyType } },
+              'Company': { select: { name: company } },
+              'Topic Tags': { multi_select: (analysis.tags || []).map(t => ({ name: t })) },
+              'Raw Summary': { rich_text: [{ text: { content: analysis.summary || '' } }] },
+              'Full Answers': { rich_text: [{ text: { content: fullAnswersText.slice(0, 2000) } }] },
+              'Used In Post': { checkbox: false }
+            }
+          })
+        });
+
+        const notionData = await notionResponse.json();
+
+        if (!notionResponse.ok) {
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: notionData.message || 'Notion API error' }));
+          return;
+        }
+
+        let postText = null;
+        if (makePost) {
+          const postResponse = await fetch('https://api.anthropic.com/v1/messages', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'x-api-key': ANTHROPIC_API_KEY,
+              'anthropic-version': '2023-06-01',
+            },
+            body: JSON.stringify({
+              model: 'claude-sonnet-4-5',
+              max_tokens: 1000,
+              system: getSystemPrompt(),
+              messages: [{ role: 'user', content: `Напиши LinkedIn пост в формате истории (тон story) на основе этого реального случая из практики Дмитрия. Используй детали из ответов, не выдумывай новых:\n\n${fullAnswersText}\n\nСтруктура: сильный хук → конкретный кейс или цифра → вскрытие логики → острый вывод с позицией. Пиши от первого лица.` }]
+            })
+          });
+          const postData = await postResponse.json();
+          postText = postData.content?.[0]?.text || null;
+        }
+
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: true, title: analysis.title, postText }));
 
       } catch (err) {
         res.writeHead(500, { 'Content-Type': 'application/json' });
