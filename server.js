@@ -6,6 +6,7 @@ const PORT = process.env.PORT || 3000;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const NOTION_API_KEY = process.env.NOTION_API_KEY;
 const NOTION_DATABASE_ID = 'a81c0118449d47388b3fb612a509cd38';
+const DRAFT_LAB_DATA_SOURCE_ID = 'a7a0cbdf-2956-445e-a02f-dbd08182a63e';
 
 const server = http.createServer(async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -114,6 +115,53 @@ const server = http.createServer(async (req, res) => {
 
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ comments }));
+
+      } catch (err) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    });
+    return;
+  }
+
+  if (req.method === 'POST' && req.url === '/api/save-draft') {
+    let body = '';
+    req.on('data', chunk => body += chunk);
+    req.on('end', async () => {
+      try {
+        const { postText, topic } = JSON.parse(body);
+
+        const ideaTitle = topic && topic.length > 0
+          ? topic.slice(0, 80)
+          : postText.split('\n')[0].slice(0, 80);
+
+        const notionResponse = await fetch('https://api.notion.com/v1/pages', {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${NOTION_API_KEY}`,
+            'Content-Type': 'application/json',
+            'Notion-Version': '2022-06-28',
+          },
+          body: JSON.stringify({
+            parent: { data_source_id: DRAFT_LAB_DATA_SOURCE_ID },
+            properties: {
+              'Idea': { title: [{ text: { content: ideaTitle } }] },
+              'Post Body': { rich_text: [{ text: { content: postText.slice(0, 2000) } }] },
+              'Rubric': { rich_text: [{ text: { content: 'Сгенерировано ботом' } }] }
+            }
+          })
+        });
+
+        const notionData = await notionResponse.json();
+
+        if (!notionResponse.ok) {
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: notionData.message || 'Notion API error' }));
+          return;
+        }
+
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: true }));
 
       } catch (err) {
         res.writeHead(500, { 'Content-Type': 'application/json' });
