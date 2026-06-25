@@ -178,10 +178,8 @@ const server = http.createServer(async (req, res) => {
       try {
         const { storyType, company, answers, makePost } = JSON.parse(body);
 
-        // Build full answers text
         const fullAnswersText = answers.map((a, i) => `${i + 1}. ${a.question}\n${a.answer}`).join('\n\n');
 
-        // Get a short summary + tags from Claude
         const analysisResponse = await fetch('https://api.anthropic.com/v1/messages', {
           method: 'POST',
           headers: {
@@ -212,7 +210,6 @@ const server = http.createServer(async (req, res) => {
           analysis = { title: storyType + ' — ' + company, summary: '', tags: [] };
         }
 
-        // Save to Notion
         const notionResponse = await fetch('https://api.notion.com/v1/pages', {
           method: 'POST',
           headers: {
@@ -279,11 +276,8 @@ const server = http.createServer(async (req, res) => {
 
 function detectLanguage(text) {
   const sample = text.slice(0, 500);
-  // Count Ukrainian-specific chars
   const ukChars = (sample.match(/[іїєґІЇЄҐ]/g) || []).length;
-  // Count Cyrillic chars
   const cyrillicChars = (sample.match(/[а-яёА-ЯЁ]/g) || []).length;
-  // Count Latin chars
   const latinChars = (sample.match(/[a-zA-Z]/g) || []).length;
 
   if (ukChars >= 2) return 'uk';
@@ -293,7 +287,6 @@ function detectLanguage(text) {
 }
 
 function parseComments(raw) {
-  // Expects format: [LABEL] text \n\n [LABEL] text ...
   const blocks = raw.split(/\n(?=\[)/).map(b => b.trim()).filter(Boolean);
   return blocks.map(block => {
     const match = block.match(/^\[(.+?)\]\s*([\s\S]*)$/);
@@ -481,6 +474,11 @@ Pragmatic выбрали честность перед собой. Редкое 
 - Никакого корпоратива, мотивации, "синергии"
 - Длина: 150-350 слов
 - Эмодзи — максимум 1, только если уместно
+
+ЛИЧНЫЙ ЯКОРЬ — обязательный элемент каждого поста:
+Каждый пост должен содержать момент, наблюдение или ситуацию из реального опыта Дмитрия. Не обязательно полная история, достаточно одного предложения которое показывает что он это видел лично, а не прочитал в статье.
+Формула: личное наблюдение или момент → системный вывод.
+Посты без этого якоря работают хуже независимо от качества аналитики.
 
 ИЗБЕГАЙ ШАБЛОННЫХ ФРАЗ И AI-МАРКЕРОВ:
 Никогда не использовать: "Вот как...", "Вот что...", "Дело не в X, а в Y", "Результат?", "Честно говоря...", "Фраза которая со мной осталась...", "В заключение...", структуры типа "3 урока" / "5 вещей которые я понял".
