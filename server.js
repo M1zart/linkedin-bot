@@ -52,13 +52,17 @@ async function getStyleExamples() {
       );
       if (!respOld.ok) throw new Error('Notion query failed');
       const dataOld = await respOld.json();
+      const countOld = (dataOld.results || []).length;
       const textOld = buildStyleText(dataOld.results || []);
+      console.log(`Career Cases: прочитано ${countOld} кейсов (старый API)`);
       styleCache = { text: textOld, fetchedAt: now };
       return textOld;
     }
 
     const data = await resp.json();
+    const count = (data.results || []).length;
     const text = buildStyleText(data.results || []);
+    console.log(`Career Cases: прочитано ${count} кейсов (новый API)`);
     styleCache = { text, fetchedAt: now };
     return text;
   } catch (err) {
