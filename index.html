@@ -500,8 +500,9 @@
 
     <div id="case-step-final" style="display:none;">
       <div class="field-label">Готово! Что делаем дальше?</div>
-      <button class="generate-btn" onclick="finishCase(true)">📝 Сделать пост из этого</button>
-      <button class="action-btn" style="width:100%; margin-top:8px;" onclick="finishCase(false)">💾 Просто сохранить в архив</button>
+      <button class="generate-btn" style="margin-bottom:8px;" onclick="finishCase(true, 'linkedin')">📝 LinkedIn пост</button>
+      <button class="generate-btn" style="background:#ff6719; margin-bottom:8px;" onclick="finishCase(true, 'substack')">📰 Статья для Substack</button>
+      <button class="action-btn" style="width:100%;" onclick="finishCase(false, null)">💾 Просто сохранить в архив</button>
     </div>
 
     <div id="case-saved" style="display:none;">
@@ -738,7 +739,7 @@
       setTimeout(() => toast.classList.remove('show'), 2000);
     }
 
-    function showResult(text, isTg = false) {
+    function showResult(text, isTg = false, isSubstack = false) {
       const box = document.getElementById('result-box');
       const label = document.getElementById('result-label');
       const copyBtn = document.getElementById('copy-btn');
@@ -746,14 +747,21 @@
       document.getElementById('result-text').textContent = text;
       document.getElementById('char-count').textContent = text.length + ' символов';
 
+      box.classList.remove('tg-result');
+      copyBtn.classList.remove('tg');
+      copyBtn.style.background = '';
+      copyBtn.style.borderColor = '';
+
       if (isTg) {
         box.classList.add('tg-result');
         label.textContent = 'Для Telegram';
         copyBtn.classList.add('tg');
+      } else if (isSubstack) {
+        label.textContent = 'Статья для Substack';
+        copyBtn.style.background = '#ff6719';
+        copyBtn.style.borderColor = '#ff6719';
       } else {
-        box.classList.remove('tg-result');
         label.textContent = 'Готовый пост';
-        copyBtn.classList.remove('tg');
       }
 
       box.classList.add('show');
@@ -764,9 +772,9 @@
       document.getElementById('result-box').classList.remove('show');
     }
 
-    function showLoading(isTg = false) {
+    function showLoading(isTg = false, text = null) {
       document.getElementById('loading-spinner').className = isTg ? 'spinner tg' : 'spinner';
-      document.getElementById('loading-text').textContent = isTg ? 'Пишу для Telegram...' : 'Пишу пост...';
+      document.getElementById('loading-text').textContent = text || (isTg ? 'Пишу для Telegram...' : 'Пишу пост...');
       document.getElementById('loading').classList.add('show');
       document.querySelectorAll('.generate-btn').forEach(b => b.disabled = true);
     }
@@ -908,8 +916,10 @@
       }
     }
 
-    async function finishCase(makePost) {
-      showLoading(false);
+    async function finishCase(makePost, platform) {
+      const isSubstack = platform === 'substack';
+      const loadingText = isSubstack ? 'Пишу статью для Substack...' : 'Пишу пост...';
+      showLoading(false, loadingText);
       document.getElementById('case-step-final').style.display = 'none';
       hideError();
 
@@ -921,7 +931,8 @@
             storyType: caseState.storyType,
             company: caseState.company,
             answers: caseState.answers,
-            makePost
+            makePost,
+            platform
           })
         });
 
@@ -935,7 +946,7 @@
 
         if (makePost && data.postText) {
           lastGenerated = data.postText;
-          showResult(data.postText, false);
+          showResult(data.postText, false, isSubstack);
         } else {
           document.getElementById('case-saved-title').textContent = data.title || '';
           document.getElementById('case-saved').style.display = 'block';
