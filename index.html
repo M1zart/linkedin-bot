@@ -18,6 +18,8 @@
       --text-dim: #888;
       --green: #22c55e;
       --red: #ef4444;
+      --tg: #2aabee;
+      --tg-dim: #0d2a3d;
     }
 
     body {
@@ -62,7 +64,7 @@
 
     .mode-tabs {
       display: flex;
-      gap: 8px;
+      gap: 6px;
       margin-bottom: 20px;
       background: var(--surface);
       padding: 4px;
@@ -71,11 +73,11 @@
 
     .tab {
       flex: 1;
-      padding: 10px;
+      padding: 8px 4px;
       border: none;
       border-radius: 8px;
       cursor: pointer;
-      font-size: 13px;
+      font-size: 11px;
       font-weight: 600;
       transition: all 0.2s;
       background: transparent;
@@ -85,6 +87,10 @@
     .tab.active {
       background: var(--accent);
       color: white;
+    }
+
+    .tab.active.tg-tab {
+      background: var(--tg);
     }
 
     .mode-panel {
@@ -121,6 +127,10 @@
 
     textarea:focus, input[type="text"]:focus {
       border-color: var(--accent);
+    }
+
+    #mode-telegram textarea:focus {
+      border-color: var(--tg);
     }
 
     textarea {
@@ -165,6 +175,10 @@
       margin-bottom: 20px;
     }
 
+    .generate-btn.tg-btn {
+      background: var(--tg);
+    }
+
     .generate-btn:disabled {
       opacity: 0.5;
       cursor: not-allowed;
@@ -195,6 +209,10 @@
       margin: 0 auto 12px;
     }
 
+    .spinner.tg {
+      border-top-color: var(--tg);
+    }
+
     @keyframes spin {
       to { transform: rotate(360deg); }
     }
@@ -210,6 +228,10 @@
 
     .result-box.show {
       display: block;
+    }
+
+    .result-box.tg-result {
+      border-color: var(--tg-dim);
     }
 
     .result-header {
@@ -261,6 +283,11 @@
     .action-btn.primary {
       background: var(--accent);
       border-color: var(--accent);
+    }
+
+    .action-btn.primary.tg {
+      background: var(--tg);
+      border-color: var(--tg);
     }
 
     .action-btn:hover {
@@ -370,6 +397,19 @@
       margin-bottom: 12px;
       font-weight: 600;
     }
+
+    .tg-badge {
+      display: inline-block;
+      font-size: 10px;
+      font-weight: 700;
+      background: var(--tg-dim);
+      color: var(--tg);
+      border-radius: 4px;
+      padding: 2px 6px;
+      letter-spacing: 0.5px;
+      margin-left: 6px;
+      vertical-align: middle;
+    }
   </style>
 </head>
 <body>
@@ -377,16 +417,17 @@
   <div class="header">
     <div class="header-icon">✍️</div>
     <div>
-      <h1>LinkedIn Posts</h1>
-      <p>Генератор постов в твоём стиле</p>
+      <h1>PostBot</h1>
+      <p>LinkedIn · Telegram</p>
     </div>
   </div>
 
   <div class="mode-tabs">
-    <button class="tab active" onclick="switchMode('topic')">По теме</button>
-    <button class="tab" onclick="switchMode('thought')">Из мысли</button>
-    <button class="tab" onclick="switchMode('comment')">Комментарий</button>
+    <button class="tab active" onclick="switchMode('topic')">Тема</button>
+    <button class="tab" onclick="switchMode('thought')">Мысль</button>
+    <button class="tab" onclick="switchMode('comment')">Коммент</button>
     <button class="tab" onclick="switchMode('case')">Кейс</button>
+    <button class="tab tg-tab" onclick="switchMode('telegram')">TG</button>
   </div>
 
   <!-- Режим 1: По теме -->
@@ -470,22 +511,29 @@
     </div>
   </div>
 
+  <!-- Режим 5: Telegram -->
+  <div id="mode-telegram" class="mode-panel">
+    <div class="field-label">Мысль или тема <span class="tg-badge">TELEGRAM</span></div>
+    <textarea id="telegram-input" placeholder="Накидай как есть — что раздражает, удивляет, наблюдение из практики..."></textarea>
+    <button class="generate-btn tg-btn" onclick="generate('telegram')">Написать для Telegram</button>
+  </div>
+
   <div class="loading" id="loading">
-    <div class="spinner"></div>
-    <div>Пишу пост...</div>
+    <div class="spinner" id="loading-spinner"></div>
+    <div id="loading-text">Пишу пост...</div>
   </div>
 
   <div class="error-msg" id="error-msg"></div>
 
   <div class="result-box" id="result-box">
     <div class="result-header">
-      <span class="result-label">Готовый пост</span>
+      <span class="result-label" id="result-label">Готовый пост</span>
       <span class="char-count" id="char-count"></span>
     </div>
     <div class="result-text" id="result-text"></div>
     <div class="result-actions">
       <button class="action-btn" onclick="regenerate()">🔄 Ещё раз</button>
-      <button class="action-btn primary" onclick="copyPost()">📋 Копировать</button>
+      <button class="action-btn primary" id="copy-btn" onclick="copyPost()">📋 Копировать</button>
     </div>
     <button class="action-btn" id="save-archive-btn" style="width:100%; margin-top:8px;" onclick="saveToArchive()">💾 Сохранить в архив</button>
   </div>
@@ -498,7 +546,6 @@
   </div>
 
   <script>
-    // Init Telegram WebApp
     const tg = window.Telegram?.WebApp;
     if (tg) {
       tg.ready();
@@ -508,47 +555,9 @@
     let currentMode = 'topic';
     let lastGenerated = '';
 
-    const SYSTEM_PROMPT = `Ты ghostwriter для Дмитрия Скакунова — Head of Sportsbook в iGaming индустрии. Пишешь LinkedIn посты строго в его стиле.
-
-ПРИМЕРЫ ЕГО ПОСТОВ:
-
-Пост 1 (история):
-"Пришла беда откуда не ждали... 
-Начал проседать рейтинг на Chess.com. Немного бьёт по самолюбию даже если часто играешь уставший и просто для удовольствия. Но проигрывать всё равно не люблю.
-Параллельно голова забита автоматизацией. Хотелось попробовать ручками, не только ставить задачи команде. И появилась идея объединить это.
-Так за 2 часа собрал первого своего Telegram бота: подключил AI, написал промт, структурировал и протестил.
-Обычно я заказчик. Сегодня впервые был исполнителем. По-другому смотришь на задачу, когда самому предстоит её делать.
-Теперь понимаю, почему команда иногда смотрит на меня странно..."
-
-Пост 2 (экспертный):
-"Pragmatic Play закрывает спортсбук... И правильно делают.
-Запустили в 2022-м, поработали, посмотрели на результаты — и решили не масштабировать то, в чём не являются лучшими.
-Очень часто принято делать наоборот. Оператор запускает спортсбук — потому что "казино есть, а спорт добавить несложно". В итоге куча продуктов, в которых никто не первый.
-Быть посредственным в пяти вертикалях хуже, чем быть лучшим в двух.
-Спортсбук — это не просто фича, которую можно прикрутить. Это отдельная операционная машина: риск-менеджмент, трейдинг, лимиты, маржа, живые события. Или ты в это инвестируешь всерьёз, или просто создаёшь иллюзию полноты продукта.
-Pragmatic выбрали честность перед собой. Редкое качество."
-
-ПРАВИЛА СТИЛЯ:
-- Пиши ТОЛЬКО на русском. Никаких английских слов кроме устоявшихся терминов (GGR, NGR, sportsbook, CRM, hold%)
-- Короткие абзацы — 1-3 предложения максимум
-- Первая строка — зацепка. Провокация, неожиданный факт или ирония. Не вопрос.
-- Личный голос, от первого лица
-- Конкретика — цифры, кейсы, механики. Никаких абстракций
-- Финал острый — вывод с позицией, без смягчений. Не "что думаете?"
-- Никакого корпоратива, мотивации, "синергии"
-- Длина: 200-400 слов
-- Эмодзи — максимум 1-2 и только если уместно
-
-Тоны:
-- expert: аналитический, факты + позиция + вывод
-- story: личная история или кейс с развязкой
-- contrarian: берёшь общепринятое мнение и разбиваешь его
-
-Отвечай ТОЛЬКО текстом поста. Никаких пояснений, заголовков, комментариев.`;
-
     function switchMode(mode) {
       currentMode = mode;
-      const tabOrder = ['topic', 'thought', 'comment', 'case'];
+      const tabOrder = ['topic', 'thought', 'comment', 'case', 'telegram'];
       document.querySelectorAll('.tab').forEach((t, i) => {
         t.classList.toggle('active', tabOrder[i] === mode);
       });
@@ -569,7 +578,7 @@ Pragmatic выбрали честность перед собой. Редкое 
 
     function getSelectedTone(mode) {
       const selector = document.getElementById(`${mode}-tone`);
-      return selector.querySelector('.tone-btn.selected')?.dataset.tone || 'expert';
+      return selector?.querySelector('.tone-btn.selected')?.dataset.tone || 'expert';
     }
 
     let lastMode = '';
@@ -580,15 +589,16 @@ Pragmatic выбрали честность перед собой. Редкое 
       let input;
       if (mode === 'topic') input = document.getElementById('topic-input').value.trim();
       else if (mode === 'thought') input = document.getElementById('thought-input').value.trim();
+      else if (mode === 'telegram') input = document.getElementById('telegram-input').value.trim();
       else input = document.getElementById('comment-input').value.trim();
 
       if (!input) {
-        const msg = mode === 'topic' ? 'Введи тему поста' : mode === 'thought' ? 'Накидай мысль' : 'Вставь текст поста';
-        showError(msg);
+        const msgs = { topic: 'Введи тему поста', thought: 'Накидай мысль', telegram: 'Накидай мысль', comment: 'Вставь текст поста' };
+        showError(msgs[mode] || 'Введи текст');
         return;
       }
 
-      const tone = mode === 'comment' ? '' : getSelectedTone(mode);
+      const tone = mode === 'comment' ? '' : mode === 'telegram' ? 'telegram' : getSelectedTone(mode);
       lastMode = mode;
       lastInput = input;
       lastTone = tone;
@@ -611,13 +621,10 @@ Pragmatic выбрали честность перед собой. Редкое 
     }
 
     async function callAPI(mode, input, tone) {
-      showLoading();
+      const isTg = tone === 'telegram';
+      showLoading(isTg);
       hideResult();
       hideError();
-
-      const userPrompt = mode === 'topic'
-        ? `Напиши LinkedIn пост на тему: "${input}". Тон: ${tone}.`
-        : `Оформи в LinkedIn пост эту сырую мысль: "${input}". Тон: ${tone}.`;
 
       try {
         const response = await fetch('/api/generate', {
@@ -636,7 +643,7 @@ Pragmatic выбрали честность перед собой. Редкое 
         if (!text) throw new Error('Пустой ответ');
 
         lastGenerated = text;
-        showResult(text);
+        showResult(text, isTg);
 
       } catch (err) {
         showError('Ошибка: ' + err.message);
@@ -646,7 +653,7 @@ Pragmatic выбрали честность перед собой. Редкое 
     }
 
     async function callCommentsAPI(postText) {
-      showLoading();
+      showLoading(false);
       hideResult();
       hideCommentsResult();
       hideError();
@@ -693,9 +700,7 @@ Pragmatic выбрали честность перед собой. Редкое 
       });
 
       document.querySelectorAll('.comment-copy-btn').forEach(btn => {
-        btn.addEventListener('click', () => {
-          copyText(btn.dataset.text);
-        });
+        btn.addEventListener('click', () => copyText(btn.dataset.text));
       });
 
       box.classList.add('show');
@@ -732,10 +737,25 @@ Pragmatic выбрали честность перед собой. Редкое 
       toast.classList.add('show');
       setTimeout(() => toast.classList.remove('show'), 2000);
     }
-    function showResult(text) {
+
+    function showResult(text, isTg = false) {
       const box = document.getElementById('result-box');
+      const label = document.getElementById('result-label');
+      const copyBtn = document.getElementById('copy-btn');
+
       document.getElementById('result-text').textContent = text;
       document.getElementById('char-count').textContent = text.length + ' символов';
+
+      if (isTg) {
+        box.classList.add('tg-result');
+        label.textContent = 'Для Telegram';
+        copyBtn.classList.add('tg');
+      } else {
+        box.classList.remove('tg-result');
+        label.textContent = 'Готовый пост';
+        copyBtn.classList.remove('tg');
+      }
+
       box.classList.add('show');
       box.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
     }
@@ -744,7 +764,9 @@ Pragmatic выбрали честность перед собой. Редкое 
       document.getElementById('result-box').classList.remove('show');
     }
 
-    function showLoading() {
+    function showLoading(isTg = false) {
+      document.getElementById('loading-spinner').className = isTg ? 'spinner tg' : 'spinner';
+      document.getElementById('loading-text').textContent = isTg ? 'Пишу для Telegram...' : 'Пишу пост...';
       document.getElementById('loading').classList.add('show');
       document.querySelectorAll('.generate-btn').forEach(b => b.disabled = true);
     }
@@ -766,23 +788,7 @@ Pragmatic выбрали честность перед собой. Редкое 
 
     async function copyPost() {
       if (!lastGenerated) return;
-      try {
-        await navigator.clipboard.writeText(lastGenerated);
-        const toast = document.getElementById('copy-toast');
-        toast.classList.add('show');
-        setTimeout(() => toast.classList.remove('show'), 2000);
-      } catch {
-        // fallback
-        const ta = document.createElement('textarea');
-        ta.value = lastGenerated;
-        document.body.appendChild(ta);
-        ta.select();
-        document.execCommand('copy');
-        document.body.removeChild(ta);
-        const toast = document.getElementById('copy-toast');
-        toast.classList.add('show');
-        setTimeout(() => toast.classList.remove('show'), 2000);
-      }
+      await copyText(lastGenerated);
     }
 
     async function saveToArchive() {
@@ -903,7 +909,7 @@ Pragmatic выбрали честность перед собой. Редкое 
     }
 
     async function finishCase(makePost) {
-      showLoading();
+      showLoading(false);
       document.getElementById('case-step-final').style.display = 'none';
       hideError();
 
@@ -929,7 +935,7 @@ Pragmatic выбрали честность перед собой. Редкое 
 
         if (makePost && data.postText) {
           lastGenerated = data.postText;
-          showResult(data.postText);
+          showResult(data.postText, false);
         } else {
           document.getElementById('case-saved-title').textContent = data.title || '';
           document.getElementById('case-saved').style.display = 'block';
