@@ -349,7 +349,7 @@ const server = http.createServer(async (req, res) => {
     req.on('data', chunk => body += chunk);
     req.on('end', async () => {
       try {
-        const { storyType, company, answers, makePost } = JSON.parse(body);
+        const { storyType, company, answers, makePost, platform } = JSON.parse(body);
 
         const fullAnswersText = answers.map((a, i) => `${i + 1}. ${a.question}\n${a.answer}`).join('\n\n');
 
@@ -417,8 +417,15 @@ const server = http.createServer(async (req, res) => {
 
         let postText = null;
         if (makePost) {
-          const styleText = await getStyleExamples();
-          const systemPrompt = getSystemPrompt() + buildStyleBlock(styleText);
+          const isSubstack = platform === 'substack';
+          const styleText = isSubstack ? '' : await getStyleExamples();
+          const systemPrompt = isSubstack
+            ? getSubstackSystemPrompt()
+            : getSystemPrompt() + buildStyleBlock(styleText);
+          const userContent = isSubstack
+            ? `Напиши статью для Substack на основе этого реального случая из практики Дмитрия. Используй детали из ответов, не выдумывай новых:\n\n${fullAnswersText}`
+            : `Напиши LinkedIn пост в формате истории (тон story). Используй детали из ответов, не выдумывай новых:\n\n${fullAnswersText}\n\nСтруктура: сильный хук — конкретный кейс или цифра — вскрытие логики — острый вывод с позицией. Пиши от первого лица.`;
+
           const postResponse = await fetch('https://api.anthropic.com/v1/messages', {
             method: 'POST',
             headers: {
@@ -428,15 +435,16 @@ const server = http.createServer(async (req, res) => {
             },
             body: JSON.stringify({
               model: MODEL,
-              max_tokens: 1000,
+              max_tokens: isSubstack ? 2000 : 1000,
               system: systemPrompt,
-              messages: [{ role: 'user', content: `Напиши LinkedIn пост в формате истории (тон story) на основе этого реального случая из практики Дмитрия. Используй детали из ответов, не выдумывай новых:\n\n${fullAnswersText}\n\nСтруктура: сильный хук → конкретный кейс или цифра → вскрытие логики → острый вывод с позицией. Пиши от первого лица.` }]
+              messages: [{ role: 'user', content: userContent }]
             })
           });
           const postData = await postResponse.json();
           const rawPost = postData.content?.[0]?.text || null;
-          // ── Stop-Slop: финальный проход ───────────────────────────────
-          postText = rawPost ? await runStopSlop(rawPost) : null;
+          postText = rawPost
+            ? (isSubstack ? rawPost : await runStopSlop(rawPost))
+            : null;
         }
 
         res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -663,6 +671,35 @@ function getSystemPrompt() {
 - Финал сильный, не мораль и не вопрос в пустоту?
 
 Отвечай ТОЛЬКО текстом поста. Никаких пояснений, заголовков, вводных фраз.`;
+}
+
+function getSubstackSystemPrompt() {
+  return `Ты ghostwriter для Дмитрия Скакунова — Head of Sportsbook в iGaming, 18 лет в индустрии. Пишешь статью для его Substack newsletter на русском языке.
+
+Substack — профессиональный канал для практиков индустрии: Head of Sportsbook, операционные и продуктовые менеджеры в iGaming.
+
+ФОРМАТ СТАТЬИ:
+- 700-1200 слов
+- От первого лица
+- Структура: личный момент или контекст → разворот ситуации с деталями → анализ что пошло не так и почему → позиция Дмитрия → практический вывод для читателя
+- Не LinkedIn: нет коротких крючков по формуле, нет искусственного ритма из одиночных предложений
+- Разговорный но структурированный — колонка практика, не академическая статья и не учебник
+- Абзацы 3-5 предложений, текст читается как текст, не как слайды
+
+ПРАВИЛА СТИЛЯ:
+- Только русский. Отраслевые термины: GGR, NGR, sportsbook, CRM, hold%, margin, live betting
+- Цифры и конкретные детали из кейса — использовать максимально
+- Финал: конкретный вывод с позицией или открытый вопрос к читателю — уместно для newsletter
+- Никакого корпоратива, мотивации, "синергии"
+- Не выдумывай детали которых нет в кейсе
+
+ЗАПРЕЩЕНО:
+- LinkedIn-крючки первой строкой ("GGR вырос на 40%. Бизнес стал слабее.")
+- AI-маркеры: "Вот как...", "Результат?", "В заключение...", "Честно говоря..."
+- Структуры: "3 урока", "5 вещей которые я понял"
+- Корпоративный язык и мотивационный тон
+
+Отвечай ТОЛЬКО текстом статьи без заголовка. Никаких пояснений, вводных фраз, комментариев.`;
 }
 
 server.listen(PORT, () => {
