@@ -308,6 +308,7 @@ const server = http.createServer(async (req, res) => {
           ? topic.slice(0, 80)
           : postText.split('\n')[0].slice(0, 80);
 
+        // Career Cases — та же база что и save-case, тот же data_source_id
         const notionResponse = await fetch('https://api.notion.com/v1/pages', {
           method: 'POST',
           headers: {
@@ -316,20 +317,11 @@ const server = http.createServer(async (req, res) => {
             'Notion-Version': '2022-06-28',
           },
           body: JSON.stringify({
-            parent: { data_source_id: DRAFT_LAB_DATA_SOURCE_ID },
+            parent: { data_source_id: CAREER_CASES_DATA_SOURCE_ID },
             properties: {
-              'Post': { title: [{ text: { content: ideaTitle } }] },
-              'Status': { select: { name: 'Draft' } },
-            },
-            children: [
-              {
-                object: 'block',
-                type: 'paragraph',
-                paragraph: {
-                  rich_text: [{ type: 'text', text: { content: postText.slice(0, 2000) } }]
-                }
-              }
-            ]
+              'Title': { title: [{ text: { content: ideaTitle } }] },
+              'Full Answers': { rich_text: [{ text: { content: postText.slice(0, 2000) } }] },
+            }
           })
         });
 
@@ -346,6 +338,7 @@ const server = http.createServer(async (req, res) => {
         res.end(JSON.stringify({ success: true }));
 
       } catch (err) {
+        console.error('save-draft catch error:', err.message);
         res.writeHead(500, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: err.message }));
       }
