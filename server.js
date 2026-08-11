@@ -6,7 +6,7 @@ const PORT = process.env.PORT || 3000;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const NOTION_API_KEY = process.env.NOTION_API_KEY;
 const NOTION_DATABASE_ID = 'a81c0118449d47388b3fb612a509cd38';
-const DRAFT_LAB_DATA_SOURCE_ID = 'a7a0cbdf-2956-445e-a02f-dbd08182a63e';
+const DRAFT_LAB_DATA_SOURCE_ID = '14814719-85c5-4819-a07e-3d1b773d6bdb';
 const CAREER_CASES_DATA_SOURCE_ID = 'a81c0118-449d-4738-8b3f-b612a509cd38';
 
 const MODEL = 'claude-sonnet-4-6';
@@ -318,16 +318,25 @@ const server = http.createServer(async (req, res) => {
           body: JSON.stringify({
             parent: { data_source_id: DRAFT_LAB_DATA_SOURCE_ID },
             properties: {
-              'Idea': { title: [{ text: { content: ideaTitle } }] },
-              'Post Body': { rich_text: [{ text: { content: postText.slice(0, 2000) } }] },
-              'Rubric': { rich_text: [{ text: { content: 'Сгенерировано ботом' } }] }
-            }
+              'Post': { title: [{ text: { content: ideaTitle } }] },
+              'Status': { select: { name: 'Draft' } },
+            },
+            children: [
+              {
+                object: 'block',
+                type: 'paragraph',
+                paragraph: {
+                  rich_text: [{ type: 'text', text: { content: postText.slice(0, 2000) } }]
+                }
+              }
+            ]
           })
         });
 
         const notionData = await notionResponse.json();
 
         if (!notionResponse.ok) {
+          console.error('save-draft Notion error:', JSON.stringify(notionData));
           res.writeHead(500, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: notionData.message || 'Notion API error' }));
           return;
