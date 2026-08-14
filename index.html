@@ -428,6 +428,7 @@
     <button class="tab" onclick="switchMode('comment')">Коммент</button>
     <button class="tab" onclick="switchMode('case')">Кейс</button>
     <button class="tab tg-tab" onclick="switchMode('telegram')">TG</button>
+    <button class="tab" onclick="switchMode('format')">Оформить</button>
   </div>
 
   <!-- Режим 1: По теме -->
@@ -519,6 +520,20 @@
     <button class="generate-btn tg-btn" onclick="generate('telegram')">Написать для Telegram</button>
   </div>
 
+  <!-- Режим 6: Оформить готовый пост -->
+  <div id="mode-format" class="mode-panel">
+    <div class="field-label">Готовый пост</div>
+    <textarea id="format-input" placeholder="Вставь текст уже написанного поста целиком..." style="min-height:160px;"></textarea>
+
+    <div class="field-label">Платформа</div>
+    <div class="tone-selector" id="format-platform">
+      <button class="tone-btn selected" data-platform="telegram">Telegram</button>
+      <button class="tone-btn" data-platform="linkedin">LinkedIn</button>
+    </div>
+
+    <button class="generate-btn" id="format-btn" onclick="formatPost()">Оформить</button>
+  </div>
+
   <div class="loading" id="loading">
     <div class="spinner" id="loading-spinner"></div>
     <div id="loading-text">Пишу пост...</div>
@@ -558,7 +573,7 @@
 
     function switchMode(mode) {
       currentMode = mode;
-      const tabOrder = ['topic', 'thought', 'comment', 'case', 'telegram'];
+      const tabOrder = ['topic', 'thought', 'comment', 'case', 'telegram', 'format'];
       document.querySelectorAll('.tab').forEach((t, i) => {
         t.classList.toggle('active', tabOrder[i] === mode);
       });
@@ -615,6 +630,8 @@
       if (lastInput) {
         if (lastMode === 'comment') {
           await callCommentsAPI(lastInput);
+        } else if (lastMode === 'format') {
+          await formatPost();
         } else {
           await callAPI(lastMode, lastInput, lastTone);
         }
@@ -831,6 +848,55 @@
           btn.textContent = originalText;
           btn.disabled = false;
         }, 2000);
+      }
+    }
+
+    function getSelectedPlatform() {
+      const selector = document.getElementById('format-platform');
+      return selector?.querySelector('.tone-btn.selected')?.dataset.platform || 'telegram';
+    }
+
+    async function formatPost() {
+      const input = document.getElementById('format-input').value.trim();
+      if (!input) {
+        showError('Вставь текст поста');
+        return;
+      }
+
+      const platform = getSelectedPlatform();
+      const isTg = platform === 'telegram';
+
+      lastMode = 'format';
+      lastInput = input;
+      lastTone = platform;
+
+      showLoading(isTg, 'Оформляю...');
+      hideResult();
+      hideError();
+
+      try {
+        const response = await fetch('/api/format-post', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ postText: input, platform })
+        });
+
+        const data = await response.json();
+
+        if (!response.ok || data.error) {
+          throw new Error(data.error || 'Ошибка API');
+        }
+
+        const text = data.text;
+        if (!text) throw new Error('Пустой ответ');
+
+        lastGenerated = text;
+        showResult(text, isTg, false);
+
+      } catch (err) {
+        showError('Ошибка: ' + err.message);
+      } finally {
+        hideLoading();
       }
     }
 
