@@ -366,38 +366,6 @@
       width: 100%;
     }
 
-    .case-type-grid {
-      display: flex;
-      flex-direction: column;
-      gap: 8px;
-      margin-bottom: 16px;
-    }
-
-    .case-type-btn {
-      padding: 14px;
-      border-radius: 10px;
-      border: 1px solid var(--border);
-      background: var(--surface);
-      color: var(--text);
-      font-size: 14px;
-      font-weight: 600;
-      cursor: pointer;
-      text-align: left;
-      transition: all 0.2s;
-    }
-
-    .case-type-btn:hover {
-      border-color: var(--accent);
-      background: var(--accent-dim);
-    }
-
-    .case-progress {
-      font-size: 12px;
-      color: var(--text-dim);
-      margin-bottom: 12px;
-      font-weight: 600;
-    }
-
     .tg-badge {
       display: inline-block;
       font-size: 10px;
@@ -426,9 +394,9 @@
     <button class="tab active" onclick="switchMode('topic')">Тема</button>
     <button class="tab" onclick="switchMode('thought')">Мысль</button>
     <button class="tab" onclick="switchMode('comment')">Коммент</button>
-    <button class="tab" onclick="switchMode('case')">Кейс</button>
     <button class="tab tg-tab" onclick="switchMode('telegram')">TG</button>
     <button class="tab" onclick="switchMode('format')">Оформить</button>
+    <button class="tab tg-tab" onclick="switchMode('newsquote')">Новость</button>
   </div>
 
   <!-- Режим 1: По теме -->
@@ -469,49 +437,13 @@
     <button class="generate-btn" onclick="generate('comment')">Сгенерировать комментарии</button>
   </div>
 
-  <!-- Режим 4: Кейс -->
-  <div id="mode-case" class="mode-panel">
-    <div id="case-step-0">
-      <div class="field-label">Какой тип истории?</div>
-      <div class="case-type-grid">
-        <button class="case-type-btn" data-type="Фейл / провал" onclick="selectCaseType('Фейл / провал')">💥 Фейл / провал</button>
-        <button class="case-type-btn" data-type="Конфликт команд" onclick="selectCaseType('Конфликт команд')">⚔️ Конфликт команд</button>
-        <button class="case-type-btn" data-type="Неожиданный успех" onclick="selectCaseType('Неожиданный успех')">🚀 Неожиданный успех</button>
-        <button class="case-type-btn" data-type="Странный случай" onclick="selectCaseType('Странный случай')">🎭 Странный случай</button>
-      </div>
-    </div>
-
-    <div id="case-step-1" style="display:none;">
-      <div class="field-label">О какой компании/периоде вспоминаем?</div>
-      <div class="case-type-grid">
-        <button class="case-type-btn" onclick="selectCompany('Marathonbet')">Marathonbet</button>
-        <button class="case-type-btn" onclick="selectCompany('Fonbet')">Fonbet</button>
-        <button class="case-type-btn" onclick="selectCompany('GG.BET')">GG.BET</button>
-        <button class="case-type-btn" onclick="selectCompany('Текущая роль')">Текущая роль</button>
-        <button class="case-type-btn" onclick="selectCompany('Другое')">Другое</button>
-      </div>
-    </div>
-
-    <div id="case-step-questions" style="display:none;">
-      <div class="case-progress" id="case-progress"></div>
-      <div class="field-label" id="case-question-label"></div>
-      <textarea id="case-answer-input" placeholder="Отвечай как есть, своими словами..."></textarea>
-      <button class="generate-btn" onclick="submitCaseAnswer()">Дальше</button>
-    </div>
-
-    <div id="case-step-final" style="display:none;">
-      <div class="field-label">Готово! Что делаем дальше?</div>
-      <button class="generate-btn" style="margin-bottom:8px;" onclick="finishCase(true, 'linkedin')">📝 LinkedIn пост</button>
-      <button class="generate-btn" style="background:#ff6719; margin-bottom:8px;" onclick="finishCase(true, 'substack')">📰 Статья для Substack</button>
-      <button class="action-btn" style="width:100%;" onclick="finishCase(false, null)">💾 Просто сохранить в архив</button>
-    </div>
-
-    <div id="case-saved" style="display:none;">
-      <div class="result-label" style="margin-bottom:8px;">✅ Сохранено в архив</div>
-      <div id="case-saved-title" style="font-size:14px; color:var(--text-dim); margin-bottom:16px;"></div>
-      <button class="action-btn" style="width:100%;" onclick="resetCaseFlow()">Начать новый кейс</button>
-    </div>
+  <!-- Режим: Новость с цитатой -->
+  <div id="mode-newsquote" class="mode-panel">
+    <div class="field-label">Сырой текст новости <span class="tg-badge">TELEGRAM</span></div>
+    <textarea id="newsquote-input" placeholder="Вставь новость, пресс-релиз, чужой пост или заметки целиком..." style="min-height:160px;"></textarea>
+    <button class="generate-btn tg-btn" onclick="generateNewsQuote()">Сделать пост с цитатой</button>
   </div>
+
 
   <!-- Режим 5: Telegram -->
   <div id="mode-telegram" class="mode-panel">
@@ -573,7 +505,7 @@
 
     function switchMode(mode) {
       currentMode = mode;
-      const tabOrder = ['topic', 'thought', 'comment', 'case', 'telegram', 'format'];
+      const tabOrder = ['topic', 'thought', 'comment', 'telegram', 'format', 'newsquote'];
       document.querySelectorAll('.tab').forEach((t, i) => {
         t.classList.toggle('active', tabOrder[i] === mode);
       });
@@ -632,6 +564,8 @@
           await callCommentsAPI(lastInput);
         } else if (lastMode === 'format') {
           await formatPost();
+        } else if (lastMode === 'newsquote') {
+          await generateNewsQuote();
         } else {
           await callAPI(lastMode, lastInput, lastTone);
         }
@@ -900,136 +834,47 @@
       }
     }
 
-    // ===== CASE MODE LOGIC =====
+    // ===== NEWS QUOTE LOGIC =====
 
-    const CASE_QUESTIONS = {
-      'Фейл / провал': [
-        'Что должно было сработать, но не сработало?',
-        'В какой момент стало понятно, что что-то идёт не так?',
-        'Какое решение тогда казалось правильным, а оказалось ошибкой?',
-        'Цифры или потери, во что это вылилось конкретно?',
-        'Что бы сделал иначе сейчас?'
-      ],
-      'Конфликт команд': [
-        'Какие две команды или роли столкнулись и из-за чего?',
-        'Что каждая сторона считала правильным со своей колокольни?',
-        'Кто оказался прав, а кто упустил важное?',
-        'Как разрешили или не разрешили конфликт?',
-        'Какое правило или процесс появилось после этого?'
-      ],
-      'Неожиданный успех': [
-        'Что планировали и что получилось вместо этого?',
-        'В чём был сюрприз, какая метрика или реакция удивила?',
-        'Кто не верил, что сработает?',
-        'Можно ли было это предсказать, если бы что-то знали заранее?',
-        'Стало ли это потом системным подходом или разовая удача?'
-      ],
-      'Странный случай': [
-        'С чего всё началось, какая деталь сразу казалась подозрительной?',
-        'Кто был вовлечён и что они делали, не понимая последствий?',
-        'Когда стало понятно, что происходит на самом деле?',
-        'Чем закончилось?',
-        'Какой вывод ты сделал на всю жизнь?'
-      ]
-    };
-
-    let caseState = {
-      storyType: null,
-      company: null,
-      questionIndex: 0,
-      answers: []
-    };
-
-    function selectCaseType(type) {
-      caseState.storyType = type;
-      document.getElementById('case-step-0').style.display = 'none';
-      document.getElementById('case-step-1').style.display = 'block';
-    }
-
-    function selectCompany(company) {
-      caseState.company = company;
-      document.getElementById('case-step-1').style.display = 'none';
-      document.getElementById('case-step-questions').style.display = 'block';
-      showCaseQuestion();
-    }
-
-    function showCaseQuestion() {
-      const questions = CASE_QUESTIONS[caseState.storyType];
-      const i = caseState.questionIndex;
-      document.getElementById('case-progress').textContent = `Вопрос ${i + 1} из ${questions.length}`;
-      document.getElementById('case-question-label').textContent = questions[i];
-      document.getElementById('case-answer-input').value = '';
-      document.getElementById('case-answer-input').focus();
-    }
-
-    function submitCaseAnswer() {
-      const answer = document.getElementById('case-answer-input').value.trim();
-      if (!answer) {
-        showError('Напиши ответ перед тем как продолжить');
+    async function generateNewsQuote() {
+      const input = document.getElementById('newsquote-input').value.trim();
+      if (!input) {
+        showError('Вставь текст новости');
         return;
       }
-      hideError();
 
-      const questions = CASE_QUESTIONS[caseState.storyType];
-      caseState.answers.push({ question: questions[caseState.questionIndex], answer });
-      caseState.questionIndex++;
+      lastMode = 'newsquote';
+      lastInput = input;
+      lastTone = 'telegram';
 
-      if (caseState.questionIndex < questions.length) {
-        showCaseQuestion();
-      } else {
-        document.getElementById('case-step-questions').style.display = 'none';
-        document.getElementById('case-step-final').style.display = 'block';
-      }
-    }
-
-    async function finishCase(makePost, platform) {
-      const isSubstack = platform === 'substack';
-      const loadingText = isSubstack ? 'Пишу статью для Substack...' : 'Пишу пост...';
-      showLoading(false, loadingText);
-      document.getElementById('case-step-final').style.display = 'none';
+      showLoading(true, 'Разбираю новость...');
+      hideResult();
       hideError();
 
       try {
-        const response = await fetch('/api/save-case', {
+        const response = await fetch('/api/news-quote', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            storyType: caseState.storyType,
-            company: caseState.company,
-            answers: caseState.answers,
-            makePost,
-            platform
-          })
+          body: JSON.stringify({ sourceText: input })
         });
 
         const data = await response.json();
 
         if (!response.ok || data.error) {
-          throw new Error(data.error || 'Ошибка сохранения');
+          throw new Error(data.error || 'Ошибка API');
         }
 
-        hideLoading();
+        const text = data.text;
+        if (!text) throw new Error('Пустой ответ');
 
-        if (makePost && data.postText) {
-          lastGenerated = data.postText;
-          showResult(data.postText, false, isSubstack);
-        } else {
-          document.getElementById('case-saved-title').textContent = data.title || '';
-          document.getElementById('case-saved').style.display = 'block';
-        }
+        lastGenerated = text;
+        showResult(text, true, false);
 
       } catch (err) {
-        hideLoading();
         showError('Ошибка: ' + err.message);
-        document.getElementById('case-step-final').style.display = 'block';
+      } finally {
+        hideLoading();
       }
-    }
-
-    function resetCaseFlow() {
-      caseState = { storyType: null, company: null, questionIndex: 0, answers: [] };
-      document.getElementById('case-saved').style.display = 'none';
-      document.getElementById('case-step-0').style.display = 'block';
-      hideResult();
     }
   </script>
 </body>
