@@ -110,7 +110,7 @@
       margin-bottom: 8px;
     }
 
-    textarea, input[type="text"] {
+    textarea, input[type="text"], select {
       width: 100%;
       background: var(--surface);
       border: 1px solid var(--border);
@@ -125,11 +125,25 @@
       margin-bottom: 16px;
     }
 
-    textarea:focus, input[type="text"]:focus {
+    select {
+      appearance: none;
+      -webkit-appearance: none;
+      background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath fill='%23888' d='M1 1l5 5 5-5'/%3E%3C/svg%3E");
+      background-repeat: no-repeat;
+      background-position: right 14px center;
+      padding-right: 36px;
+      cursor: pointer;
+    }
+
+    textarea:focus, input[type="text"]:focus, select:focus {
       border-color: var(--accent);
     }
 
     #mode-telegram textarea:focus {
+      border-color: var(--tg);
+    }
+
+    #mode-newsquote select:focus {
       border-color: var(--tg);
     }
 
@@ -441,6 +455,27 @@
   <div id="mode-newsquote" class="mode-panel">
     <div class="field-label">Готовый пост <span class="tg-badge">TELEGRAM</span></div>
     <textarea id="newsquote-input" placeholder="Вставь свой уже написанный пост целиком, ничего переписывать не будет..." style="min-height:160px;"></textarea>
+
+    <div class="field-label">Рубрика</div>
+    <select id="rubric-select">
+      <option value="auto">Определить автоматически</option>
+      <option value="1">⚙️ МЕХАНИКА СПОРТСБУКА</option>
+      <option value="2">🤝 ПРОВАЙДЕРЫ И КОНТРАКТЫ</option>
+      <option value="3">📊 ТРЕЙДИНГ И МАРЖА</option>
+      <option value="4">🌍 ЗАПУСК И GEO</option>
+      <option value="5">🎰 КАЗИНО И СПОРТСБУК</option>
+      <option value="6">🎯 CRM И RETENTION</option>
+      <option value="7">📈 МЕТРИКИ И P&L</option>
+      <option value="8">👥 ЛЮДИ И РОЛИ</option>
+      <option value="9">🔍 РАЗБОР РЕЛИЗОВ</option>
+      <option value="10">🗞 НОВОСТИ ИЗНУТРИ</option>
+      <option value="11">🧩 ИЗ ПРАКТИКИ</option>
+      <option value="12">🤖 AI В ОПЕРАЦИЯХ</option>
+      <option value="13">⚽ БОТ И ТОП МАТЧИ</option>
+      <option value="14">🧰 ИНСТРУМЕНТЫ</option>
+      <option value="15">😏 ВОСКРЕСНОЕ</option>
+    </select>
+
     <button class="generate-btn tg-btn" onclick="generateNewsQuote()">Определить рубрику и оформить</button>
   </div>
 
@@ -836,6 +871,14 @@
 
     // ===== RUBRIC FORMAT LOGIC =====
 
+    const RUBRIC_HASHTAGS = {
+      '1': '#механика_спортсбука', '2': '#провайдеры_контракты', '3': '#трейдинг_маржа',
+      '4': '#запуск_geo', '5': '#казино_спортсбук', '6': '#crm_retention',
+      '7': '#метрики_pnl', '8': '#люди_роли', '9': '#разбор_релизов',
+      '10': '#новости_изнутри', '11': '#из_практики', '12': '#ai_операции',
+      '13': '#бот_матчи', '14': '#инструменты', '15': '#воскресное'
+    };
+
     async function generateNewsQuote() {
       const input = document.getElementById('newsquote-input').value.trim();
       if (!input) {
@@ -843,11 +886,20 @@
         return;
       }
 
+      const rubricValue = document.getElementById('rubric-select').value;
+      let forcedLabel = null;
+      let forcedHashtag = null;
+      if (rubricValue !== 'auto') {
+        const select = document.getElementById('rubric-select');
+        forcedLabel = select.options[select.selectedIndex].textContent;
+        forcedHashtag = RUBRIC_HASHTAGS[rubricValue];
+      }
+
       lastMode = 'newsquote';
       lastInput = input;
       lastTone = 'telegram';
 
-      showLoading(true, 'Определяю рубрику...');
+      showLoading(true, forcedLabel ? 'Оформляю...' : 'Определяю рубрику...');
       hideResult();
       hideError();
 
@@ -855,7 +907,7 @@
         const response = await fetch('/api/rubric-format', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ postText: input })
+          body: JSON.stringify({ postText: input, forcedLabel, forcedHashtag })
         });
 
         const data = await response.json();
