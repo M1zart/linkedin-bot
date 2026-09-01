@@ -405,16 +405,20 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  if (req.method === 'POST' && req.url === '/api/save-case') {
+  if (req.method === 'POST' && req.url === '/api/news-quote') {
     let body = '';
     req.on('data', chunk => body += chunk);
     req.on('end', async () => {
       try {
-        const { storyType, company, answers, makePost, platform } = JSON.parse(body);
+        const { sourceText } = JSON.parse(body);
 
-        const fullAnswersText = answers.map((a, i) => `${i + 1}. ${a.question}\n${a.answer}`).join('\n\n');
+        if (!sourceText || !sourceText.trim()) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Пустой текст новости' }));
+          return;
+        }
 
-        const analysisResponse = await fetch('https://api.anthropic.com/v1/messages', {
+        const response = await fetch('https://api.anthropic.com/v1/messages', {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
@@ -423,95 +427,29 @@ const server = http.createServer(async (req, res) => {
           },
           body: JSON.stringify({
             model: MODEL,
-            max_tokens: 300,
-            system: `Ты помогаешь каталогизировать истории из карьеры Дмитрия, Head of Sportsbook в iGaming. По ответам на вопросы интервью сформируй:
-1. Короткий заголовок истории (5-8 слов, без кавычек)
-2. Выжимку в 1-2 предложения для быстрого скана списка
-3. До 4 тегов из набора: риск, CRM, трейдинг, продукт, лидерство, платежи, бонусы, команда
-
-Формат ответа строго JSON без markdown форматирования:
-{"title": "...", "summary": "...", "tags": ["...", "..."]}`,
-            messages: [{ role: 'user', content: fullAnswersText }]
+            max_tokens: 700,
+            system: getNewsQuoteSystemPrompt(),
+            messages: [{ role: 'user', content: sourceText }]
           })
         });
 
-        const analysisData = await analysisResponse.json();
-        const analysisText = analysisData.content?.[0]?.text || '{}';
-        let analysis;
-        try {
-          analysis = JSON.parse(analysisText.replace(/```json\n?|```/g, '').trim());
-        } catch {
-          analysis = { title: storyType + ' — ' + company, summary: '', tags: [] };
-        }
+        const data = await response.json();
 
-        const notionResponse = await fetch('https://api.notion.com/v1/pages', {
-          method: 'POST',
-          headers: {
-            'Authorization': `Bearer ${NOTION_API_KEY}`,
-            'Content-Type': 'application/json',
-            'Notion-Version': '2022-06-28',
-          },
-          body: JSON.stringify({
-            parent: { data_source_id: 'a81c0118-449d-4738-8b3f-b612a509cd38' },
-            properties: {
-              'Title': { title: [{ text: { content: analysis.title || (storyType + ' — ' + company) } }] },
-              'Story Type': { select: { name: storyType } },
-              'Company': { select: { name: company } },
-              'Topic Tags': { multi_select: (analysis.tags || []).map(t => ({ name: t })) },
-              'Raw Summary': { rich_text: [{ text: { content: analysis.summary || '' } }] },
-              'Full Answers': { rich_text: [{ text: { content: fullAnswersText.slice(0, 2000) } }] },
-              'Used In Post': { checkbox: false }
-            }
-          })
-        });
-
-        const notionData = await notionResponse.json();
-
-        if (!notionResponse.ok) {
+        if (!response.ok) {
+          console.error('news-quote API error:', JSON.stringify(data));
           res.writeHead(500, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: notionData.message || 'Notion API error' }));
+          res.end(JSON.stringify({ error: data.error?.message || 'API error' }));
           return;
         }
 
-        // Новый кейс — сбрасываем кэш образцов стиля
-        styleCache = { text: '', fetchedAt: 0 };
-
-        let postText = null;
-        if (makePost) {
-          const isSubstack = platform === 'substack';
-          const styleText = isSubstack ? '' : await getStyleExamples();
-          const systemPrompt = isSubstack
-            ? getSubstackSystemPrompt()
-            : getSystemPrompt() + buildStyleBlock(styleText);
-          const userContent = isSubstack
-            ? `Напиши статью для Substack на основе этого реального случая из практики Дмитрия. Используй детали из ответов, не выдумывай новых:\n\n${fullAnswersText}`
-            : `Напиши LinkedIn пост в формате истории (тон story). Используй детали из ответов, не выдумывай новых:\n\n${fullAnswersText}\n\nСтруктура: сильный хук — конкретный кейс или цифра — вскрытие логики — острый вывод с позицией. Пиши от первого лица.`;
-
-          const postResponse = await fetch('https://api.anthropic.com/v1/messages', {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              'x-api-key': ANTHROPIC_API_KEY,
-              'anthropic-version': '2023-06-01',
-            },
-            body: JSON.stringify({
-              model: MODEL,
-              max_tokens: isSubstack ? 2000 : 1000,
-              system: systemPrompt,
-              messages: [{ role: 'user', content: userContent }]
-            })
-          });
-          const postData = await postResponse.json();
-          const rawPost = postData.content?.[0]?.text || null;
-          postText = rawPost
-            ? (isSubstack ? rawPost : await runStopSlop(rawPost))
-            : null;
-        }
+        const rawText = data.content?.[0]?.text || '';
+        const text = await runTelegramStopSlop(rawText);
 
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ success: true, title: analysis.title, postText }));
+        res.end(JSON.stringify({ text }));
 
       } catch (err) {
+        console.error('news-quote catch error:', err.message);
         res.writeHead(500, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: err.message }));
       }
@@ -959,6 +897,34 @@ async function runTelegramCritic(postText) {
     console.error('telegram-critic failed:', err.message);
     return postText;
   }
+}
+
+function getNewsQuoteSystemPrompt() {
+  return `Ты помогаешь Дмитрию Скакунову, Head of Sportsbook с 18-летним опытом, вести Telegram канал t.me/skakunov_igaming. Формат: разбор чужой новости с операторской оптикой. Не пересказ, а что это значит для того кто держит P&L.
+
+Тебе дают сырой текст: новость, пресс-релиз, чужой пост, заметки. Сделай из этого короткий пост по строгому формату.
+
+СТРУКТУРА, СЛЕДОВАТЬ ТОЧНО:
+
+1. Первая строка: опционально один короткий emoji в начале, только если тема реально предполагает уместный (флаг страны для новости про конкретный рынок или регулятора, предупреждающий знак для инцидента или штрафа, что-то в этом духе). Если ничего не подходит естественно — без emoji. Сразу за emoji (или с начала строки, если emoji не нужен) факт из новости жирным текстом (**текст**), одна-две строки, без вводных фраз и предисловий.
+
+2. Пустая строка.
+
+3. Блок цитаты. Каждая строка блока начинается с символов "> " (знак больше и пробел). Длина блока 2-4 строки. Это не пересказ новости другими словами, а операторская трактовка: что реально происходит за формулировкой, в чем ловушка или скрытая логика, чего не видно человеку без операционного опыта. Внутри блока цитаты выделить жирным (**текст**) одну ключевую фразу, максимум две.
+
+4. Опционально, короткая финальная строка вне цитаты: личная позиция в одно предложение, если она добавляет новый смысл сверх цитаты. Если добавить нечего — не пиши эту строку вообще, не растягивай искусственно.
+
+ЖЕСТКИЕ ОГРАНИЧЕНИЯ:
+Ноль хэштегов.
+Ноль тире и дефисов как знака препинания, переформулируй вокруг них.
+Ноль буквы "е" с двумя точками, заменяй на обычную "е".
+Не пересказывай факты из источника дважды между заголовком и цитатой.
+Не выдумывай цифры, детали или контекст которых нет в исходном тексте.
+Не превращай цитату в общий совет без операторского взгляда, конкретика обязательна.
+
+ГОЛОС: прямой практик, без смягчений, видит бизнес-логику за формальной формулировкой пресс-релиза или новости. Не журналист, не аналитик со стороны, а человек который сам был на месте того кто это решение принимает или разгребает.
+
+Верни ТОЛЬКО готовый текст поста в описанном формате. Никаких пояснений, никаких вводных вида "Вот пост" или заголовков.`;
 }
 
 function getSubstackSystemPrompt() {
