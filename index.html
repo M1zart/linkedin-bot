@@ -396,7 +396,7 @@
     <button class="tab" onclick="switchMode('comment')">Коммент</button>
     <button class="tab tg-tab" onclick="switchMode('telegram')">TG</button>
     <button class="tab" onclick="switchMode('format')">Оформить</button>
-    <button class="tab tg-tab" onclick="switchMode('newsquote')">Новость</button>
+    <button class="tab tg-tab" onclick="switchMode('newsquote')">Рубрика</button>
   </div>
 
   <!-- Режим 1: По теме -->
@@ -437,11 +437,11 @@
     <button class="generate-btn" onclick="generate('comment')">Сгенерировать комментарии</button>
   </div>
 
-  <!-- Режим: Новость с цитатой -->
+  <!-- Режим: Определить рубрику и оформить -->
   <div id="mode-newsquote" class="mode-panel">
-    <div class="field-label">Сырой текст новости <span class="tg-badge">TELEGRAM</span></div>
-    <textarea id="newsquote-input" placeholder="Вставь новость, пресс-релиз, чужой пост или заметки целиком..." style="min-height:160px;"></textarea>
-    <button class="generate-btn tg-btn" onclick="generateNewsQuote()">Сделать пост с цитатой</button>
+    <div class="field-label">Готовый пост <span class="tg-badge">TELEGRAM</span></div>
+    <textarea id="newsquote-input" placeholder="Вставь свой уже написанный пост целиком, ничего переписывать не будет..." style="min-height:160px;"></textarea>
+    <button class="generate-btn tg-btn" onclick="generateNewsQuote()">Определить рубрику и оформить</button>
   </div>
 
 
@@ -834,12 +834,12 @@
       }
     }
 
-    // ===== NEWS QUOTE LOGIC =====
+    // ===== RUBRIC FORMAT LOGIC =====
 
     async function generateNewsQuote() {
       const input = document.getElementById('newsquote-input').value.trim();
       if (!input) {
-        showError('Вставь текст новости');
+        showError('Вставь текст поста');
         return;
       }
 
@@ -847,15 +847,15 @@
       lastInput = input;
       lastTone = 'telegram';
 
-      showLoading(true, 'Разбираю новость...');
+      showLoading(true, 'Определяю рубрику...');
       hideResult();
       hideError();
 
       try {
-        const response = await fetch('/api/news-quote', {
+        const response = await fetch('/api/rubric-format', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ sourceText: input })
+          body: JSON.stringify({ postText: input })
         });
 
         const data = await response.json();
