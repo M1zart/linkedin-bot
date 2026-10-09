@@ -156,7 +156,7 @@ async function runStopSlop(postText) {
       },
       body: JSON.stringify({
         model: MODEL,
-        max_tokens: 1000,
+        max_tokens: 4096,
         system: stopSlopSystem,
         messages: [{ role: 'user', content: postText }]
       })
@@ -165,6 +165,11 @@ async function runStopSlop(postText) {
     if (!response.ok) {
       console.error('stop-slop API error:', data.error?.message);
       return postText; // fallback — оригинал
+    }
+    if (data.stop_reason === 'max_tokens') {
+      // Обрезанная чистка хуже оригинала: концовка поста потерялась бы молча
+      console.error('stop-slop: ответ обрезан по max_tokens, возвращаю оригинал');
+      return postText;
     }
     const cleaned = data.content?.[0]?.text || postText;
     console.log('stop-slop: проход выполнен');
@@ -830,10 +835,14 @@ async function runTelegramStopSlop(postText) {
         'x-api-key': ANTHROPIC_API_KEY,
         'anthropic-version': '2023-06-01',
       },
-      body: JSON.stringify({ model: MODEL, max_tokens: 1000, system, messages: [{ role: 'user', content: postText }] })
+      body: JSON.stringify({ model: MODEL, max_tokens: 4096, system, messages: [{ role: 'user', content: postText }] })
     });
     const data = await response.json();
     if (!response.ok) return postText;
+    if (data.stop_reason === 'max_tokens') {
+      console.error('telegram-stop-slop: ответ обрезан по max_tokens, возвращаю оригинал');
+      return postText;
+    }
     console.log('telegram-stop-slop: проход выполнен');
     return data.content?.[0]?.text || postText;
   } catch (err) {
@@ -870,10 +879,14 @@ async function runTelegramCritic(postText) {
         'x-api-key': ANTHROPIC_API_KEY,
         'anthropic-version': '2023-06-01',
       },
-      body: JSON.stringify({ model: MODEL, max_tokens: 1000, system, messages: [{ role: 'user', content: postText }] })
+      body: JSON.stringify({ model: MODEL, max_tokens: 4096, system, messages: [{ role: 'user', content: postText }] })
     });
     const data = await response.json();
     if (!response.ok) return postText;
+    if (data.stop_reason === 'max_tokens') {
+      console.error('telegram-critic: ответ обрезан по max_tokens, возвращаю оригинал');
+      return postText;
+    }
     console.log('telegram-critic: проход выполнен');
     return data.content?.[0]?.text || postText;
   } catch (err) {
