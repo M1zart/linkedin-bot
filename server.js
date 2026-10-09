@@ -7,7 +7,9 @@ const PORT = process.env.PORT || 3000;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const NOTION_API_KEY = process.env.NOTION_API_KEY;
 // Публикация в Telegram-канал: токен бота, канал (@имя или числовой -100...) и список Telegram ID, которым разрешено публиковать
-const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+// Пробелы и переводы строки по краям токена убираем: URL к Telegram их «прощает» (getMe отвечает),
+// а подпись initData считается по токену как есть и тогда не сходится
+const TELEGRAM_BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || '').trim() || undefined;
 const TELEGRAM_CHANNEL_ID = normalizeChannelId(process.env.TELEGRAM_CHANNEL_ID);
 const TELEGRAM_ALLOWED_USER_IDS = (process.env.TELEGRAM_ALLOWED_USER_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
 const INIT_DATA_MAX_AGE_SEC = 24 * 60 * 60;
@@ -516,6 +518,12 @@ const server = http.createServer(async (req, res) => {
           out.bot = '@' + me.username;
           out.botId = me.id;
         } catch (e) { out.botError = friendlyTelegramError(e.message); }
+        // Привязано ли Mini App к этому боту: кнопка меню бота должна вести на адрес этого сервиса.
+        // Если у бота кнопка меню другая, приложение, открытое через него, подписано его токеном, а не нашим.
+        try {
+          const mb = await tgApi('getChatMenuButton', {});
+          out.menuButton = { type: mb.type, text: mb.text || null, url: (mb.web_app && mb.web_app.url) || null };
+        } catch (e) { out.menuButtonError = friendlyTelegramError(e.message); }
       }
       if (TELEGRAM_BOT_TOKEN && TELEGRAM_CHANNEL_ID && out.botId) {
         try {
@@ -548,7 +556,12 @@ const server = http.createServer(async (req, res) => {
           return send(503, { error: 'Публикация не настроена: задай TELEGRAM_BOT_TOKEN и TELEGRAM_CHANNEL_ID в переменных Railway' });
         }
         const auth = verifyTelegramInitData(req.headers['x-telegram-init-data']);
-        if (!auth.ok) return send(auth.status, { error: auth.error });
+        if (!auth.ok) {
+          // Самая частая причина «подпись не прошла»: Mini App открыто через другого бота, не через того,
+          // чей токен лежит в TELEGRAM_BOT_TOKEN. Называем нужного бота, чтобы не гадать.
+          const hint = auth.signatureMismatch ? await botHint() : '';
+          return send(auth.status, { error: auth.error + hint });
+        }
         if (!TELEGRAM_ALLOWED_USER_IDS.includes(auth.userId)) {
           return send(403, { error: `Твой Telegram ID ${auth.userId} не в списке разрешённых. Добавь его в переменную TELEGRAM_ALLOWED_USER_IDS в Railway.` });
         }
@@ -1387,6 +1400,16 @@ async function tgApi(method, payload, isForm = false) {
   return data.result;
 }
 
+let botUsernameCache = null;
+async function botHint() {
+  try {
+    if (!botUsernameCache) botUsernameCache = '@' + (await tgApi('getMe', {})).username;
+    return `. Подпись проверяется токеном бота ${botUsernameCache}: открой приложение через этого бота (его кнопка меню или ссылка), а не через другого`;
+  } catch {
+    return '. Проверь, что приложение открыто через того бота, чей токен задан в TELEGRAM_BOT_TOKEN';
+  }
+}
+
 // Проверка подписи initData по документации Telegram Mini Apps:
 // secret = HMAC_SHA256(ключ "WebAppData", сообщение: токен бота), hash = HMAC_SHA256(ключ secret, строка проверки)
 function verifyTelegramInitData(initData) {
@@ -1404,7 +1427,7 @@ function verifyTelegramInitData(initData) {
   let given;
   try { given = Buffer.from(hash, 'hex'); } catch { given = Buffer.alloc(0); }
   if (given.length !== calc.length || !crypto.timingSafeEqual(given, calc)) {
-    return { ok: false, status: 403, error: 'Подпись данных Telegram не прошла проверку' };
+    return { ok: false, status: 403, signatureMismatch: true, error: 'Подпись данных Telegram не прошла проверку' };
   }
   const age = Math.floor(Date.now() / 1000) - Number(params.get('auth_date') || 0);
   if (!(age >= -60 && age <= INIT_DATA_MAX_AGE_SEC)) {
