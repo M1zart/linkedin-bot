@@ -642,6 +642,7 @@
     let lastMode = '';
     let lastInput = '';
     let lastTone = '';
+    let lastRubric = 'auto'; // рубрика последнего запуска «рубрикатора», нужна для «Ещё раз»
 
     async function generate(mode) {
       let input;
@@ -674,9 +675,9 @@
         if (lastMode === 'comment') {
           await callCommentsAPI(lastInput);
         } else if (lastMode === 'format') {
-          await formatLinkedIn();
+          await formatLinkedIn(lastInput);
         } else if (lastMode === 'newsquote') {
-          await generateNewsQuote();
+          await generateNewsQuote(lastInput, lastRubric);
         } else {
           await callAPI(lastMode, lastInput, lastTone);
         }
@@ -884,15 +885,14 @@
       document.getElementById('char-count').textContent = lastGenerated.length + ' символов';
     });
 
-    // Список рубрик в редакторе берётся из вкладки «Рубрика», чтобы он был один
+    // Список рубрик в редакторе берётся из вкладки «Готовый», чтобы он был один (только справочник, не состояние)
     document.getElementById('editor-rubric-select').innerHTML = document.getElementById('rubric-select').innerHTML;
 
-    // «Применить рубрику»: рубрика, акценты, хэштег и подпись прямо в редакторе, без перехода на другую вкладку
+    // «Применить рубрику»: рубрика, акценты, хэштег и подпись прямо в редакторе, без перехода на другую вкладку.
+    // Текст и рубрика передаются параметрами: поля других вкладок не читаются и не меняются.
     function applyRubricInEditor() {
       if (!lastGenerated.trim()) return;
-      document.getElementById('newsquote-input').value = lastGenerated;
-      document.getElementById('rubric-select').value = document.getElementById('editor-rubric-select').value;
-      generateNewsQuote();
+      generateNewsQuote(lastGenerated, document.getElementById('editor-rubric-select').value);
     }
 
     // «←»: закрыть редактор и вернуться на вкладку, с которой начат черновик; поля ввода сохраняются
@@ -993,12 +993,13 @@
     // LinkedIn — только разбивка на абзацы и маркеры
     function processReady() {
       originMode = 'newsquote';
-      if (getReadyPlatform() === 'telegram') generateNewsQuote();
-      else formatLinkedIn();
+      const text = document.getElementById('newsquote-input').value;
+      if (getReadyPlatform() === 'telegram') generateNewsQuote(text, document.getElementById('rubric-select').value);
+      else formatLinkedIn(text);
     }
 
-    async function formatLinkedIn() {
-      const input = document.getElementById('newsquote-input').value.trim();
+    async function formatLinkedIn(text) {
+      const input = (text || '').trim();
       if (!input) {
         showError('Вставь текст поста');
         return;
@@ -1042,25 +1043,27 @@
       }
     }
 
-    async function generateNewsQuote() {
-      const input = document.getElementById('newsquote-input').value.trim();
+    // text и rubricValue ('auto' или номер рубрики) приходят параметрами от вызывающего: вкладки «Готовый»,
+    // редактора или «Ещё раз». Эта функция не читает поля никаких вкладок.
+    async function generateNewsQuote(text, rubricValue = 'auto') {
+      const input = (text || '').trim();
       if (!input) {
         showError('Вставь текст поста');
         return;
       }
 
-      const rubricValue = document.getElementById('rubric-select').value;
       let forcedLabel = null;
       let forcedHashtag = null;
       if (rubricValue !== 'auto') {
-        const select = document.getElementById('rubric-select');
-        forcedLabel = select.options[select.selectedIndex].textContent;
-        forcedHashtag = RUBRIC_HASHTAGS[rubricValue];
+        const option = [...document.getElementById('rubric-select').options].find(o => o.value === rubricValue);
+        forcedLabel = option ? option.textContent : null;
+        forcedHashtag = RUBRIC_HASHTAGS[rubricValue] || null;
       }
 
       lastMode = 'newsquote';
       lastInput = input;
       lastTone = 'telegram';
+      lastRubric = rubricValue;
 
       const inEditor = isEditorOpen();
       const busyText = forcedLabel ? 'Оформляю...' : 'Определяю рубрику...';
@@ -1082,11 +1085,11 @@
 
         const data = await readApi(response);
 
-        const text = data.text;
-        if (!text) throw new Error('Пустой ответ');
+        const resultText = data.text;
+        if (!resultText) throw new Error('Пустой ответ');
 
-        lastGenerated = text;
-        showResult(text, true, false);
+        lastGenerated = resultText;
+        showResult(resultText, true, false);
 
       } catch (err) {
         if (inEditor) setEditorStatus('Ошибка: ' + err.message, true);
