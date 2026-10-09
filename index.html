@@ -313,6 +313,62 @@
       display: block;
     }
 
+    /* Обложка: карточка в стиле игрового рейтинга */
+    #cover-section {
+      margin-top: 4px;
+    }
+
+    .muted-note {
+      font-weight: 400;
+      text-transform: none;
+      letter-spacing: 0;
+      margin-left: 6px;
+    }
+
+    .cover-fields {
+      display: none;
+      gap: 8px;
+      margin-top: 12px;
+    }
+
+    .cover-fields.show {
+      display: flex;
+    }
+
+    .cover-fields input {
+      margin-bottom: 0;
+      min-width: 0;
+    }
+
+    #cover-number { flex: 0 0 22%; }
+    #cover-label { flex: 0 0 22%; }
+    #cover-caption { flex: 1; }
+
+    .cover-variants {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 8px;
+      margin-top: 12px;
+    }
+
+    .cover-variants canvas {
+      width: 100%;
+      height: auto;
+      border-radius: 10px;
+      border: 2px solid var(--border);
+      cursor: pointer;
+    }
+
+    .cover-variants canvas.selected {
+      border-color: var(--accent);
+    }
+
+    .cover-state {
+      font-size: 13px;
+      color: var(--text-dim);
+      margin-top: 10px;
+    }
+
     .editor-status.error {
       color: var(--red);
       border-top-color: var(--red);
@@ -580,6 +636,21 @@
         <select id="editor-rubric-select"></select>
         <button class="action-btn" id="next-rubric-btn" style="width:100%;" onclick="applyRubricInEditor()">Применить рубрику и оформить</button>
       </div>
+
+      <div id="cover-section">
+        <div class="field-label">Обложка <span class="muted-note">необязательно</span></div>
+        <div class="result-actions">
+          <button class="action-btn" id="cover-gen-btn" onclick="generateCover()">🎴 Сгенерировать обложку</button>
+          <button class="action-btn" id="cover-skip-btn" onclick="skipCover()">Без картинки</button>
+        </div>
+        <div class="cover-fields" id="cover-fields">
+          <input type="text" id="cover-number" placeholder="Цифра" maxlength="6" />
+          <input type="text" id="cover-label" placeholder="Код" maxlength="6" />
+          <input type="text" id="cover-caption" placeholder="Титул карточки" maxlength="40" />
+        </div>
+        <div class="cover-variants" id="cover-variants"></div>
+        <div class="cover-state" id="cover-state"></div>
+      </div>
     </div>
 
     <div class="editor-status" id="editor-status"></div>
@@ -658,7 +729,7 @@
       }
 
       const tone = mode === 'comment' ? '' : mode === 'telegram' ? 'telegram' : getSelectedTone(mode);
-      if (mode !== 'comment') originMode = mode;
+      if (mode !== 'comment') { originMode = mode; resetCover(); }
       lastMode = mode;
       lastInput = input;
       lastTone = tone;
@@ -700,6 +771,7 @@
     async function callAPI(mode, input, tone) {
       const isTg = tone === 'telegram';
       const inEditor = isEditorOpen();
+      resetCover(); // новый текст поста: прежняя обложка относилась к старому
       if (inEditor) {
         setEditorStatus('Пишу заново...');
         setEditorBusy(true);
@@ -972,6 +1044,252 @@
       '13': '#бот_матчи', '14': '#инструменты', '15': '#воскресное'
     };
 
+    // ===== ОБЛОЖКА: карточка в стиле игрового рейтинга =====
+    // Gemini рисует только арт (без текста). Рамку, цифру, код темы и титул накладывает приложение на canvas:
+    // так кириллица и цифры получаются точными, а их можно править в полях под кнопками.
+    //
+    // Состояние обложки черновика: 'none' (не выбирали), 'selected' (выбран вариант), 'skipped' («Без картинки»).
+    // Для публикации (пункт 6) картинка берётся через getCoverDataUrl(): null означает «публиковать текстом».
+    const cover = { status: 'none', arts: [], selected: -1, dataUrl: null, busy: false };
+
+    function getCoverDataUrl() {
+      return cover.status === 'selected' ? cover.dataUrl : null;
+    }
+
+    function setCoverState(msg) {
+      document.getElementById('cover-state').textContent = msg || '';
+    }
+
+    function resetCover() {
+      cover.status = 'none';
+      cover.arts = [];
+      cover.selected = -1;
+      cover.dataUrl = null;
+      document.getElementById('cover-variants').innerHTML = '';
+      document.getElementById('cover-fields').classList.remove('show');
+      setCoverState('');
+    }
+
+    function skipCover() {
+      cover.status = 'skipped';
+      cover.selected = -1;
+      cover.dataUrl = null;
+      document.querySelectorAll('#cover-variants canvas').forEach(c => c.classList.remove('selected'));
+      setCoverState('Без картинки: пост будет опубликован текстом.');
+    }
+
+    function drawCoverCard(canvas, art, plan) {
+      const W = 1080, H = 1440, M = 56;
+      canvas.width = W;
+      canvas.height = H;
+      const g = canvas.getContext('2d');
+      const FONT = '"Arial Black","Segoe UI",Arial,sans-serif';
+      const gold = (x0, y0, x1, y1) => {
+        const gr = g.createLinearGradient(x0, y0, x1, y1);
+        gr.addColorStop(0, '#f6e27a'); gr.addColorStop(0.5, '#c9962b'); gr.addColorStop(1, '#f3d97b');
+        return gr;
+      };
+      const roundRect = (x, y, w, h, r) => {
+        g.beginPath();
+        g.moveTo(x + r, y);
+        g.arcTo(x + w, y, x + w, y + h, r);
+        g.arcTo(x + w, y + h, x, y + h, r);
+        g.arcTo(x, y + h, x, y, r);
+        g.arcTo(x, y, x + w, y, r);
+        g.closePath();
+      };
+
+      const bg = g.createLinearGradient(0, 0, W, H);
+      bg.addColorStop(0, '#0a0a10'); bg.addColorStop(1, '#1b1407');
+      g.fillStyle = bg;
+      g.fillRect(0, 0, W, H);
+
+      g.save();
+      roundRect(M, M, W - 2 * M, H - 2 * M, 44);
+      g.clip();
+      if (art) {
+        const s = Math.max((W - 2 * M) / art.width, (H - 2 * M) / art.height);
+        const dw = art.width * s, dh = art.height * s;
+        g.drawImage(art, (W - dw) / 2, (H - dh) / 2, dw, dh);
+      }
+      // затемнение сверху и снизу, чтобы цифра и титул читались на любом арте
+      const top = g.createLinearGradient(0, M, 0, 560);
+      top.addColorStop(0, 'rgba(0,0,0,0.75)'); top.addColorStop(1, 'rgba(0,0,0,0)');
+      g.fillStyle = top;
+      g.fillRect(M, M, W - 2 * M, 560);
+      const bot = g.createLinearGradient(0, H - 600, 0, H - M);
+      bot.addColorStop(0, 'rgba(0,0,0,0)'); bot.addColorStop(0.55, 'rgba(0,0,0,0.85)'); bot.addColorStop(1, 'rgba(0,0,0,0.95)');
+      g.fillStyle = bot;
+      g.fillRect(M, H - 600, W - 2 * M, 600 - M);
+      g.restore();
+
+      // золотая двойная рамка
+      g.strokeStyle = gold(0, 0, W, H);
+      g.lineWidth = 16;
+      roundRect(M, M, W - 2 * M, H - 2 * M, 44);
+      g.stroke();
+      g.lineWidth = 3;
+      roundRect(M + 28, M + 28, W - 2 * M - 56, H - 2 * M - 56, 28);
+      g.stroke();
+
+      // цифра и код темы слева сверху
+      const left = M + 84;
+      g.textAlign = 'left';
+      g.textBaseline = 'alphabetic';
+      const number = (plan.number || '').trim();
+      const label = (plan.label || '').trim().toUpperCase();
+      let y = M + 70;
+      if (number) {
+        let size = 240;
+        g.font = `900 ${size}px ${FONT}`;
+        while (g.measureText(number).width > 440 && size > 80) { size -= 6; g.font = `900 ${size}px ${FONT}`; }
+        y += size * 0.82;
+        g.fillStyle = gold(left, y - size, left, y);
+        g.fillText(number, left, y);
+        y += 20;
+      }
+      if (label) {
+        const size = number ? 64 : 170;
+        g.font = `800 ${size}px ${FONT}`;
+        y += size * 0.95;
+        g.fillStyle = gold(left, y - size, left, y);
+        g.fillText(label, left, y);
+        const w = Math.min(g.measureText(label).width, 440);
+        g.fillRect(left, y + 18, w, 5);
+      }
+
+      // титул карточки внизу по центру
+      const caption = (plan.caption || '').trim().toUpperCase();
+      if (caption) {
+        const maxW = W - 2 * M - 168;
+        g.textAlign = 'center';
+        g.fillStyle = '#f6e9b8';
+        let size = 84;
+        g.font = `800 ${size}px ${FONT}`;
+        while (g.measureText(caption).width > maxW && size > 46) { size -= 4; g.font = `800 ${size}px ${FONT}`; }
+        let lines = [caption];
+        if (g.measureText(caption).width > maxW) {
+          size = 58;
+          g.font = `800 ${size}px ${FONT}`;
+          const words = caption.split(' ');
+          let a = '';
+          const l = [];
+          for (const w of words) {
+            if (g.measureText((a + ' ' + w).trim()).width > maxW && a) { l.push(a); a = w; } else a = (a + ' ' + w).trim();
+          }
+          l.push(a);
+          lines = l.slice(0, 3);
+        }
+        const lineH = size * 1.15;
+        const baseY = H - M - 110 - (lines.length - 1) * lineH;
+        g.fillStyle = gold(left, baseY - 100, W - left, baseY);
+        g.fillRect(left, baseY - size - 44, W - 2 * left, 5);
+        g.fillStyle = '#f6e9b8';
+        lines.forEach((ln, i) => g.fillText(ln, W / 2, baseY + i * lineH));
+      }
+    }
+
+    function getCoverPlanFromFields() {
+      return {
+        number: document.getElementById('cover-number').value,
+        label: document.getElementById('cover-label').value,
+        caption: document.getElementById('cover-caption').value
+      };
+    }
+
+    function renderCoverVariants() {
+      const box = document.getElementById('cover-variants');
+      box.innerHTML = '';
+      const plan = getCoverPlanFromFields();
+      cover.arts.forEach((art, i) => {
+        const c = document.createElement('canvas');
+        drawCoverCard(c, art, plan);
+        if (i === cover.selected) c.classList.add('selected');
+        c.addEventListener('click', () => selectCover(i));
+        box.appendChild(c);
+      });
+      // если выбранный вариант перерисовался (правка цифры или титула), обновляем итоговую картинку
+      if (cover.status === 'selected' && cover.selected >= 0) {
+        cover.dataUrl = box.children[cover.selected].toDataURL('image/png');
+      }
+    }
+
+    function selectCover(i) {
+      cover.selected = i;
+      cover.status = 'selected';
+      const canvases = document.querySelectorAll('#cover-variants canvas');
+      canvases.forEach((c, idx) => c.classList.toggle('selected', idx === i));
+      cover.dataUrl = canvases[i].toDataURL('image/png');
+      setCoverState('Обложка выбрана. Цифру, код и титул можно править в полях выше.');
+    }
+
+    ['cover-number', 'cover-label', 'cover-caption'].forEach(id => {
+      document.getElementById(id).addEventListener('input', () => { if (cover.arts.length) renderCoverVariants(); });
+    });
+
+    function loadImage(dataUrl) {
+      return new Promise((resolve, reject) => {
+        const img = new Image();
+        img.onload = () => resolve(img);
+        img.onerror = () => reject(new Error('картинка не загрузилась'));
+        img.src = dataUrl;
+      });
+    }
+
+    async function generateCover() {
+      const text = lastGenerated.trim();
+      if (!text || cover.busy) return;
+      cover.busy = true;
+      setEditorBusy(true);
+      cover.status = 'none';
+      cover.selected = -1;
+      cover.dataUrl = null;
+      setCoverState('');
+      try {
+        setEditorStatus('Готовлю план обложки...');
+        const planResp = await fetch('/api/cover-plan', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ postText: text })
+        });
+        const { plan } = await readApi(planResp);
+        document.getElementById('cover-number').value = plan.number || '';
+        document.getElementById('cover-label').value = plan.label || '';
+        document.getElementById('cover-caption').value = plan.caption || '';
+        document.getElementById('cover-fields').classList.add('show');
+
+        setEditorStatus('Генерирую арт, это может занять до минуты...');
+        let imageError = '';
+        cover.arts = [];
+        try {
+          const imgResp = await fetch('/api/cover-image', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ artPrompt: plan.art_prompt, count: 3 })
+          });
+          const { images } = await readApi(imgResp);
+          cover.arts = await Promise.all(images.map(i => loadImage(i.dataUrl)));
+        } catch (err) {
+          imageError = err.message;
+        }
+
+        if (!cover.arts.length) {
+          // Gemini недоступен: показываем карточку без арта (рамка, цифра, титул), чтобы обложку всё равно можно было взять
+          cover.arts = [null];
+          setCoverState('Арт не получился: ' + imageError + '. Ниже карточка без арта, её тоже можно взять.');
+        } else {
+          setCoverState('Выбери вариант или нажми «Без картинки».');
+        }
+        renderCoverVariants();
+        setEditorStatus('');
+      } catch (err) {
+        setEditorStatus('Ошибка обложки: ' + err.message, true);
+      } finally {
+        cover.busy = false;
+        setEditorBusy(false);
+      }
+    }
+
     // ===== ВХОД 2: готовый текст =====
 
     function getReadyPlatform() {
@@ -993,6 +1311,7 @@
     // LinkedIn — только разбивка на абзацы и маркеры
     function processReady() {
       originMode = 'newsquote';
+      resetCover();
       const text = document.getElementById('newsquote-input').value;
       if (getReadyPlatform() === 'telegram') generateNewsQuote(text, document.getElementById('rubric-select').value);
       else formatLinkedIn(text);

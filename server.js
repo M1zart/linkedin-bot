@@ -5,6 +5,10 @@ const path = require('path');
 const PORT = process.env.PORT || 3000;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const NOTION_API_KEY = process.env.NOTION_API_KEY;
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+// Модель и адрес вынесены в переменные окружения: у Google они менялись, и подстроить их можно без правки кода
+const GEMINI_IMAGE_MODEL = process.env.GEMINI_IMAGE_MODEL || 'gemini-nano-banana-2.1';
+const GEMINI_API_URL = process.env.GEMINI_API_URL || 'https://generativelanguage.googleapis.com/v1beta/interactions';
 const NOTION_DATABASE_ID = 'a81c0118449d47388b3fb612a509cd38';
 const DRAFT_LAB_DATA_SOURCE_ID = '14814719-85c5-4819-a07e-3d1b773d6bdb';
 const CAREER_CASES_DATA_SOURCE_ID = 'a81c0118-449d-4738-8b3f-b612a509cd38';
@@ -490,9 +494,201 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // ── Обложка, шаг 1: Claude выбирает из поста цифру, титул, код темы и описание арта ──
+  if (req.method === 'POST' && req.url === '/api/cover-plan') {
+    let body = '';
+    req.on('data', chunk => body += chunk);
+    req.on('end', async () => {
+      try {
+        const { postText } = JSON.parse(body);
+        if (!postText || !postText.trim()) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Пустой текст поста' }));
+          return;
+        }
+
+        const response = await fetch('https://api.anthropic.com/v1/messages', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-api-key': ANTHROPIC_API_KEY,
+            'anthropic-version': '2023-06-01',
+          },
+          body: JSON.stringify({
+            model: MODEL,
+            max_tokens: 1024,
+            system: getCoverPlanSystemPrompt(),
+            messages: [{ role: 'user', content: postText }]
+          })
+        });
+        const data = await response.json();
+
+        if (!response.ok) {
+          console.error('cover-plan API error:', JSON.stringify(data));
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: data.error?.message || 'API error' }));
+          return;
+        }
+        if (data.stop_reason === 'max_tokens') {
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Ответ модели обрезан по лимиту длины.' }));
+          return;
+        }
+
+        const plan = parseCoverPlan(data.content?.[0]?.text || '');
+        if (!plan) {
+          console.error('cover-plan: не удалось разобрать JSON:', (data.content?.[0]?.text || '').slice(0, 300));
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Не удалось разобрать план обложки, попробуй ещё раз' }));
+          return;
+        }
+
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ plan }));
+
+      } catch (err) {
+        console.error('cover-plan catch error:', err.message);
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    });
+    return;
+  }
+
+  // ── Обложка, шаг 2: Gemini рисует 1-3 варианта арта (без текста; рамку и надписи накладывает приложение) ──
+  if (req.method === 'POST' && req.url === '/api/cover-image') {
+    let body = '';
+    req.on('data', chunk => body += chunk);
+    req.on('end', async () => {
+      try {
+        if (!GEMINI_API_KEY) {
+          res.writeHead(503, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'GEMINI_API_KEY не задан в переменных Railway' }));
+          return;
+        }
+
+        const { artPrompt, count } = JSON.parse(body);
+        if (!artPrompt || !artPrompt.trim()) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Нет описания арта' }));
+          return;
+        }
+
+        const n = Math.min(Math.max(parseInt(count, 10) || 3, 1), 3);
+        const results = await Promise.allSettled(
+          Array.from({ length: n }, (_, i) => geminiGenerateImage(buildCoverImagePrompt(artPrompt, i)))
+        );
+
+        const images = results.filter(r => r.status === 'fulfilled').map(r => ({ dataUrl: `data:${r.value.mime};base64,${r.value.data}` }));
+        const errors = results.filter(r => r.status === 'rejected').map(r => r.reason.message);
+
+        if (!images.length) {
+          console.error('cover-image: все варианты не удались:', errors);
+          res.writeHead(502, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: errors[0] || 'Не удалось сгенерировать картинку' }));
+          return;
+        }
+
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ images, errors }));
+
+      } catch (err) {
+        console.error('cover-image catch error:', err.message);
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    });
+    return;
+  }
+
   res.writeHead(404);
   res.end('Not found');
 });
+
+// ── Обложка: вспомогательные функции ─────────────────────────────────
+
+function getCoverPlanSystemPrompt() {
+  return `Ты готовишь обложку для поста Дмитрия Скакунова (iGaming, спортбук) в виде игровой карточки, как карточка игрока в FIFA Ultimate Team: большая цифра рейтинга, короткий код темы, титул внизу и арт в центре.
+
+Прочитай пост и верни ТОЛЬКО JSON без пояснений и без обрамления кодом:
+{"number": "...", "label": "...", "caption": "...", "art_prompt": "..."}
+
+number: главная цифра поста, которая должна бросаться в глаза, максимум 5 символов, например "+40%", "8%", "3x", "18", "2.5x". Бери цифру, которая реально есть в посте и несёт его смысл. Если в посте нет значимой цифры, верни пустую строку. Цифры не выдумывай.
+label: код темы, от 2 до 5 заглавных латинских букв, как позиция игрока: GGR, NGR, HOLD, CRM, KPI, LIVE, RISK, GEO, PNL, BONUS. Выбери самый точный.
+caption: титул карточки по-русски, от 2 до 4 слов, суть поста, без точки. Не используй букву «ё» (только «е»). Не используй тире и дефисы.
+art_prompt: описание центрального арта на английском, одно или два предложения. Силуэт или символический объект по теме поста (например, силуэт игрока в движении, мяч, график, щит, весы), в тёмной палитре с золотыми акцентами. В арте не должно быть текста, букв, цифр, логотипов, брендов и узнаваемых реальных людей.`;
+}
+
+function parseCoverPlan(raw) {
+  const m = raw.match(/\{[\s\S]*\}/);
+  if (!m) return null;
+  let obj;
+  try { obj = JSON.parse(m[0]); } catch { return null; }
+  if (typeof obj.art_prompt !== 'string' || !obj.art_prompt.trim()) return null;
+  // Форма карточки жёсткая: страхуемся от слишком длинных значений и запрещённых символов в титуле
+  const clean = (s, max) => String(s || '').replace(/ё/g, 'е').replace(/Ё/g, 'Е').slice(0, max).trim();
+  return {
+    number: clean(obj.number, 6),
+    label: clean(obj.label, 6).toUpperCase(),
+    caption: clean(obj.caption, 40).replace(/[-–—]/g, ' ').replace(/\s+/g, ' '),
+    art_prompt: obj.art_prompt.trim()
+  };
+}
+
+const COVER_ART_STYLE = 'Premium collectible football trading card artwork, dark near-black background, subtle gold accents and light rays, one centered subject, cinematic lighting, portrait composition. Absolutely no text, no letters, no numbers, no logos, no watermarks, no frame or border.';
+const COVER_VARIATIONS = ['', ' Variation: a different camera angle and composition.', ' Variation: more abstract and geometric treatment.'];
+
+function buildCoverImagePrompt(artPrompt, index) {
+  return `${artPrompt.trim()} ${COVER_ART_STYLE}${COVER_VARIATIONS[index] || ''}`;
+}
+
+// Достаёт base64-картинку из ответа Gemini, не привязываясь к точной форме JSON:
+// формат ответа у Google менялся (steps/outputs/candidates, inlineData/inline_data)
+function findImage(node) {
+  if (!node || typeof node !== 'object') return null;
+  if (node.type === 'image' && typeof node.data === 'string' && node.data.length > 100) {
+    return { data: node.data, mime: node.mime_type || node.mimeType || 'image/png' };
+  }
+  const inline = node.inlineData || node.inline_data;
+  if (inline && typeof inline.data === 'string') {
+    return { data: inline.data, mime: inline.mimeType || inline.mime_type || 'image/png' };
+  }
+  for (const v of Object.values(node)) {
+    const found = findImage(v);
+    if (found) return found;
+  }
+  return null;
+}
+
+async function geminiGenerateImage(prompt) {
+  const call = async (withFormat) => {
+    const reqBody = { model: GEMINI_IMAGE_MODEL, input: [{ type: 'text', text: prompt }] };
+    if (withFormat) reqBody.response_format = { type: 'image', aspect_ratio: '3:4' };
+    const resp = await fetch(GEMINI_API_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY },
+      body: JSON.stringify(reqBody)
+    });
+    const raw = await resp.text();
+    let data = null;
+    try { data = JSON.parse(raw); } catch {}
+    return { resp, data, raw };
+  };
+
+  let r = await call(true);
+  // Если Google не принял параметры формата, пробуем без них (картинка будет в размере по умолчанию)
+  if (r.resp.status === 400) r = await call(false);
+
+  if (!r.resp.ok) {
+    throw new Error(`Gemini ${r.resp.status}: ${r.data?.error?.message || r.raw.replace(/\s+/g, ' ').slice(0, 200)}`);
+  }
+  const img = findImage(r.data);
+  if (!img) {
+    console.error('Gemini: в ответе нет картинки; поля ответа:', Object.keys(r.data || {}), 'status:', r.data?.status);
+    throw new Error('Gemini не вернул картинку (возможно, сработал фильтр безопасности)');
+  }
+  return img;
+}
 
 function detectLanguage(text) {
   const sample = text.slice(0, 500);
