@@ -9,6 +9,7 @@ const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 // Модель и адрес вынесены в переменные окружения: у Google они менялись, и подстроить их можно без правки кода
 const GEMINI_IMAGE_MODEL = process.env.GEMINI_IMAGE_MODEL || 'gemini-nano-banana-2.1';
 const GEMINI_API_URL = process.env.GEMINI_API_URL || 'https://generativelanguage.googleapis.com/v1beta/interactions';
+const GEMINI_LEGACY_BASE = 'https://generativelanguage.googleapis.com/v1beta/models';
 const NOTION_DATABASE_ID = 'a81c0118449d47388b3fb612a509cd38';
 const DRAFT_LAB_DATA_SOURCE_ID = '14814719-85c5-4819-a07e-3d1b773d6bdb';
 const CAREER_CASES_DATA_SOURCE_ID = 'a81c0118-449d-4738-8b3f-b612a509cd38';
@@ -494,6 +495,37 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // ── Проверка Gemini: принимает ли Google ключ и какие модели картинок доступны. Ключ в ответ не попадает ──
+  if (req.method === 'GET' && req.url === '/api/cover-diag') {
+    try {
+      const out = { keyPresent: !!GEMINI_API_KEY, configuredModel: GEMINI_IMAGE_MODEL, endpoint: GEMINI_API_URL };
+      if (GEMINI_API_KEY) {
+        const resp = await fetch('https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000', {
+          headers: { 'x-goog-api-key': GEMINI_API_KEY }
+        });
+        const raw = await resp.text();
+        let data = null;
+        try { data = JSON.parse(raw); } catch {}
+        out.listStatus = resp.status;
+        if (resp.ok) {
+          const names = (data?.models || []).map(m => String(m.name || '').replace(/^models\//, ''));
+          out.keyAccepted = true;
+          out.configuredModelAvailable = names.includes(GEMINI_IMAGE_MODEL);
+          out.imageModels = names.filter(n => /image|banana|imagen/i.test(n)).slice(0, 40);
+        } else {
+          out.keyAccepted = false;
+          out.error = geminiError(data, raw).message;
+        }
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify(out, null, 2));
+    } catch (err) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: err.message }));
+    }
+    return;
+  }
+
   // ── Обложка, шаг 1: Claude выбирает из поста цифру, титул, код темы и описание арта ──
   if (req.method === 'POST' && req.url === '/api/cover-plan') {
     let body = '';
@@ -660,28 +692,59 @@ function findImage(node) {
   return null;
 }
 
+// Google отдаёт ошибки то объектом {error}, то массивом [{error}]
+function geminiError(data, raw) {
+  const e = Array.isArray(data) ? data[0]?.error : data?.error;
+  return {
+    message: e?.message || raw.replace(/\s+/g, ' ').slice(0, 200),
+    keyInvalid: /API key|API_KEY/i.test(JSON.stringify(e || ''))
+  };
+}
+
+async function geminiPost(url, reqBody) {
+  const resp = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY },
+    body: JSON.stringify(reqBody)
+  });
+  const raw = await resp.text();
+  let data = null;
+  try { data = JSON.parse(raw); } catch {}
+  return { resp, data, raw };
+}
+
 async function geminiGenerateImage(prompt) {
-  const call = async (withFormat) => {
-    const reqBody = { model: GEMINI_IMAGE_MODEL, input: [{ type: 'text', text: prompt }] };
-    if (withFormat) reqBody.response_format = { type: 'image', aspect_ratio: '3:4' };
-    const resp = await fetch(GEMINI_API_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY },
-      body: JSON.stringify(reqBody)
-    });
-    const raw = await resp.text();
-    let data = null;
-    try { data = JSON.parse(raw); } catch {}
-    return { resp, data, raw };
+  const interactionBody = (withFormat) => {
+    const b = { model: GEMINI_IMAGE_MODEL, input: [{ type: 'text', text: prompt }] };
+    if (withFormat) b.response_format = { type: 'image', aspect_ratio: '3:4' };
+    return b;
   };
 
-  let r = await call(true);
-  // Если Google не принял параметры формата, пробуем без них (картинка будет в размере по умолчанию)
-  if (r.resp.status === 400) r = await call(false);
+  let r = await geminiPost(GEMINI_API_URL, interactionBody(true));
+  let err = r.resp.ok ? null : geminiError(r.data, r.raw);
 
-  if (!r.resp.ok) {
-    throw new Error(`Gemini ${r.resp.status}: ${r.data?.error?.message || r.raw.replace(/\s+/g, ' ').slice(0, 200)}`);
+  // Google не принял параметры формата: пробуем без них (картинка будет в размере по умолчанию).
+  // При неверном ключе повтор бессмыслен.
+  if (err && r.resp.status === 400 && !err.keyInvalid) {
+    r = await geminiPost(GEMINI_API_URL, interactionBody(false));
+    err = r.resp.ok ? null : geminiError(r.data, r.raw);
   }
+
+  // Запасной путь: прежний формат generateContent, если новый не знает модель или не принимает запрос
+  if (err && !err.keyInvalid && (r.resp.status === 400 || r.resp.status === 404)) {
+    const lr = await geminiPost(`${GEMINI_LEGACY_BASE}/${GEMINI_IMAGE_MODEL}:generateContent`, {
+      contents: [{ parts: [{ text: prompt }] }],
+      generationConfig: { responseModalities: ['IMAGE'], imageConfig: { aspectRatio: '3:4' } }
+    });
+    if (lr.resp.ok) {
+      r = lr;
+      err = null;
+    } else {
+      err.message += ` | запасной путь generateContent ${lr.resp.status}: ${geminiError(lr.data, lr.raw).message}`;
+    }
+  }
+
+  if (err) throw new Error(`Gemini ${r.resp.status}: ${err.message}`);
   const img = findImage(r.data);
   if (!img) {
     console.error('Gemini: в ответе нет картинки; поля ответа:', Object.keys(r.data || {}), 'status:', r.data?.status);

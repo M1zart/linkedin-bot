@@ -363,6 +363,24 @@
       border-color: var(--accent);
     }
 
+    .cover-preview-box {
+      display: none;
+      margin-top: 14px;
+    }
+
+    .cover-preview-box.show {
+      display: block;
+    }
+
+    .cover-preview-box img {
+      display: block;
+      width: 100%;
+      max-width: 420px;
+      margin: 0 auto 10px;
+      border-radius: 12px;
+      border: 1px solid var(--border);
+    }
+
     .cover-state {
       font-size: 13px;
       color: var(--text-dim);
@@ -650,6 +668,14 @@
         </div>
         <div class="cover-variants" id="cover-variants"></div>
         <div class="cover-state" id="cover-state"></div>
+        <div class="cover-preview-box" id="cover-preview-box">
+          <img id="cover-preview" alt="Выбранная обложка" />
+          <div class="result-actions">
+            <button class="action-btn" onclick="copyCoverImage()">📋 Копировать картинку</button>
+            <button class="action-btn" onclick="downloadCover()">⬇️ Скачать</button>
+          </div>
+          <div class="cover-state">Если кнопки не сработали, нажми на картинку и удерживай: телефон предложит сохранить или скопировать её.</div>
+        </div>
       </div>
     </div>
 
@@ -882,9 +908,15 @@
         document.execCommand('copy');
         document.body.removeChild(ta);
       }
+      showToast('Скопировано!');
+    }
+
+    function showToast(msg, isError = false) {
       const toast = document.getElementById('copy-toast');
+      toast.textContent = msg;
+      toast.style.background = isError ? 'var(--red)' : '';
       toast.classList.add('show');
-      setTimeout(() => toast.classList.remove('show'), 2000);
+      setTimeout(() => toast.classList.remove('show'), 2200);
     }
 
     function showResult(text, isTg = false, isSubstack = false) {
@@ -1068,6 +1100,7 @@
       document.getElementById('cover-variants').innerHTML = '';
       document.getElementById('cover-fields').classList.remove('show');
       setCoverState('');
+      updateCoverPreview();
     }
 
     function skipCover() {
@@ -1076,6 +1109,64 @@
       cover.dataUrl = null;
       document.querySelectorAll('#cover-variants canvas').forEach(c => c.classList.remove('selected'));
       setCoverState('Без картинки: пост будет опубликован текстом.');
+      updateCoverPreview();
+    }
+
+    // Крупный предпросмотр выбранной карточки с кнопками «Копировать картинку» и «Скачать»
+    function updateCoverPreview() {
+      const box = document.getElementById('cover-preview-box');
+      const img = document.getElementById('cover-preview');
+      if (cover.status === 'selected' && cover.dataUrl) {
+        img.src = cover.dataUrl;
+        box.classList.add('show');
+      } else {
+        img.removeAttribute('src');
+        box.classList.remove('show');
+      }
+    }
+
+    function coverBlob() {
+      const [, b64] = cover.dataUrl.split(',');
+      const bin = atob(b64);
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      return new Blob([bytes], { type: 'image/png' });
+    }
+
+    // Копирует саму картинку в буфер обмена, чтобы вставить в Telegram вместе с текстом поста.
+    // В некоторых WebView (в том числе в Telegram) запись картинки в буфер запрещена: тогда подсказываем «Скачать».
+    async function copyCoverImage() {
+      if (!cover.dataUrl) return;
+      try {
+        await navigator.clipboard.write([new ClipboardItem({ 'image/png': coverBlob() })]);
+        showToast('Картинка скопирована');
+      } catch {
+        showToast('Не удалось скопировать. Нажми «Скачать» или удержи картинку', true);
+      }
+    }
+
+    // Сохранение: на телефоне через системное меню «Поделиться» (можно сразу отправить в Telegram или сохранить),
+    // иначе обычное скачивание файла
+    async function downloadCover() {
+      if (!cover.dataUrl) return;
+      const blob = coverBlob();
+      const file = new File([blob], 'cover.png', { type: 'image/png' });
+      if (navigator.canShare && navigator.canShare({ files: [file] })) {
+        try {
+          await navigator.share({ files: [file] });
+          return;
+        } catch (err) {
+          if (err.name === 'AbortError') return; // пользователь закрыл меню
+        }
+      }
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = 'cover.png';
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+      showToast('Картинка сохраняется');
     }
 
     function drawCoverCard(canvas, art, plan) {
@@ -1212,6 +1303,7 @@
       if (cover.status === 'selected' && cover.selected >= 0) {
         cover.dataUrl = box.children[cover.selected].toDataURL('image/png');
       }
+      updateCoverPreview();
     }
 
     function selectCover(i) {
@@ -1221,6 +1313,7 @@
       canvases.forEach((c, idx) => c.classList.toggle('selected', idx === i));
       cover.dataUrl = canvases[i].toDataURL('image/png');
       setCoverState('Обложка выбрана. Цифру, код и титул можно править в полях выше.');
+      updateCoverPreview();
     }
 
     ['cover-number', 'cover-label', 'cover-caption'].forEach(id => {
@@ -1273,15 +1366,18 @@
           imageError = err.message;
         }
 
-        if (!cover.arts.length) {
+        const artFailed = !cover.arts.length;
+        if (artFailed) {
           // Gemini недоступен: показываем карточку без арта (рамка, цифра, титул), чтобы обложку всё равно можно было взять
           cover.arts = [null];
-          setCoverState('Арт не получился: ' + imageError + '. Ниже карточка без арта, её тоже можно взять.');
+          setCoverState('Это карточка без арта: Gemini не отдал картинку. Её тоже можно взять, или попробуй сгенерировать ещё раз.');
         } else {
           setCoverState('Выбери вариант или нажми «Без картинки».');
         }
         renderCoverVariants();
-        setEditorStatus('');
+        // Причина отказа Gemini: красная строка над нижней панелью, чтобы её нельзя было пропустить
+        if (artFailed) setEditorStatus('Gemini не сгенерировал арт: ' + imageError, true);
+        else setEditorStatus('');
       } catch (err) {
         setEditorStatus('Ошибка обложки: ' + err.message, true);
       } finally {
