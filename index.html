@@ -293,11 +293,20 @@
       border-color: var(--tg);
     }
 
+    /* Закреплён над нижней панелью, вне прокрутки: статус и ошибки всегда на виду */
     .editor-status {
       display: none;
+      flex-shrink: 0;
       font-size: 13px;
-      color: var(--text-dim);
-      margin-top: 10px;
+      color: var(--text);
+      background: var(--surface);
+      border-top: 1px solid var(--border);
+      padding: 10px 16px;
+    }
+
+    .action-btn:disabled {
+      opacity: 0.4;
+      cursor: not-allowed;
     }
 
     .editor-status.show {
@@ -306,6 +315,7 @@
 
     .editor-status.error {
       color: var(--red);
+      border-top-color: var(--red);
     }
 
     .editor-footer {
@@ -562,9 +572,9 @@
         <select id="editor-rubric-select"></select>
         <button class="action-btn" id="next-rubric-btn" style="width:100%;" onclick="applyRubricInEditor()">Применить рубрику и оформить</button>
       </div>
-
-      <div class="editor-status" id="editor-status"></div>
     </div>
+
+    <div class="editor-status" id="editor-status"></div>
 
     <div class="editor-footer">
       <div class="result-actions">
@@ -841,7 +851,7 @@
 
     function setEditorStatus(msg, isError = false) {
       const el = document.getElementById('editor-status');
-      el.textContent = msg;
+      el.textContent = msg && !isError ? '⏳ ' + msg : msg;
       el.classList.toggle('show', !!msg);
       el.classList.toggle('error', isError);
     }
