@@ -225,7 +225,7 @@ const server = http.createServer(async (req, res) => {
           },
           body: JSON.stringify({
             model: MODEL,
-            max_tokens: 1000,
+            max_tokens: 4096,
             system: systemPrompt,
             messages: [{ role: 'user', content: buildUserPrompt(prompt, tone, mode) }]
           })
@@ -236,6 +236,14 @@ const server = http.createServer(async (req, res) => {
         if (!response.ok) {
           res.writeHead(500, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: data.error?.message || 'API error' }));
+          return;
+        }
+
+        // Обрезанный черновик нельзя отдавать и пропускать через чистку: концовка поста потерялась бы молча
+        if (data.stop_reason === 'max_tokens') {
+          console.error('generate: ответ обрезан по max_tokens, тон', tone);
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Ответ модели обрезан по лимиту длины. Попробуй сузить тему или написать ещё раз.' }));
           return;
         }
 
