@@ -1,10 +1,16 @@
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
 const PORT = process.env.PORT || 3000;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const NOTION_API_KEY = process.env.NOTION_API_KEY;
+// Публикация в Telegram-канал: токен бота, канал (@имя или числовой -100...) и список Telegram ID, которым разрешено публиковать
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const TELEGRAM_CHANNEL_ID = process.env.TELEGRAM_CHANNEL_ID;
+const TELEGRAM_ALLOWED_USER_IDS = (process.env.TELEGRAM_ALLOWED_USER_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
+const INIT_DATA_MAX_AGE_SEC = 24 * 60 * 60;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 // Модель и адрес вынесены в переменные окружения: у Google они менялись, и подстроить их можно без правки кода
 const GEMINI_IMAGE_MODEL = process.env.GEMINI_IMAGE_MODEL || 'gemini-nano-banana-2.1';
@@ -495,6 +501,62 @@ const server = http.createServer(async (req, res) => {
         console.error('rubric-format catch error:', err.message);
         res.writeHead(500, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: err.message }));
+      }
+    });
+    return;
+  }
+
+  // ── Публикация в Telegram-канал: состояние настройки без пробных постов. Токен в ответ не попадает ──
+  if (req.method === 'GET' && req.url.split('?')[0] === '/api/publish-diag') {
+    const out = { tokenPresent: !!TELEGRAM_BOT_TOKEN, channel: TELEGRAM_CHANNEL_ID || null, allowedUsers: TELEGRAM_ALLOWED_USER_IDS.length };
+    try {
+      if (TELEGRAM_BOT_TOKEN) {
+        try {
+          const me = await tgApi('getMe', {});
+          out.bot = '@' + me.username;
+          out.botId = me.id;
+        } catch (e) { out.botError = friendlyTelegramError(e.message); }
+      }
+      if (TELEGRAM_BOT_TOKEN && TELEGRAM_CHANNEL_ID && out.botId) {
+        try {
+          const chat = await tgApi('getChat', { chat_id: TELEGRAM_CHANNEL_ID });
+          out.chat = { title: chat.title || null, type: chat.type, username: chat.username || null };
+        } catch (e) { out.chatError = friendlyTelegramError(e.message); }
+        try {
+          const m = await tgApi('getChatMember', { chat_id: TELEGRAM_CHANNEL_ID, user_id: out.botId });
+          out.botStatus = m.status;
+          out.canPostMessages = m.status === 'creator' || (m.status === 'administrator' && m.can_post_messages !== false);
+        } catch (e) { out.memberError = friendlyTelegramError(e.message); }
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify(out, null, 2));
+    } catch (err) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: scrubToken(err.message) }));
+    }
+    return;
+  }
+
+  // ── Публикация в Telegram-канал. Только из Telegram Mini App и только для разрешённых Telegram ID ──
+  if (req.method === 'POST' && req.url === '/api/publish') {
+    let body = '';
+    req.on('data', chunk => { body += chunk; if (body.length > 15 * 1024 * 1024) req.destroy(); });
+    req.on('end', async () => {
+      const send = (status, obj) => { res.writeHead(status, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(obj)); };
+      try {
+        if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHANNEL_ID) {
+          return send(503, { error: 'Публикация не настроена: задай TELEGRAM_BOT_TOKEN и TELEGRAM_CHANNEL_ID в переменных Railway' });
+        }
+        const auth = verifyTelegramInitData(req.headers['x-telegram-init-data']);
+        if (!auth.ok) return send(auth.status, { error: auth.error });
+        if (!TELEGRAM_ALLOWED_USER_IDS.includes(auth.userId)) {
+          return send(403, { error: `Твой Telegram ID ${auth.userId} не в списке разрешённых. Добавь его в переменную TELEGRAM_ALLOWED_USER_IDS в Railway.` });
+        }
+        const { text, imageDataUrl } = JSON.parse(body);
+        send(200, await publishToChannel(text, imageDataUrl));
+      } catch (err) {
+        console.error('publish error:', scrubToken(err.message));
+        send(err.httpStatus || 500, { error: scrubToken(err.message) });
       }
     });
     return;
@@ -1277,6 +1339,148 @@ function getRubricFormatSystemPrompt() {
 }
 
 
+
+// ── Публикация в Telegram-канал: вспомогательные функции ─────────────
+
+function httpError(status, message) {
+  const e = new Error(message);
+  e.httpStatus = status;
+  return e;
+}
+
+// Токен бота не должен попасть ни в логи, ни в ответы клиенту
+function scrubToken(msg) {
+  const s = String(msg);
+  return TELEGRAM_BOT_TOKEN ? s.split(TELEGRAM_BOT_TOKEN).join('***') : s;
+}
+
+function friendlyTelegramError(msg) {
+  const m = scrubToken(msg);
+  if (/chat not found/i.test(m)) return `Telegram: канал не найден. Проверь TELEGRAM_CHANNEL_ID и что бот добавлен в канал (${m})`;
+  if (/not enough rights|have no rights|CHAT_ADMIN_REQUIRED|not a member|Forbidden/i.test(m)) {
+    return `Telegram: у бота нет прав публиковать в канале. Добавь бота администратором канала с правом публикации сообщений (${m})`;
+  }
+  if (/Unauthorized|token/i.test(m)) return `Telegram: токен бота не принят. Проверь TELEGRAM_BOT_TOKEN (${m})`;
+  return 'Telegram: ' + m;
+}
+
+async function tgApi(method, payload, isForm = false) {
+  const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/${method}`;
+  const resp = await fetch(url, isForm
+    ? { method: 'POST', body: payload }
+    : { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+  const data = await resp.json().catch(() => null);
+  if (!data || !data.ok) throw new Error((data && data.description) || `HTTP ${resp.status}`);
+  return data.result;
+}
+
+// Проверка подписи initData по документации Telegram Mini Apps:
+// secret = HMAC_SHA256(ключ "WebAppData", сообщение: токен бота), hash = HMAC_SHA256(ключ secret, строка проверки)
+function verifyTelegramInitData(initData) {
+  if (!initData) return { ok: false, status: 403, error: 'Публикация доступна только из Telegram Mini App: нет данных авторизации Telegram' };
+  const params = new URLSearchParams(initData);
+  const hash = params.get('hash');
+  if (!hash) return { ok: false, status: 403, error: 'Данные авторизации Telegram без подписи' };
+  params.delete('hash');
+  const dataCheckString = [...params.entries()]
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+    .map(([k, v]) => `${k}=${v}`)
+    .join('\n');
+  const secret = crypto.createHmac('sha256', 'WebAppData').update(TELEGRAM_BOT_TOKEN).digest();
+  const calc = crypto.createHmac('sha256', secret).update(dataCheckString).digest();
+  let given;
+  try { given = Buffer.from(hash, 'hex'); } catch { given = Buffer.alloc(0); }
+  if (given.length !== calc.length || !crypto.timingSafeEqual(given, calc)) {
+    return { ok: false, status: 403, error: 'Подпись данных Telegram не прошла проверку' };
+  }
+  const age = Math.floor(Date.now() / 1000) - Number(params.get('auth_date') || 0);
+  if (!(age >= -60 && age <= INIT_DATA_MAX_AGE_SEC)) {
+    return { ok: false, status: 403, error: 'Данные авторизации Telegram устарели: закрой и снова открой Mini App' };
+  }
+  let user = {};
+  try { user = JSON.parse(params.get('user') || '{}'); } catch {}
+  if (!user.id) return { ok: false, status: 403, error: 'В данных Telegram нет пользователя' };
+  return { ok: true, userId: String(user.id) };
+}
+
+// Жирный из **текст** в HTML-теги Telegram; всё остальное экранируется, чтобы <, > и & в посте не ломали разметку
+function toTelegramHtml(md) {
+  const escaped = md.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  return escaped.replace(/\*\*([^\n]+?)\*\*/g, '<b>$1</b>');
+}
+
+// Длина текста, которую считает Telegram (после разбора разметки)
+function visibleLength(html) {
+  return html.replace(/<\/?b>/g, '').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&').length;
+}
+
+function channelLink(messageId) {
+  const id = String(TELEGRAM_CHANNEL_ID);
+  if (id.startsWith('@')) return `https://t.me/${id.slice(1)}/${messageId}`;
+  const m = /^-100(\d+)$/.exec(id);
+  return m ? `https://t.me/c/${m[1]}/${messageId}` : null;
+}
+
+async function sendTextToChannel(text) {
+  try {
+    return await tgApi('sendMessage', { chat_id: TELEGRAM_CHANNEL_ID, text: toTelegramHtml(text), parse_mode: 'HTML' });
+  } catch (e) {
+    // Разметка не принята: публикуем обычным текстом без звёздочек (до этого ничего не отправлено)
+    if (/can't parse entities/i.test(e.message)) {
+      return tgApi('sendMessage', { chat_id: TELEGRAM_CHANNEL_ID, text: text.replace(/\*\*/g, '') });
+    }
+    throw e;
+  }
+}
+
+async function sendPhotoToChannel(photo, captionText) {
+  const build = (caption, withHtml) => {
+    const f = new FormData();
+    f.append('chat_id', TELEGRAM_CHANNEL_ID);
+    f.append('photo', new Blob([photo.buf], { type: photo.mime }), `cover.${photo.ext}`);
+    if (caption) {
+      f.append('caption', caption);
+      if (withHtml) f.append('parse_mode', 'HTML');
+    }
+    return f;
+  };
+  try {
+    return await tgApi('sendPhoto', build(captionText ? toTelegramHtml(captionText) : null, true), true);
+  } catch (e) {
+    if (captionText && /can't parse entities/i.test(e.message)) {
+      return tgApi('sendPhoto', build(captionText.replace(/\*\*/g, ''), false), true);
+    }
+    throw e;
+  }
+}
+
+// Подпись к фото в Telegram не длиннее 1024 символов, обычное сообщение не длиннее 4096.
+// Короткий пост с картинкой уходит одним сообщением, длинный: сначала картинка, потом текст.
+async function publishToChannel(text, imageDataUrl) {
+  if (typeof text !== 'string' || !text.trim()) throw httpError(400, 'Пустой текст поста');
+  const len = visibleLength(toTelegramHtml(text));
+  if (len > 4096) throw httpError(400, `Пост длиннее лимита Telegram: ${len} из 4096 символов`);
+
+  let photo = null;
+  if (imageDataUrl) {
+    const m = /^data:image\/(png|jpeg);base64,([A-Za-z0-9+/=]+)$/.exec(imageDataUrl);
+    if (!m) throw httpError(400, 'Картинка должна быть PNG или JPEG в виде data URL');
+    const buf = Buffer.from(m[2], 'base64');
+    if (buf.length > 10 * 1024 * 1024) throw httpError(400, 'Картинка больше 10 МБ');
+    photo = { buf, mime: `image/${m[1]}`, ext: m[1] === 'jpeg' ? 'jpg' : 'png' };
+  }
+
+  const captionFits = !!photo && len <= 1024;
+  const ids = [];
+  try {
+    if (photo) ids.push((await sendPhotoToChannel(photo, captionFits ? text : null)).message_id);
+    if (!captionFits) ids.push((await sendTextToChannel(text)).message_id);
+  } catch (e) {
+    const msg = friendlyTelegramError(e.message);
+    throw httpError(502, ids.length ? `Картинка опубликована, а текст нет. Не публикуй её повторно. ${msg}` : msg);
+  }
+  return { ok: true, messageIds: ids, link: channelLink(ids[0]), withImage: !!photo, parts: ids.length };
+}
 
 function getSubstackSystemPrompt() {
   return `Ты ghostwriter для Дмитрия Скакунова — Head of Sportsbook в iGaming, 18 лет в индустрии. Пишешь статью для его Substack newsletter на русском языке.

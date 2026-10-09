@@ -313,6 +313,22 @@
       display: block;
     }
 
+    .publish-info {
+      display: none;
+      font-size: 13px;
+      margin-bottom: 8px;
+      color: var(--green);
+    }
+
+    .publish-info.show {
+      display: block;
+    }
+
+    .publish-info a {
+      color: var(--tg);
+      margin-left: 6px;
+    }
+
     /* Обложка: карточка в стиле игрового рейтинга */
     #cover-section {
       margin-top: 4px;
@@ -682,6 +698,8 @@
     <div class="editor-status" id="editor-status"></div>
 
     <div class="editor-footer">
+      <div class="publish-info" id="publish-info"></div>
+      <button class="action-btn primary tg" id="publish-btn" style="display:none; width:100%; margin-bottom:8px;" onclick="publishToChannel()">📣 Опубликовать в Telegram-канал</button>
       <div class="result-actions">
         <button class="action-btn" onclick="regenerate()">🔄 Ещё раз</button>
         <button class="action-btn" id="save-archive-btn" onclick="saveToArchive()">💾 В архив</button>
@@ -950,6 +968,8 @@
       // Рубрика, хэштег и подпись есть только у Telegram. И после шага «Рубрика» текст уже с ними:
       // повторное применение продублировало бы лейбл, хэштег и подпись.
       document.getElementById('rubric-section').style.display = isTg && lastMode !== 'newsquote' ? '' : 'none';
+      // Публикация в канал только для Telegram-постов; у LinkedIn остаётся копирование
+      document.getElementById('publish-btn').style.display = isTg ? '' : 'none';
 
       box.classList.add('show');
       document.body.classList.add('editor-open');
@@ -1093,6 +1113,7 @@
     }
 
     function resetCover() {
+      resetPublish(); // новый черновик: прежняя отметка «уже опубликовано» к нему не относится
       cover.status = 'none';
       cover.arts = [];
       cover.selected = -1;
@@ -1382,6 +1403,88 @@
         setEditorStatus('Ошибка обложки: ' + err.message, true);
       } finally {
         cover.busy = false;
+        setEditorBusy(false);
+      }
+    }
+
+    // ===== ПУБЛИКАЦИЯ В TELEGRAM-КАНАЛ (сразу, без планирования) =====
+    // Сервер публикует только по проверенной подписи Telegram (initData) и только для разрешённых Telegram ID,
+    // поэтому кнопка работает внутри Telegram Mini App, а в обычном браузере вернёт понятную ошибку.
+    const publishState = { done: false, busy: false };
+
+    function getInitData() {
+      return window.Telegram?.WebApp?.initData || '';
+    }
+
+    function resetPublish() {
+      publishState.done = false;
+      const info = document.getElementById('publish-info');
+      info.classList.remove('show');
+      info.textContent = '';
+    }
+
+    // Финальное подтверждение: нативное окно Telegram, а вне Telegram обычный confirm
+    function confirmAsk(message) {
+      const wa = window.Telegram?.WebApp;
+      if (wa && typeof wa.showConfirm === 'function' && wa.initData) {
+        return new Promise(resolve => wa.showConfirm(message, ok => resolve(!!ok)));
+      }
+      return Promise.resolve(window.confirm(message));
+    }
+
+    function showPublishInfo(data) {
+      const info = document.getElementById('publish-info');
+      info.textContent = '✅ Опубликовано' + (data.parts === 2 ? ' (картинка и текст двумя сообщениями)' : '');
+      if (data.link && data.link.startsWith('https://t.me/')) {
+        const a = document.createElement('a');
+        a.href = data.link;
+        a.target = '_blank';
+        a.rel = 'noopener';
+        a.textContent = 'Открыть пост';
+        a.addEventListener('click', e => {
+          const wa = window.Telegram?.WebApp;
+          if (wa && typeof wa.openTelegramLink === 'function') { e.preventDefault(); wa.openTelegramLink(data.link); }
+        });
+        info.appendChild(a);
+      }
+      info.classList.add('show');
+    }
+
+    async function publishToChannel() {
+      if (publishState.busy) return;
+      const text = lastGenerated.trim();
+      if (!text) return;
+      const image = getCoverDataUrl();
+
+      const preview = text.replace(/\*\*/g, '').replace(/\s+/g, ' ').slice(0, 80);
+      let message = `Опубликовать в Telegram-канал?\n\n«${preview}…»\n\n` + (image ? 'С обложкой.' : 'Без картинки.');
+      if (publishState.done) message += '\nЭтот пост уже публиковался, будет второй раз.';
+
+      // Занято уже на время окна подтверждения: второе нажатие не должно открыть второе окно
+      publishState.busy = true;
+      const confirmed = await confirmAsk(message.slice(0, 250));
+      if (!confirmed) {
+        publishState.busy = false;
+        return;
+      }
+
+      setEditorBusy(true);
+      setEditorStatus('Публикую в канал...');
+      try {
+        const response = await fetch('/api/publish', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-Telegram-Init-Data': getInitData() },
+          body: JSON.stringify({ text, imageDataUrl: image })
+        });
+        const data = await readApi(response);
+        publishState.done = true;
+        setEditorStatus('');
+        showPublishInfo(data);
+        showToast('Опубликовано в канале');
+      } catch (err) {
+        setEditorStatus('Ошибка публикации: ' + err.message, true);
+      } finally {
+        publishState.busy = false;
         setEditorBusy(false);
       }
     }
