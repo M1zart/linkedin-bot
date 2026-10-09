@@ -231,28 +231,88 @@
       to { transform: rotate(360deg); }
     }
 
+    /* Единый редактор черновика: полноэкранный слой поверх вкладок */
     .result-box {
       display: none;
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: 12px;
-      padding: 16px;
-      margin-top: 4px;
+      position: fixed;
+      inset: 0;
+      height: 100dvh;
+      z-index: 50;
+      background: var(--bg);
+      flex-direction: column;
     }
 
     .result-box.show {
+      display: flex;
+    }
+
+    body.editor-open {
+      overflow: hidden;
+    }
+
+    .editor-bar {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 12px 16px;
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+
+    .editor-back {
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 8px;
+      font-size: 16px;
+      width: 36px;
+      height: 36px;
+      cursor: pointer;
+    }
+
+    .editor-bar .char-count {
+      margin-left: auto;
+    }
+
+    .editor-body {
+      flex: 1;
+      overflow-y: auto;
+      padding: 16px;
+      -webkit-overflow-scrolling: touch;
+    }
+
+    .editor-body textarea {
+      min-height: 50vh;
+      font-size: 15px;
+      line-height: 1.6;
+      overflow: hidden;
+    }
+
+    .result-box.tg-result textarea:focus,
+    .result-box.tg-result select:focus {
+      border-color: var(--tg);
+    }
+
+    .editor-status {
+      display: none;
+      font-size: 13px;
+      color: var(--text-dim);
+      margin-top: 10px;
+    }
+
+    .editor-status.show {
       display: block;
     }
 
-    .result-box.tg-result {
-      border-color: var(--tg-dim);
+    .editor-status.error {
+      color: var(--red);
     }
 
-    .result-header {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      margin-bottom: 12px;
+    .editor-footer {
+      flex-shrink: 0;
+      padding: 12px 16px calc(12px + env(safe-area-inset-bottom));
+      border-top: 1px solid var(--border);
+      background: var(--bg);
     }
 
     .result-label {
@@ -266,14 +326,6 @@
     .char-count {
       font-size: 11px;
       color: var(--text-dim);
-    }
-
-    .result-text {
-      font-size: 15px;
-      line-height: 1.6;
-      white-space: pre-wrap;
-      word-break: break-word;
-      margin-bottom: 16px;
     }
 
     .result-actions {
@@ -322,6 +374,7 @@
       opacity: 0;
       transition: all 0.3s;
       pointer-events: none;
+      z-index: 100;
     }
 
     .copy-toast.show {
@@ -494,20 +547,32 @@
   <div class="error-msg" id="error-msg"></div>
 
   <div class="result-box" id="result-box">
-    <div class="result-header">
+    <div class="editor-bar">
+      <button class="editor-back" onclick="goBackToInput()" aria-label="К вводу">←</button>
       <span class="result-label" id="result-label">Готовый пост</span>
       <span class="char-count" id="char-count"></span>
     </div>
-    <div class="result-text" id="result-text" contenteditable="true" spellcheck="false"></div>
-    <div class="result-actions">
-      <button class="action-btn" onclick="regenerate()">🔄 Ещё раз</button>
-      <button class="action-btn primary" id="copy-btn" onclick="copyPost()">📋 Копировать</button>
+
+    <div class="editor-body">
+      <div class="field-label">Текст</div>
+      <textarea id="result-text" spellcheck="false"></textarea>
+
+      <div id="rubric-section">
+        <div class="field-label">Рубрика <span class="tg-badge">TELEGRAM</span></div>
+        <select id="editor-rubric-select"></select>
+        <button class="action-btn" id="next-rubric-btn" style="width:100%;" onclick="applyRubricInEditor()">Применить рубрику и оформить</button>
+      </div>
+
+      <div class="editor-status" id="editor-status"></div>
     </div>
-    <div class="result-actions" style="margin-top:8px;">
-      <button class="action-btn" id="back-btn" onclick="goBackToInput()">← К вводу</button>
-      <button class="action-btn" id="next-rubric-btn" onclick="sendDraftToRubric()">Дальше → Рубрика</button>
+
+    <div class="editor-footer">
+      <div class="result-actions">
+        <button class="action-btn" onclick="regenerate()">🔄 Ещё раз</button>
+        <button class="action-btn" id="save-archive-btn" onclick="saveToArchive()">💾 В архив</button>
+        <button class="action-btn primary" id="copy-btn" onclick="copyPost()">📋 Копировать</button>
+      </div>
     </div>
-    <button class="action-btn" id="save-archive-btn" style="width:100%; margin-top:8px;" onclick="saveToArchive()">💾 Сохранить в архив</button>
   </div>
 
   <div class="copy-toast" id="copy-toast">Скопировано!</div>
@@ -600,8 +665,14 @@
 
     async function callAPI(mode, input, tone) {
       const isTg = tone === 'telegram';
-      showLoading(isTg);
-      hideResult();
+      const inEditor = isEditorOpen();
+      if (inEditor) {
+        setEditorStatus('Пишу заново...');
+        setEditorBusy(true);
+      } else {
+        showLoading(isTg);
+        hideResult();
+      }
       hideError();
 
       try {
@@ -624,9 +695,11 @@
         showResult(text, isTg);
 
       } catch (err) {
-        showError('Ошибка: ' + err.message);
+        if (inEditor) setEditorStatus('Ошибка: ' + err.message, true);
+        else showError('Ошибка: ' + err.message);
       } finally {
-        hideLoading();
+        if (inEditor) setEditorBusy(false);
+        else hideLoading();
       }
     }
 
@@ -721,8 +794,11 @@
       const label = document.getElementById('result-label');
       const copyBtn = document.getElementById('copy-btn');
 
-      document.getElementById('result-text').textContent = text;
+      const ta = document.getElementById('result-text');
+      ta.value = text;
+      autoGrow(ta);
       document.getElementById('char-count').textContent = text.length + ' символов';
+      setEditorStatus('');
 
       box.classList.remove('tg-result');
       copyBtn.classList.remove('tg');
@@ -741,31 +817,59 @@
         label.textContent = 'Готовый пост';
       }
 
-      document.getElementById('next-rubric-btn').style.display = lastMode === 'newsquote' ? 'none' : '';
+      // После шага «Рубрика» текст уже с лейблом, хэштегом и подписью: повторное применение продублировало бы их
+      document.getElementById('rubric-section').style.display = lastMode === 'newsquote' ? 'none' : '';
 
       box.classList.add('show');
-      box.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      document.body.classList.add('editor-open');
+      autoGrow(ta); // после показа: у скрытого элемента scrollHeight равен 0
     }
 
     function hideResult() {
       document.getElementById('result-box').classList.remove('show');
+      document.body.classList.remove('editor-open');
     }
 
-    // Правки в окне результата сразу попадают в общий черновик
+    function isEditorOpen() {
+      return document.getElementById('result-box').classList.contains('show');
+    }
+
+    function autoGrow(ta) {
+      ta.style.height = 'auto';
+      ta.style.height = Math.max(ta.scrollHeight, window.innerHeight * 0.5) + 'px';
+    }
+
+    function setEditorStatus(msg, isError = false) {
+      const el = document.getElementById('editor-status');
+      el.textContent = msg;
+      el.classList.toggle('show', !!msg);
+      el.classList.toggle('error', isError);
+    }
+
+    function setEditorBusy(busy) {
+      document.querySelectorAll('#result-box .action-btn, #result-box .editor-back, #editor-rubric-select')
+        .forEach(el => el.disabled = busy);
+    }
+
+    // Правки в редакторе сразу попадают в общий черновик
     document.getElementById('result-text').addEventListener('input', (e) => {
-      lastGenerated = e.target.innerText;
+      lastGenerated = e.target.value;
+      autoGrow(e.target);
       document.getElementById('char-count').textContent = lastGenerated.length + ' символов';
     });
 
-    // «Дальше → Рубрика»: текущий черновик (с правками) уходит в рубрикатор без копирования руками
-    function sendDraftToRubric() {
+    // Список рубрик в редакторе берётся из вкладки «Рубрика», чтобы он был один
+    document.getElementById('editor-rubric-select').innerHTML = document.getElementById('rubric-select').innerHTML;
+
+    // «Применить рубрику»: рубрика, акценты, хэштег и подпись прямо в редакторе, без перехода на другую вкладку
+    function applyRubricInEditor() {
       if (!lastGenerated.trim()) return;
       document.getElementById('newsquote-input').value = lastGenerated;
-      switchMode('newsquote');
+      document.getElementById('rubric-select').value = document.getElementById('editor-rubric-select').value;
       generateNewsQuote();
     }
 
-    // «← К вводу»: вернуться на вкладку, с которой начат черновик; поля ввода сохраняются
+    // «←»: закрыть редактор и вернуться на вкладку, с которой начат черновик; поля ввода сохраняются
     function goBackToInput() {
       switchMode(originMode);
     }
@@ -862,8 +966,15 @@
       lastInput = input;
       lastTone = 'telegram';
 
-      showLoading(true, forcedLabel ? 'Оформляю...' : 'Определяю рубрику...');
-      hideResult();
+      const inEditor = isEditorOpen();
+      const busyText = forcedLabel ? 'Оформляю...' : 'Определяю рубрику...';
+      if (inEditor) {
+        setEditorStatus(busyText);
+        setEditorBusy(true);
+      } else {
+        showLoading(true, busyText);
+        hideResult();
+      }
       hideError();
 
       try {
@@ -886,9 +997,11 @@
         showResult(text, true, false);
 
       } catch (err) {
-        showError('Ошибка: ' + err.message);
+        if (inEditor) setEditorStatus('Ошибка: ' + err.message, true);
+        else showError('Ошибка: ' + err.message);
       } finally {
-        hideLoading();
+        if (inEditor) setEditorBusy(false);
+        else hideLoading();
       }
     }
   </script>
