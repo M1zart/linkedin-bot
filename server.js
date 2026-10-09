@@ -499,6 +499,21 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'GET' && req.url === '/api/cover-diag') {
     try {
       const out = { keyPresent: !!GEMINI_API_KEY, configuredModel: GEMINI_IMAGE_MODEL, endpoint: GEMINI_API_URL };
+      // Что сервер реально видит в окружении (только имена и длины, значения не показываются).
+      // Нестандартные символы в имени (пробел, кириллица, похожая на латиницу) выводятся escape-кодами.
+      out.envNamesLikeGemini = Object.keys(process.env)
+        .filter(k => /gem|goog|banana|imagen|mini|key|api/i.test(k) || /[^\x21-\x7e]/.test(k))
+        .map(k => ({
+          name: k.replace(/[^\x21-\x7e]/g, c => '\\u' + c.charCodeAt(0).toString(16).padStart(4, '0')),
+          nameLength: k.length,
+          valueLength: String(process.env[k]).length
+        }));
+      // Какое развёртывание отвечает: Railway сам задаёт эти переменные
+      out.railway = {
+        environment: process.env.RAILWAY_ENVIRONMENT_NAME || null,
+        service: process.env.RAILWAY_SERVICE_NAME || null,
+        commit: (process.env.RAILWAY_GIT_COMMIT_SHA || '').slice(0, 7) || null
+      };
       if (GEMINI_API_KEY) {
         const resp = await fetch('https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000', {
           headers: { 'x-goog-api-key': GEMINI_API_KEY }
