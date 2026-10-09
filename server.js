@@ -10,6 +10,11 @@ const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const GEMINI_IMAGE_MODEL = process.env.GEMINI_IMAGE_MODEL || 'gemini-nano-banana-2.1';
 const GEMINI_API_URL = process.env.GEMINI_API_URL || 'https://generativelanguage.googleapis.com/v1beta/interactions';
 const GEMINI_LEGACY_BASE = 'https://generativelanguage.googleapis.com/v1beta/models';
+// Проба моделей картинок (/api/cover-diag?probe=1): дешёвый запрос и пауза между запусками
+const PROBE_PROMPT = 'A single small gold circle centered on a plain black background. No text, no letters, no numbers.';
+const PROBE_COOLDOWN_MS = 60 * 1000;
+let probeRunning = false;
+let lastProbeAt = 0;
 const NOTION_DATABASE_ID = 'a81c0118449d47388b3fb612a509cd38';
 const DRAFT_LAB_DATA_SOURCE_ID = '14814719-85c5-4819-a07e-3d1b773d6bdb';
 const CAREER_CASES_DATA_SOURCE_ID = 'a81c0118-449d-4738-8b3f-b612a509cd38';
@@ -496,8 +501,9 @@ const server = http.createServer(async (req, res) => {
   }
 
   // ── Проверка Gemini: принимает ли Google ключ и какие модели картинок доступны. Ключ в ответ не попадает ──
-  if (req.method === 'GET' && req.url === '/api/cover-diag') {
+  if (req.method === 'GET' && req.url.split('?')[0] === '/api/cover-diag') {
     try {
+      const wantProbe = new URL(req.url, 'http://localhost').searchParams.get('probe') === '1';
       const out = { keyPresent: !!GEMINI_API_KEY, configuredModel: GEMINI_IMAGE_MODEL, endpoint: GEMINI_API_URL };
       // Что сервер реально видит в окружении (только имена и длины, значения не показываются).
       // Нестандартные символы в имени (пробел, кириллица, похожая на латиницу) выводятся escape-кодами.
@@ -527,6 +533,38 @@ const server = http.createServer(async (req, res) => {
           out.keyAccepted = true;
           out.configuredModelAvailable = names.includes(GEMINI_IMAGE_MODEL);
           out.imageModels = names.filter(n => /image|banana|imagen/i.test(n)).slice(0, 40);
+
+          // ?probe=1: пробуем сгенерировать минимальную картинку каждой моделью и смотрим, у кого есть квота.
+          // Imagen пропускаем (другой интерфейс). Успешная проба тратит одну картинку на модель,
+          // поэтому между пробами пауза.
+          if (wantProbe) {
+            const wait = PROBE_COOLDOWN_MS - (Date.now() - lastProbeAt);
+            if (probeRunning || wait > 0) {
+              out.probe = { skipped: true, reason: `Проба уже недавно запускалась, подожди ${Math.ceil(Math.max(wait, 1000) / 1000)} с` };
+            } else {
+              probeRunning = true;
+              try {
+                const models = out.imageModels.filter(n => !/imagen/i.test(n));
+                const results = await Promise.all(models.map(async (m) => {
+                  try {
+                    const img = await geminiGenerateImage(PROBE_PROMPT, m);
+                    return { model: m, ok: true, mime: img.mime, sizeKB: Math.round(img.data.length * 0.75 / 1024) };
+                  } catch (e) {
+                    const msg = String(e.message);
+                    return { model: m, ok: false, freeTierBlocked: /Free Tier|limit: 0/i.test(msg), error: msg.slice(0, 220) };
+                  }
+                }));
+                out.probe = {
+                  works: results.filter(r => r.ok).map(r => r.model),
+                  blockedByFreeTier: results.filter(r => r.freeTierBlocked).map(r => r.model),
+                  results
+                };
+              } finally {
+                probeRunning = false;
+                lastProbeAt = Date.now();
+              }
+            }
+          }
         } else {
           out.keyAccepted = false;
           out.error = geminiError(data, raw).message;
@@ -728,9 +766,9 @@ async function geminiPost(url, reqBody) {
   return { resp, data, raw };
 }
 
-async function geminiGenerateImage(prompt) {
+async function geminiGenerateImage(prompt, model = GEMINI_IMAGE_MODEL) {
   const interactionBody = (withFormat) => {
-    const b = { model: GEMINI_IMAGE_MODEL, input: [{ type: 'text', text: prompt }] };
+    const b = { model, input: [{ type: 'text', text: prompt }] };
     if (withFormat) b.response_format = { type: 'image', aspect_ratio: '3:4' };
     return b;
   };
@@ -747,7 +785,7 @@ async function geminiGenerateImage(prompt) {
 
   // Запасной путь: прежний формат generateContent, если новый не знает модель или не принимает запрос
   if (err && !err.keyInvalid && (r.resp.status === 400 || r.resp.status === 404)) {
-    const lr = await geminiPost(`${GEMINI_LEGACY_BASE}/${GEMINI_IMAGE_MODEL}:generateContent`, {
+    const lr = await geminiPost(`${GEMINI_LEGACY_BASE}/${model}:generateContent`, {
       contents: [{ parts: [{ text: prompt }] }],
       generationConfig: { responseModalities: ['IMAGE'], imageConfig: { aspectRatio: '3:4' } }
     });
