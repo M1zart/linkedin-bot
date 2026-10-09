@@ -279,7 +279,7 @@ const server = http.createServer(async (req, res) => {
           },
           body: JSON.stringify({
             model: MODEL,
-            max_tokens: 1500,
+            max_tokens: 4096,
             system: systemPrompt,
             messages: [{ role: 'user', content: postText }]
           })
@@ -291,6 +291,13 @@ const server = http.createServer(async (req, res) => {
           console.error('format-post error:', JSON.stringify(data));
           res.writeHead(500, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: data.error?.message || 'API error' }));
+          return;
+        }
+
+        if (data.stop_reason === 'max_tokens') {
+          console.error('format-post: ответ обрезан по max_tokens, длина входа', postText.length);
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Ответ модели обрезан по лимиту длины. Пост слишком длинный для оформления.' }));
           return;
         }
 
@@ -432,7 +439,7 @@ const server = http.createServer(async (req, res) => {
           },
           body: JSON.stringify({
             model: MODEL,
-            max_tokens: 1500,
+            max_tokens: 4096,
             system: systemPrompt,
             messages: [{ role: 'user', content: postText }]
           })
@@ -444,6 +451,15 @@ const server = http.createServer(async (req, res) => {
           console.error('rubric-format API error:', JSON.stringify(data));
           res.writeHead(500, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: data.error?.message || 'API error' }));
+          return;
+        }
+
+        // Подпись и хэштег стоят в самом конце ответа: при обрезке по лимиту они пропали бы первыми.
+        // Лучше показать ошибку, чем молча отдать обрезанный пост.
+        if (data.stop_reason === 'max_tokens') {
+          console.error('rubric-format: ответ обрезан по max_tokens, длина входа', postText.length);
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Ответ модели обрезан по лимиту длины. Пост слишком длинный для оформления.' }));
           return;
         }
 
