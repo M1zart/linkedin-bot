@@ -8,7 +8,7 @@ const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const NOTION_API_KEY = process.env.NOTION_API_KEY;
 // Публикация в Telegram-канал: токен бота, канал (@имя или числовой -100...) и список Telegram ID, которым разрешено публиковать
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const TELEGRAM_CHANNEL_ID = process.env.TELEGRAM_CHANNEL_ID;
+const TELEGRAM_CHANNEL_ID = normalizeChannelId(process.env.TELEGRAM_CHANNEL_ID);
 const TELEGRAM_ALLOWED_USER_IDS = (process.env.TELEGRAM_ALLOWED_USER_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
 const INIT_DATA_MAX_AGE_SEC = 24 * 60 * 60;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
@@ -1341,6 +1341,19 @@ function getRubricFormatSystemPrompt() {
 
 
 // ── Публикация в Telegram-канал: вспомогательные функции ─────────────
+
+// Bot API принимает канал только как @имя или числовой -100…, а в переменную часто кладут ссылку.
+// Приводим t.me/имя, https://t.me/имя/, имя в кавычках и голое имя к @имя; числовой ID не трогаем.
+// Инвайт-ссылки (t.me/+…) не превращаются в канал: их Bot API не принимает, диагностика покажет «chat not found».
+function normalizeChannelId(raw) {
+  if (!raw) return raw;
+  let v = String(raw).trim().replace(/^["']|["']$/g, '').trim();
+  if (/^-?\d+$/.test(v)) return v;
+  const m = /^(?:https?:\/\/)?(?:www\.)?(?:t|telegram)\.me\/([^/?#\s]+)/i.exec(v);
+  if (m) v = m[1];
+  if (/^[A-Za-z][A-Za-z0-9_]{3,}$/.test(v)) return '@' + v;
+  return v;
+}
 
 function httpError(status, message) {
   const e = new Error(message);
