@@ -673,6 +673,19 @@
       }
     }
 
+    // Разбор ответа сервера. Если ответ не JSON или без поля error (например, 502 от Railway),
+    // в сообщение попадают HTTP-статус и начало тела, чтобы причина была видна на экране.
+    async function readApi(response) {
+      const raw = await response.text();
+      let data = null;
+      try { data = JSON.parse(raw); } catch {}
+      if (!response.ok || data?.error) {
+        const detail = data?.error || data?.message || raw.replace(/\s+/g, ' ').slice(0, 200) || response.statusText || 'нет ответа';
+        throw new Error(`${detail} (HTTP ${response.status})`);
+      }
+      if (!data) throw new Error(`Ответ сервера не JSON (HTTP ${response.status}): ${raw.replace(/\s+/g, ' ').slice(0, 200)}`);
+      return data;
+    }
     async function callAPI(mode, input, tone) {
       const isTg = tone === 'telegram';
       const inEditor = isEditorOpen();
@@ -692,11 +705,7 @@
           body: JSON.stringify({ prompt: input, tone, mode })
         });
 
-        const data = await response.json();
-
-        if (!response.ok || data.error) {
-          throw new Error(data.error || 'Ошибка API');
-        }
+        const data = await readApi(response);
 
         const text = data.text;
         if (!text) throw new Error('Пустой ответ');
@@ -726,11 +735,7 @@
           body: JSON.stringify({ postText })
         });
 
-        const data = await response.json();
-
-        if (!response.ok || data.error) {
-          throw new Error(data.error || 'Ошибка API');
-        }
+        const data = await readApi(response);
 
         const comments = data.comments;
         if (!comments || !comments.length) throw new Error('Пустой ответ');
@@ -994,11 +999,7 @@
           body: JSON.stringify({ postText: input, forcedLabel, forcedHashtag })
         });
 
-        const data = await response.json();
-
-        if (!response.ok || data.error) {
-          throw new Error(data.error || 'Ошибка API');
-        }
+        const data = await readApi(response);
 
         const text = data.text;
         if (!text) throw new Error('Пустой ответ');
