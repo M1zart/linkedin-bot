@@ -1906,7 +1906,13 @@ async function handleBotUpdate(update) {
   const cmd = String(msg.text || '').trim().split(/\s|@/)[0].toLowerCase();
   if (cmd === '/scheduled') {
     if (!scheduleConfigured()) return botSend(msg.chat.id, 'Расписание не настроено: нет NOTION_API_KEY.');
-    return sendScheduledList(msg.chat.id, userId);
+    try {
+      return await sendScheduledList(msg.chat.id, userId);
+    } catch (e) {
+      // Молчание в чате хуже понятной причины (например, база Notion не открыта интеграции)
+      console.error('/scheduled:', scrubToken(e.message));
+      return botSend(msg.chat.id, `Не удалось получить очередь: ${scrubToken(e.message).slice(0, 300)}`).catch(() => {});
+    }
   }
   if (cmd === '/start' || cmd === '/help') {
     return botSend(msg.chat.id, 'Команды:\n/scheduled: запланированные посты, отмена и публикация сразу.\n\nСоздавать и планировать посты нужно в приложении (кнопка меню).');
@@ -1925,7 +1931,7 @@ async function handleBotCallback(cb) {
   const edit = (text, markup) => tgApi('editMessageText', { chat_id: chatId, message_id: messageId, text, reply_markup: markup || { inline_keyboard: [] } }).catch(e => console.error('editMessageText:', scrubToken(e.message)));
 
   let row;
-  try { row = await schedGet(id); } catch { return answer('Пост не найден', true); }
+  try { row = await schedGet(id); } catch { return answer('Пост не найден или очередь недоступна', true); }
   if (String(row.owner) !== userId) return answer('Это не твой пост', true);
   if (row.status !== 'scheduled') {
     await answer(`Уже не в очереди: ${row.status}`);
