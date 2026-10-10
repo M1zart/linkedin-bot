@@ -921,7 +921,7 @@
 
     <div class="editor-body">
       <div class="field-label">Текст</div>
-      <textarea id="result-text" spellcheck="false"></textarea>
+      <textarea id="result-text" spellcheck="true" lang="ru" autocorrect="on"></textarea>
 
       <div id="rubric-section">
         <div class="field-label">Рубрика <span class="tg-badge">TELEGRAM</span></div>
@@ -1304,8 +1304,13 @@
     }
 
     function autoGrow(ta) {
+      // Высота на миг сбрасывается в auto, из-за этого контейнер сжимается и его прокрутка улетает вниз.
+      // Запоминаем позицию прокрутки и возвращаем её после пересчета
+      const sc = ta.closest('.editor-body');
+      const top = sc ? sc.scrollTop : 0;
       ta.style.height = 'auto';
       ta.style.height = Math.max(ta.scrollHeight, window.innerHeight * 0.5) + 'px';
+      if (sc) sc.scrollTop = top;
     }
 
     function setEditorStatus(msg, isError = false) {
@@ -2419,7 +2424,7 @@
       posts.forEach(p => {
         const card = document.createElement('div'); card.className = 'digest-card';
         const t = document.createElement('div'); t.className = 'digest-title'; t.textContent = p.angle || 'Угол'; card.appendChild(t);
-        const ta = document.createElement('textarea'); ta.value = p.text; ta.style.width = '100%'; ta.style.boxSizing = 'border-box'; ta.style.minHeight = '180px';
+        const ta = document.createElement('textarea'); ta.spellcheck = true; ta.lang = 'ru'; ta.value = p.text; ta.style.width = '100%'; ta.style.boxSizing = 'border-box'; ta.style.minHeight = '180px';
         const counter = document.createElement('div'); counter.className = 'digest-row';
         const upd = () => { const n = thLen(ta.value); counter.textContent = n + ' из ' + TH_MAX; counter.style.color = n > TH_MAX ? 'var(--red)' : ''; ta.style.height = 'auto'; ta.style.height = Math.max(180, ta.scrollHeight + 4) + 'px'; };
         ta.addEventListener('input', upd); card.appendChild(ta); card.appendChild(counter); setTimeout(upd, 0); upd();
