@@ -310,6 +310,8 @@ const server = http.createServer(async (req, res) => {
         }
         // Пост из дайджеста (во входе есть «Что произошло:»): сверяем с входом и режем выдумки
         if (/Что произошло:/.test(String(prompt || ''))) text = await runFactTrim(prompt, text);
+        // Последним: ловим «не X, а Y» кодом (после всех проходов, которые могли его вернуть)
+        text = await runNegContrastFix(text);
 
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ text: noYo(text) }));
@@ -1440,6 +1442,42 @@ async function runFactTrim(inputText, postText) {
     return data.content?.[0]?.text || postText;
   } catch (err) {
     console.error('fact-trim failed:', err.message);
+    return postText;
+  }
+}
+
+// Отрицательное противопоставление («не X, а Y», «Это не X. Это Y.», «Не потому что X. А потому что Y.») модель
+// пропускает при любых инструкциях. Ловим предложения кодом и просим переписать только их
+function findNegContrast(text) {
+  const sentences = String(text || '').split(/(?<=[.!?])\s+/);
+  const hits = [];
+  for (let i = 0; i < sentences.length; i++) {
+    const cur = sentences[i];
+    const next = sentences[i + 1] || '';
+    const oneSentence = /(^|[\s«"(])не\s[^.!?]{1,120},\s*а\s/i.test(cur) || /не потому,? что[^.!?]{1,120},\s*а потому/i.test(cur);
+    const twoSentences = /^(это|речь|дело)?\s*не\s[^.!?]{1,100}[.!?]?$/i.test(cur.trim()) && /^(это|а|просто|именно)\s/i.test(next.trim());
+    if (oneSentence) hits.push(cur.trim());
+    else if (twoSentences) hits.push((cur.trim() + ' ' + next.trim()).trim());
+  }
+  return [...new Set(hits)];
+}
+
+async function runNegContrastFix(postText) {
+  const hits = findNegContrast(postText);
+  if (!hits.length) return postText;
+  const system = `Ты редактор. В посте есть отрицательные противопоставления («не X, а Y», «Это не X. Это Y.», «Не потому что X. А потому что Y.»). Перепиши ТОЛЬКО указанные места так, чтобы осталось прямое утверждение про Y, без упоминания X и без слов «не», «а», «просто» как связки противопоставления. Не добавляй новых фактов, цифр и сроков, не меняй остальной текст. Без тире, без жирного, без буквы «ё». Верни ПОЛНЫЙ текст поста с исправленными местами, без пояснений.`;
+  try {
+    const response = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify({ model: MODEL, max_tokens: 4096, system, messages: [{ role: 'user', content: `МЕСТА ДЛЯ ПЕРЕПИСЫВАНИЯ:\n${hits.map((h, i) => (i + 1) + '. ' + h).join('\n')}\n\nПОСТ:\n${postText}` }] })
+    });
+    const data = await response.json();
+    if (!response.ok || data.stop_reason === 'max_tokens') return postText;
+    console.log('neg-contrast-fix: переписано мест', hits.length);
+    return data.content?.[0]?.text || postText;
+  } catch (err) {
+    console.error('neg-contrast-fix failed:', err.message);
     return postText;
   }
 }
