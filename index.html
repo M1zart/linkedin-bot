@@ -1977,6 +1977,35 @@
     const digestState = { raw: '', parsed: null, used: new Set() };
     const DIGEST_STORE = 'postbot.digest.v1';
 
+    // Числа в заголовке и комментарии должны быть в фактах этого же пункта («Что произошло», «Цифра / факт»).
+    // Иначе в пункт попали цифры из соседней новости (так в датский пост попали бразильские «40 000 против 9 000»):
+    // такие предложения вырезаем и показываем предупреждение
+    function numbersIn(s) {
+      return (String(s || '').match(/\d[\d\s\u00a0.,]*\d|\d/g) || []).map(x => x.replace(/[\s\u00a0.,]/g, '')).filter(x => x.length >= 2);
+    }
+    function checkForeignNumbers(it) {
+      const known = new Set(numbersIn(it.what + ' ' + it.fact));
+      if (!known.size) return;
+      const isForeign = s => numbersIn(s).some(n => !known.has(n));
+      const sentences = s => String(s || '').split(/(?<=[.!?])\s+/).filter(Boolean);
+      const foreignNums = s => [...new Set(numbersIn(s).filter(n => !known.has(n)))];
+      it.warn = [];
+      if (isForeign(it.title)) {
+        it.warn.push('в заголовке числа, которых нет в фактах: ' + foreignNums(it.title).join(', ') + '. Заголовок заменён первым фактом');
+        const first = sentences(it.what)[0] || it.title;
+        it.titleClean = first.length > 140 ? first.slice(0, 137).replace(/\s+\S*$/, '') + '…' : first;
+      }
+      if (it.comment) {
+        const variants = it.comment.split(/\s\/\s|\s(?=\d[.)]\s+[А-ЯA-Z])/).map(v => v.replace(/^\d[.)]\s+/, '').trim()).filter(Boolean);
+        const kept = variants.filter(v => !isForeign(v));
+        if (kept.length < variants.length) {
+          it.warn.push('в комментарии числа, которых нет в фактах: ' + foreignNums(variants.filter(isForeign).join(' ')).join(', ') + '. Этот вариант убран');
+          it.commentClean = kept.join(' / ');
+        }
+      }
+      if (!it.warn.length) delete it.warn;
+    }
+
     function parseDigest(raw) {
       const text = String(raw || '').replace(/\r/g, '').replace(/ /g, ' ');
       const lines = text.split('\n');
@@ -2055,6 +2084,7 @@
         it.url = url.replace(/[.,;]+$/, '');
         const dm = srcLine ? /·\s*([^\n]+)$/.exec(srcLine) : /(?:https?:\/\/\S+|\))\s*·\s*([^\n]+)/.exec(block);
         if (dm) it.date = strip(dm[1]);
+        checkForeignNumbers(it);
         return it;
       });
 
@@ -2067,11 +2097,12 @@
     // Тема для генератора: заголовок + факты из новости + авторский угол. Кавычки меняем, чтобы не ломать промпт
     function digestTopic(it, multiline) {
       const q = s => String(s || '').replace(/"/g, "'");
-      const parts = [q(it.title)];
+      const parts = [q(it.titleClean || it.title)];
       if (it.what) parts.push('Что произошло: ' + q(it.what));
       if (it.fact) parts.push('Цифра / факт: ' + q(it.fact));
       if (it.angle) parts.push('Угол для поста: ' + q(it.angle));
-      if (it.comment) parts.push('Моя позиция (варианты из дайджеста, выбери одну или сведи): ' + q(it.comment));
+      const cm = it.commentClean !== undefined ? it.commentClean : it.comment;
+      if (cm) parts.push('Моя позиция (варианты из дайджеста, выбери одну или сведи): ' + q(cm));
       if (it.url) { try { parts.push('Источник (назови издание по имени, без ссылки и домена): ' + new URL(it.url).hostname.replace(/^www\./, '')); } catch {} }
       return multiline ? parts.join('\n') : parts.join('. ').replace(/\.\.\s/g, '. ');
     }
@@ -2116,7 +2147,8 @@
         row('Цифра / факт', it.fact);
         row('Угол для поста', it.angle);
         if (!it.fact && !it.angle) row('Что произошло', it.what);
-        row('Позиция', it.comment);
+        row('Позиция', it.commentClean !== undefined ? it.commentClean : it.comment);
+        if (it.warn) it.warn.forEach(w => row('⚠ Внимание', w));
         if (it.url && /^https?:\/\//.test(it.url)) {
           const r = document.createElement('div');
           r.className = 'digest-row';
