@@ -2398,6 +2398,7 @@
         const data = await queueCall('/api/threads-editor', { method: 'POST', body: JSON.stringify(body) });
         edState.last = data;
         edRender(data);
+        box.scrollIntoView({ behavior: 'smooth', block: 'start' });
       } catch (e) {
         box.textContent = thErr(e);
       } finally {
@@ -2425,6 +2426,7 @@
       try {
         const data = await queueCall('/api/threads-angles', { method: 'POST', body: JSON.stringify(body) });
         anglesRender(data);
+        box.scrollIntoView({ behavior: 'smooth', block: 'start' });
       } catch (e) { box.textContent = thErr(e); }
       finally { edState.busy = false; btn.disabled = false; btn.textContent = '5 постов под разными углами'; }
     }
@@ -2474,7 +2476,8 @@
       title.className = 'digest-title';
       title.textContent = (names[r.status] || r.status || 'Нет ответа') + (r.content_type ? ' · ' + r.content_type.toUpperCase() : '') + (r.goal === 'telegram_bridge' ? ' · мост в Telegram' : '');
       card.appendChild(title);
-      if (r.reason) { const rs = document.createElement('div'); rs.className = 'digest-row'; rs.textContent = r.reason; card.appendChild(rs); }
+      if (r.reason) { const rs = document.createElement('div'); rs.className = 'digest-row'; rs.style.fontWeight = '600'; rs.textContent = r.reason; card.appendChild(rs); }
+      if (!r.post_text) { const h = document.createElement('div'); h.className = 'digest-row'; h.textContent = 'Поста нет: редактор отказался писать по этим правилам. Нажми «5 постов под разными углами», там пост напишется в любом случае.'; card.appendChild(h); }
       let ta = null;
       if (r.post_text) {
         const lab = document.createElement('div'); lab.className = 'digest-row'; lab.style.fontWeight = '600';
