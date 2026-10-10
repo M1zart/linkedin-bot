@@ -3049,10 +3049,11 @@ async function handleCommentCallback(cb) {
 // с вариантами ответа в 7 стилях. Каждый вариант можно скопировать (и править сам) или отправить в Threads одной кнопкой:
 // ответ уходит с аккаунта владельца через API (reply_to_id).
 // Нужны права threads_read_replies и threads_manage_replies у токена THREADS_ACCESS_TOKEN.
-const THREADS_REPLIES_EVERY_MS = (Number(process.env.THREADS_REPLIES_MINUTES) || 3) * 60 * 1000;
+// Бот проверяет время раз в несколько минут, но ответы собирает раз в час: в начале каждого часа берет все ответы за предыдущий полный час
+// (в 13:00 приходят ответы с 12:00 до 13:00). Памяти о показанных ответах не нужно: окна не пересекаются.
+const THREADS_REPLIES_EVERY_MS = 5 * 60 * 1000;
 const THREADS_POSTS_LOOKBACK = 8;                      // сколько последних постов проверять
-const threadsSeen = new Set();                         // id ответов, по которым карточка уже была
-const threadsReplyState = { started: false, baseline: false, lastTickAt: null, lastError: null, lastCards: 0 };
+const threadsReplyState = { started: false, doneHour: 0, lastTickAt: null, lastWindow: null, lastError: null, lastCards: 0 };
 let threadsMe = null;
 let threadsPermWarned = false;
 let threadsRepliesRunning = false;
@@ -3100,14 +3101,15 @@ function threadsReplyCard(c, variants, sentIdx = -1) {
 async function threadsRepliesTick() {
   if (threadsRepliesRunning || !threadsConfigured() || !ANTHROPIC_API_KEY || !TELEGRAM_BOT_TOKEN || !TELEGRAM_ALLOWED_USER_IDS.length) return;
   if (process.env.THREADS_REPLIES === 'off') return;
+  const hourStart = Math.floor(Date.now() / 3600000) * 3600000;
+  if (threadsReplyState.doneHour >= hourStart) return;       // этот час уже обработан
+  const winFrom = hourStart - 3600000;
   threadsRepliesRunning = true;
   threadsReplyState.lastTickAt = new Date().toISOString();
   try {
     const uid = await threadsUserId();
     const mine = await threadsMyUsername();
     const posts = (await threadsReq('GET', `/${uid}/threads`, { fields: 'id,text,timestamp', limit: String(THREADS_POSTS_LOOKBACK) })).data || [];
-    const firstPass = !threadsReplyState.baseline;
-    const now = Date.now();
     const fresh = [];
     for (const post of posts) {
       let items;
@@ -3121,20 +3123,18 @@ async function threadsRepliesTick() {
       }
       const byId = new Map(items.map(x => [x.id, x]));
       for (const it of items) {
-        if (threadsSeen.has(it.id)) continue;
-        threadsSeen.add(it.id);
         const text = String(it.text || '').trim();
         if (!text || it.is_reply_owned_by_me === true || (it.username && it.username === mine)) continue;
-        // Первый проход после запуска: старые ответы не поднимаем, только свежие за последние 10 минут
-        if (firstPass && now - Date.parse(it.timestamp || 0) > 10 * 60 * 1000) continue;
+        const ts = Date.parse(it.timestamp || 0);
+        if (!(ts >= winFrom && ts < hourStart)) continue;       // только окно предыдущего часа
         const parent = it.replied_to && it.replied_to.id && byId.get(it.replied_to.id);
         fresh.push({ post, it, text, parentText: parent ? String(parent.text || '') : '' });
       }
     }
-    threadsReplyState.baseline = true;
+    threadsReplyState.doneHour = hourStart;
+    threadsReplyState.lastWindow = new Date(winFrom).toISOString() + ' – ' + new Date(hourStart).toISOString();
     threadsReplyState.lastError = null;
-    trimMap(threadsSeen, 3000);
-    for (const f of fresh.slice(0, 10)) {
+    for (const f of fresh.slice(0, 20)) {
       const c = { id: ++commentCtxSeq, platform: 'threads', replyId: f.it.id, postText: f.post.text || '', parentText: f.parentText, commentText: f.text, author: f.it.username || '', link: f.it.permalink || '', variants: [], sentIdx: -1 };
       let variants;
       try { variants = await generateReplyVariants(c); }
