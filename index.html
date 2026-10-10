@@ -348,6 +348,77 @@
       margin-bottom: 14px;
     }
 
+    /* Дайджест: карточки тем */
+    .digest-meta {
+      font-size: 13px;
+      color: var(--text-dim);
+      margin-bottom: 12px;
+    }
+
+    .digest-meta:empty {
+      display: none;
+    }
+
+    .digest-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 14px;
+      margin-bottom: 12px;
+    }
+
+    .digest-card.used {
+      opacity: 0.6;
+    }
+
+    .digest-head {
+      display: flex;
+      gap: 8px;
+      align-items: flex-start;
+      margin-bottom: 8px;
+    }
+
+    .digest-title {
+      flex: 1;
+      font-size: 15px;
+      font-weight: 700;
+      line-height: 1.35;
+    }
+
+    .digest-score {
+      flex-shrink: 0;
+      font-size: 11px;
+      font-weight: 700;
+      color: var(--green);
+      border: 1px solid var(--green);
+      border-radius: 6px;
+      padding: 2px 6px;
+      white-space: nowrap;
+    }
+
+    .digest-row {
+      font-size: 13px;
+      line-height: 1.45;
+      color: var(--text-dim);
+      margin-bottom: 6px;
+    }
+
+    .digest-row b {
+      color: var(--text);
+      font-weight: 600;
+    }
+
+    .digest-row a {
+      color: var(--tg);
+      word-break: break-all;
+    }
+
+    .digest-actions {
+      display: flex;
+      gap: 8px;
+      margin-top: 10px;
+    }
+
     .reschedule-post {
       font-size: 14px;
       line-height: 1.5;
@@ -678,6 +749,7 @@
     <button class="tab" onclick="switchMode('comment')">Коммент</button>
     <button class="tab tg-tab" onclick="switchMode('telegram')">TG</button>
     <button class="tab tg-tab" onclick="switchMode('newsquote')">Готовый</button>
+    <button class="tab" onclick="switchMode('digest')">Дайджест</button>
   </div>
 
   <!-- Режим 1: По теме -->
@@ -754,6 +826,15 @@
     <button class="generate-btn tg-btn" id="ready-btn" onclick="processReady()">Определить рубрику и оформить</button>
   </div>
 
+
+  <!-- Режим: Дайджест (источник тем для входа 1) -->
+  <div id="mode-digest" class="mode-panel">
+    <div class="field-label">Дайджест целиком</div>
+    <textarea id="digest-input" placeholder="Вставь сводку из Claude: заголовки новостей, «Угол для поста», оценки, ссылки..." style="min-height:140px;"></textarea>
+    <button class="generate-btn" id="digest-parse-btn" onclick="parseDigestInput()">Разобрать темы</button>
+    <div class="digest-meta" id="digest-meta"></div>
+    <div id="digest-list"></div>
+  </div>
 
   <!-- Режим 5: Telegram -->
   <div id="mode-telegram" class="mode-panel">
@@ -893,7 +974,7 @@
 
     function switchMode(mode) {
       currentMode = mode;
-      const tabOrder = ['topic', 'thought', 'comment', 'telegram', 'newsquote'];
+      const tabOrder = ['topic', 'thought', 'comment', 'telegram', 'newsquote', 'digest'];
       document.querySelectorAll('.tab').forEach((t, i) => {
         t.classList.toggle('active', tabOrder[i] === mode);
       });
@@ -1888,6 +1969,202 @@
       if (!id) return;
       const m = parseInt(params.get('m'), 10);
       openRescheduleScreen(id, Number.isInteger(m) && m > 0 ? m : null);
+    })();
+
+    // ===== ДАЙДЖЕСТ: источник тем для входа 1 =====
+    // Формат сводки задаёт задание igaming-morning-digest: «N. Заголовок», затем «Что произошло», «Цифра / факт»,
+    // «Почему важно…», «Угол для поста», «Оценка: N/10 · Тема N» и ссылка. Копия из Claude может прийти и с **, и без них.
+    const digestState = { raw: '', parsed: null, used: new Set() };
+    const DIGEST_STORE = 'postbot.digest.v1';
+
+    function parseDigest(raw) {
+      const text = String(raw || '').replace(/\r/g, '').replace(/ /g, ' ');
+      const lines = text.split('\n');
+      const strip = s => String(s || '').replace(/\*\*/g, '').replace(/^[\s#>*_`\-–—:]+/, '').replace(/[\s*_`]+$/, '').replace(/^\[(.*)\]$/, '$1').trim();
+
+      // Начала новостей: строки «1. …», «**2. …**», «### 3) …» строго по порядку 1, 2, 3…
+      const itemRe = /^\s*(?:#{1,4}\s*)?(?:\*\*\s*)?(\d{1,2})\s*[.)]\s*(?:\*\*\s*)?(.+?)\s*$/;
+      const starts = [];
+      let expect = 1;
+      lines.forEach((ln, i) => {
+        const m = itemRe.exec(ln);
+        if (m && Number(m[1]) === expect && strip(m[2])) { starts.push({ i, n: expect, title: strip(m[2]) }); expect++; }
+      });
+
+      // Конец последней новости: итоговые строки «Главный тренд дня» / «Для Дмитрия»
+      const tail = lines.findIndex((ln, i) => i > (starts.length ? starts[starts.length - 1].i : -1) && /Главный тренд дня|Для Дмитрия|^\s*💡|^\s*🎯/.test(ln));
+      const endAll = tail === -1 ? lines.length : tail;
+
+      const LABELS = [
+        ['what', /Что произошло/i],
+        ['fact', /Цифра\s*\/\s*факт/i],
+        ['why', /Почему важно[^:\n]*/i],
+        ['angle', /Угол для поста/i],
+        ['score', /Оценка/i]
+      ];
+
+      const items = starts.map((st, k) => {
+        const block = lines.slice(st.i + 1, k + 1 < starts.length ? starts[k + 1].i : endAll).join('\n');
+        // Позиции меток (с возможными ** вокруг и двоеточием), значение идёт до следующей метки
+        const found = [];
+        for (const [key, re] of LABELS) {
+          const m = new RegExp('(?:\\*\\*)?\\s*' + re.source + '\\s*(?:\\*\\*)?\\s*:?\\s*(?:\\*\\*)?', 'i').exec(block);
+          if (m) found.push({ key, at: m.index, valueFrom: m.index + m[0].length });
+        }
+        found.sort((a, b) => a.at - b.at);
+        const it = { n: st.n, title: st.title, what: '', fact: '', why: '', angle: '', score: null, theme: null, url: '', date: '' };
+        found.forEach((f, idx) => {
+          const val = block.slice(f.valueFrom, idx + 1 < found.length ? found[idx + 1].at : block.length);
+          if (f.key === 'score') {
+            const sm = /(\d{1,2})\s*\/\s*10/.exec(val);
+            if (sm) it.score = Number(sm[1]);
+            const tm = /Тема\s*(\d{1,2})/i.exec(val);
+            if (tm) it.theme = Number(tm[1]);
+          } else {
+            it[f.key] = strip(val).replace(/\s*\n\s*/g, ' ');
+          }
+        });
+        if (!found.length) it.what = strip(block).replace(/\s*\n\s*/g, ' ');
+
+        // Источник: ссылка вида [текст](url) или голый url, дата после «·»
+        const md = /\]\((https?:\/\/[^\s)]+)\)/.exec(block);
+        const bare = /(https?:\/\/[^\s)\]>]+)/.exec(block);
+        const url = (md && md[1]) || (bare && bare[1]) || '';
+        it.url = url.replace(/[.,;]+$/, '');
+        const dm = /(?:https?:\/\/\S+|\))\s*·\s*([^\n]+)/.exec(block);
+        if (dm) it.date = strip(dm[1]);
+        return it;
+      });
+
+      const head = lines.find(ln => /Дайджест/i.test(ln));
+      const trend = /Главный тренд дня[:*\s]*([^\n]+)/i.exec(text);
+      const forYou = /Для Дмитрия[:*\s]*([^\n]+)/i.exec(text);
+      return { title: head ? strip(head) : '', items, trend: trend ? strip(trend[1]) : '', forYou: forYou ? strip(forYou[1]) : '' };
+    }
+
+    // Тема для генератора: заголовок + факты из новости + авторский угол. Кавычки меняем, чтобы не ломать промпт
+    function digestTopic(it, multiline) {
+      const q = s => String(s || '').replace(/"/g, "'");
+      const parts = [q(it.title)];
+      if (it.what) parts.push('Что произошло: ' + q(it.what));
+      if (it.fact) parts.push('Цифра / факт: ' + q(it.fact));
+      if (it.angle) parts.push('Угол для поста: ' + q(it.angle));
+      return multiline ? parts.join('\n') : parts.join('. ').replace(/\.\.\s/g, '. ');
+    }
+
+    function renderDigest() {
+      const list = document.getElementById('digest-list');
+      const meta = document.getElementById('digest-meta');
+      list.innerHTML = '';
+      const d = digestState.parsed;
+      if (!d) { meta.textContent = ''; return; }
+      if (!d.items.length) {
+        meta.textContent = 'Не нашёл тем. Нужна сводка с пронумерованными новостями («1. Заголовок», «2. …»). Вставь её целиком, как её отдаёт задание.';
+        return;
+      }
+      meta.textContent = `Тем: ${d.items.length}.` + (d.trend ? ` Главный тренд: ${d.trend}` : '');
+      d.items.forEach((it, i) => {
+        const card = document.createElement('div');
+        card.className = 'digest-card' + (digestState.used.has(it.n) ? ' used' : '');
+        const head = document.createElement('div');
+        head.className = 'digest-head';
+        const title = document.createElement('div');
+        title.className = 'digest-title';
+        title.textContent = `${it.n}. ${it.title}`;
+        head.appendChild(title);
+        if (it.score !== null) {
+          const sc = document.createElement('div');
+          sc.className = 'digest-score';
+          sc.textContent = `${it.score}/10` + (it.theme ? ` · Тема ${it.theme}` : '');
+          head.appendChild(sc);
+        }
+        card.appendChild(head);
+        const row = (label, value) => {
+          if (!value) return;
+          const r = document.createElement('div');
+          r.className = 'digest-row';
+          const b = document.createElement('b');
+          b.textContent = label + ': ';
+          r.appendChild(b);
+          r.appendChild(document.createTextNode(value));
+          card.appendChild(r);
+        };
+        row('Цифра / факт', it.fact);
+        row('Угол для поста', it.angle);
+        if (!it.fact && !it.angle) row('Что произошло', it.what);
+        if (it.url && /^https?:\/\//.test(it.url)) {
+          const r = document.createElement('div');
+          r.className = 'digest-row';
+          const a = document.createElement('a');
+          a.href = it.url;
+          a.target = '_blank';
+          a.rel = 'noopener';
+          a.textContent = it.url.replace(/^https?:\/\/(www\.)?/, '').slice(0, 60);
+          r.appendChild(a);
+          if (it.date) r.appendChild(document.createTextNode(' · ' + it.date));
+          card.appendChild(r);
+        }
+        const actions = document.createElement('div');
+        actions.className = 'digest-actions';
+        const li = document.createElement('button');
+        li.className = 'action-btn primary';
+        li.textContent = '✍️ Для LinkedIn';
+        li.addEventListener('click', () => writeFromDigest(i, 'linkedin'));
+        const tgBtn = document.createElement('button');
+        tgBtn.className = 'action-btn primary tg';
+        tgBtn.textContent = '📣 Для Telegram';
+        tgBtn.addEventListener('click', () => writeFromDigest(i, 'telegram'));
+        actions.appendChild(li);
+        actions.appendChild(tgBtn);
+        card.appendChild(actions);
+        list.appendChild(card);
+      });
+    }
+
+    function saveDigest() {
+      try { localStorage.setItem(DIGEST_STORE, JSON.stringify({ raw: digestState.raw, savedAt: Date.now(), used: [...digestState.used] })); } catch {}
+    }
+
+    function parseDigestInput() {
+      const raw = document.getElementById('digest-input').value;
+      digestState.raw = raw;
+      digestState.parsed = raw.trim() ? parseDigest(raw) : null;
+      digestState.used = new Set();
+      if (!raw.trim()) { document.getElementById('digest-meta').textContent = 'Вставь текст дайджеста'; document.getElementById('digest-list').innerHTML = ''; return; }
+      renderDigest();
+      saveDigest();
+    }
+
+    // «Написать пост»: тема уходит в тот же вход 1, что и ручной ввод, и сразу запускается генерация
+    function writeFromDigest(i, target) {
+      const it = digestState.parsed && digestState.parsed.items[i];
+      if (!it) return;
+      if (target === 'telegram') {
+        switchMode('telegram');
+        document.getElementById('telegram-input').value = digestTopic(it, true);
+        generate('telegram');
+      } else {
+        switchMode('topic');
+        document.getElementById('topic-input').value = digestTopic(it, false);
+        generate('topic');
+      }
+      originMode = 'digest'; // «←» в редакторе возвращает к списку тем дайджеста
+      digestState.used.add(it.n);
+      saveDigest();
+      renderDigest();
+    }
+
+    // Дайджест переживает перезапуск Mini App в течение 3 суток (только в этом браузере, поэтому в try)
+    (function restoreDigest() {
+      try {
+        const saved = JSON.parse(localStorage.getItem(DIGEST_STORE) || 'null');
+        if (!saved || !saved.raw || Date.now() - saved.savedAt > 3 * 86400000) return;
+        digestState.raw = saved.raw;
+        digestState.used = new Set(saved.used || []);
+        digestState.parsed = parseDigest(saved.raw);
+        document.getElementById('digest-input').value = saved.raw;
+        renderDigest();
+      } catch {}
     })();
 
     // ===== ВХОД 2: готовый текст =====
