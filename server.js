@@ -2536,6 +2536,15 @@ function threadsRoute(req, res) {
         return send(200, { posts: batch.posts.map((text, i) => ({ text, when: slots[i] || '' })), dropped: batch.dropped });
       }
 
+      if (req.method === 'POST' && url === '/api/threads-angles') {
+        const body = await readJsonBody(req, 512 * 1024);
+        const out = await generateAngles(body.candidate || {});
+        const rows = await schedQuery({ and: [{ property: 'Status', select: { equals: TS.scheduled } }, { property: 'Owner', number: { equals: Number(auth.userId) } }] }, 100);
+        const taken = new Set(rows.filter(r => r.publishAt).map(r => Math.floor(Date.parse(r.publishAt) / 60000)));
+        const slots = nextThreadsSlots(out.posts.length, taken);
+        return send(200, { posts: out.posts.map((x, i) => ({ ...x, when: slots[i] || '' })), dropped: out.dropped });
+      }
+
       if (req.method === 'POST' && url === '/api/threads-editor') {
         const body = await readJsonBody(req, 512 * 1024);
         const out = await runEditor(body.candidate || {}, body.telegram_asset || {});
@@ -2774,6 +2783,51 @@ async function runEditor(cand, tg) {
   return { result: res, mix: input.mix_last_20, slot: nextThreadsSlots(1, taken)[0] || '' };
 }
 
+
+// ── Несколько углов из одной новости ──
+const ANGLE_LENSES = [
+  'кто платит: чьи деньги и чей риск стоят за этой новостью',
+  'что дорожает или дешевеет для оператора и что остается ограничением',
+  'неудобный вопрос индустрии, который эта новость ставит',
+  'спорная позиция: с чем в этой новости можно не согласиться',
+  'глазами игрока: что он увидит и как изменится его поведение',
+  'что в заявлении компании пока только обещание и чем это проверить'
+];
+function anglesSystemPrompt(maxBody) {
+  return `Ты редактор русскоязычного Threads Дмитрия об iGaming и sportsbook. По одной новости напиши 6 разных постов, каждый под своим углом. Углы: ${ANGLE_LENSES.map((a, i) => (i + 1) + ') ' + a).join('; ')}. Можно заменить угол более острым, но все шесть должны отличаться по мысли, а не по формулировке. Провокация должна быть в мысли или вопросе к индустрии, не в обвинении компании и не в нападках на нее по имени.
+
+Правила. Только факты из source_text, заявление компании маркируй как заявление, свои выводы подавай как интерпретацию. Не придумывай цифры, цитаты, кейсы и личный опыт автора («я видел», «в моей практике», «у нас был»). Каждый пост: факт, вывод оператора, позиция. Длина текста поста не больше ${maxBody} символов, ссылку не пиши, ее добавит система. Русский простой разговорный, буква е без точек, без эмодзи, хэштегов, Markdown, тире (только дефис внутри слов), без «Вот почему», «Вот что», «Дело не в X, а в Y», «Это не просто X, это Y», «Результат?», «Что думаете?», «Согласны?», без призывов к комментариям, без трех симметричных коротких фраз. Цифр не больше трех-четырех на пост, проценты знаком %. Слово «книга» в значении линии букмекера не используй. Не пиши про американский гемблинг (рынок США, штаты), кроме prediction markets. Базовые термины (GGR, NGR, маржа) не расшифровывай.
+
+Верни ТОЛЬКО JSON без Markdown: {"posts":[{"angle":"название угла 2-5 слов","text":"текст поста"}]}`;
+}
+async function generateAngles(cand) {
+  const title = String(cand.title || '').slice(0, 300);
+  const urlSrc = String(cand.source_url || '').trim().slice(0, 600);
+  const srcText = String(cand.source_text || '').slice(0, 12000);
+  if (!srcText.trim()) throw httpError(400, 'Нужен текст новости: вставь его в поле источника');
+  if (!/^https?:\/\/\S+$/.test(urlSrc)) throw httpError(400, 'Нужна ссылка на источник: она ставится в конец каждого поста');
+  const maxBody = THREADS_MAX - threadsLength(urlSrc) - 1 - 10;
+  if (maxBody < 150) throw httpError(400, 'Ссылка слишком длинная, на текст остается меньше 150 символов');
+  const raw = await claudeCall(anglesSystemPrompt(maxBody), JSON.stringify({ title, source_url: urlSrc, source_text: srcText }), 4000);
+  const parsed = parseEditorJson(raw);
+  if (!parsed || !Array.isArray(parsed.posts)) throw httpError(502, 'Модель вернула не JSON, попробуй еще раз');
+  const posts = [], dropped = [];
+  for (const it of parsed.posts) {
+    const body = noYo(String((it && it.text) || '').trim()).replace(/https?:\/\/\S+/g, '').trim();
+    const angle = String((it && it.angle) || '').trim().slice(0, 60);
+    const why = [];
+    if (!body) why.push('пусто');
+    if (threadsLength(body) > maxBody) why.push('длинно');
+    if (EDITOR_BAD.some(([re]) => re.test(body))) why.push('шаблонная фраза');
+    if (findNegContrast(body).length) why.push('не X, а Y');
+    if (/[—–]/.test(body) || /\s-\s/.test(body)) why.push('тире');
+    if (US_GAMBLING.test(body) && !PRED_MARKET.test(body)) why.push('США');
+    if (why.length) { dropped.push(`${angle || 'угол'}: ${why.join(', ')}`); continue; }
+    posts.push({ angle, text: body + '\n' + urlSrc });
+  }
+  return { posts: posts.slice(0, 5), dropped };
+}
+// ── конец блока углов ──
 // ── конец блока Threads ──
 
 // ── Ответы на комментарии под постами канала ──

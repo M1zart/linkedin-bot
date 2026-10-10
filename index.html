@@ -888,6 +888,7 @@
       <input type="text" id="ed-tg-extra" placeholder="Что читатель получит там дополнительно" style="margin-top:8px;" />
     </div>
     <button class="generate-btn" id="ed-run" onclick="thEditorRun()">Подготовить пост</button>
+    <button class="generate-btn" id="ed-angles" onclick="thAnglesRun()" style="margin-top:8px;">5 постов под разными углами</button>
     <div id="ed-result"></div>
 
     <div class="field-label">Формат</div>
@@ -2402,6 +2403,53 @@
       } finally {
         edState.busy = false; btn.disabled = false; btn.textContent = 'Подготовить пост';
       }
+    }
+
+    async function thAnglesRun() {
+      if (edState.busy) return;
+      const body = { candidate: { title: document.getElementById('ed-title').value.trim(), source_url: document.getElementById('ed-url').value.trim(), source_text: document.getElementById('ed-text').value.trim() } };
+      const btn = document.getElementById('ed-angles');
+      const box = document.getElementById('ed-result');
+      edState.busy = true; btn.disabled = true; btn.textContent = 'Пишу 5 углов…'; box.innerHTML = '';
+      try {
+        const data = await queueCall('/api/threads-angles', { method: 'POST', body: JSON.stringify(body) });
+        anglesRender(data);
+      } catch (e) { box.textContent = thErr(e); }
+      finally { edState.busy = false; btn.disabled = false; btn.textContent = '5 постов под разными углами'; }
+    }
+
+    function anglesRender(data) {
+      const box = document.getElementById('ed-result');
+      box.innerHTML = '';
+      const posts = data.posts || [];
+      if (!posts.length) { box.textContent = 'Ни один вариант не прошел проверку' + ((data.dropped || []).length ? ': ' + data.dropped.join('; ') : '') + '. Нажми еще раз.'; return; }
+      const head = document.createElement('div'); head.className = 'digest-row'; head.style.fontWeight = '600';
+      head.textContent = 'Бот написал ' + posts.length + ' разных постов по твоей новости. Выбери нужный, поправь и поставь в очередь. Ссылка уже в конце каждого.';
+      box.appendChild(head);
+      posts.forEach(p => {
+        const card = document.createElement('div'); card.className = 'digest-card';
+        const t = document.createElement('div'); t.className = 'digest-title'; t.textContent = p.angle || 'Угол'; card.appendChild(t);
+        const ta = document.createElement('textarea'); ta.value = p.text; ta.style.width = '100%'; ta.style.boxSizing = 'border-box'; ta.style.minHeight = '180px';
+        const counter = document.createElement('div'); counter.className = 'digest-row';
+        const upd = () => { const n = thLen(ta.value); counter.textContent = n + ' из ' + TH_MAX; counter.style.color = n > TH_MAX ? 'var(--red)' : ''; ta.style.height = 'auto'; ta.style.height = Math.max(180, ta.scrollHeight + 4) + 'px'; };
+        ta.addEventListener('input', upd); card.appendChild(ta); card.appendChild(counter); setTimeout(upd, 0); upd();
+        const when = document.createElement('input'); when.type = 'datetime-local'; when.value = thToInput(p.when || '');
+        const q = document.createElement('button'); q.className = 'generate-btn tg-btn'; q.textContent = 'Поставить в очередь';
+        q.addEventListener('click', async () => {
+          if (thState.busy) return;
+          if (thLen(ta.value) > TH_MAX) { showToast('Длиннее ' + TH_MAX + ' символов', true); return; }
+          const w = thFromInput(when.value);
+          if (!w) { showToast('Выбери время', true); return; }
+          thState.busy = true; q.disabled = true; q.textContent = 'Ставлю…';
+          try {
+            await queueCall('/api/threads-schedule', { method: 'POST', body: JSON.stringify({ items: [{ text: ta.value, when: w, meta: { type: 'news', goal: 'reach', angle: p.angle || '' } }] }) });
+            showToast('В очереди'); card.remove();
+          } catch (e) { showToast(thErr(e), true); q.disabled = false; q.textContent = 'Поставить в очередь'; }
+          finally { thState.busy = false; }
+          thLoadQueue();
+        });
+        card.appendChild(when); card.appendChild(q); box.appendChild(card);
+      });
     }
 
     function edRender(data) {
