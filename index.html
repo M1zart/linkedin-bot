@@ -869,6 +869,27 @@
   <!-- Threads: партия постов, очередь, автопубликация -->
   <div id="mode-threads" class="mode-panel">
     <div class="digest-meta" id="th-meta" style="display:block;">Посты для широкой аудитории, до 500 символов. Время по Варшаве, слоты 12:30 и 19:30.</div>
+    <div class="field-label">Из источника (редакционный алгоритм)</div>
+    <input type="text" id="ed-title" placeholder="Заголовок или тема" />
+    <input type="text" id="ed-url" placeholder="Ссылка на первичный источник" style="margin-top:8px;" />
+    <textarea id="ed-text" placeholder="Текст источника: вставь сюда статью или релиз. Без текста NEWS и FEATURE не пишутся" style="margin-top:8px;min-height:120px;"></textarea>
+    <div class="field-label">Дата публикации источника и тип</div>
+    <input type="datetime-local" id="ed-date" />
+    <select id="ed-type" style="margin-top:8px;">
+      <option value="auto">Тип: определить автоматически</option>
+      <option value="news">NEWS: новость с позицией</option>
+      <option value="feature">FEATURE: разбор функции или релиза</option>
+      <option value="mechanic">MECHANIC: механика или миф</option>
+      <option value="opinion">OPINION: наблюдение</option>
+    </select>
+    <label style="display:flex;align-items:center;gap:8px;margin:10px 0 6px;font-size:14px;"><input type="checkbox" id="ed-tg" onchange="document.getElementById('ed-tg-box').style.display=this.checked?'block':'none'" /> Есть материал в Telegram для перехода</label>
+    <div id="ed-tg-box" style="display:none;">
+      <input type="text" id="ed-tg-url" placeholder="Ссылка на материал или пригласительная ссылка Threds" />
+      <input type="text" id="ed-tg-extra" placeholder="Что читатель получит там дополнительно" style="margin-top:8px;" />
+    </div>
+    <button class="generate-btn" id="ed-run" onclick="thEditorRun()">Подготовить пост</button>
+    <div id="ed-result"></div>
+
     <div class="field-label">Формат</div>
     <select id="th-format">
       <option value="mix">Микс</option>
@@ -2349,6 +2370,95 @@
         thState.busy = false;
       }
       thLoadQueue();
+    }
+
+    // ----- Редакционный алгоритм Threads -----
+    const edState = { busy: false, last: null };
+    async function thEditorRun() {
+      if (edState.busy) return;
+      const tgOn = document.getElementById('ed-tg').checked;
+      const dateVal = document.getElementById('ed-date').value;
+      const body = {
+        candidate: {
+          title: document.getElementById('ed-title').value.trim(),
+          source_url: document.getElementById('ed-url').value.trim(),
+          source_text: document.getElementById('ed-text').value.trim(),
+          published_at: dateVal ? new Date(dateVal).toISOString() : '',
+          suggested_type: document.getElementById('ed-type').value
+        },
+        telegram_asset: { available: tgOn && !!document.getElementById('ed-tg-url').value.trim(), url: document.getElementById('ed-tg-url').value.trim(), extra_value: document.getElementById('ed-tg-extra').value.trim() }
+      };
+      edState.busy = true;
+      const btn = document.getElementById('ed-run');
+      const box = document.getElementById('ed-result');
+      btn.disabled = true; btn.textContent = 'Готовлю пост…';
+      box.innerHTML = '';
+      try {
+        const data = await queueCall('/api/threads-editor', { method: 'POST', body: JSON.stringify(body) });
+        edState.last = data;
+        edRender(data);
+      } catch (e) {
+        box.textContent = thErr(e);
+      } finally {
+        edState.busy = false; btn.disabled = false; btn.textContent = 'Подготовить пост';
+      }
+    }
+
+    function edRender(data) {
+      const box = document.getElementById('ed-result');
+      box.innerHTML = '';
+      const r = data.result || {};
+      const card = document.createElement('div');
+      card.className = 'digest-card' + (r.status === 'ready' ? '' : ' queue-card failed');
+      const names = { ready: 'Готово к очереди', needs_input: 'Нужны данные', skip: 'Не публиковать' };
+      const title = document.createElement('div');
+      title.className = 'digest-title';
+      title.textContent = (names[r.status] || r.status || 'Нет ответа') + (r.content_type ? ' · ' + r.content_type.toUpperCase() : '') + (r.goal === 'telegram_bridge' ? ' · мост в Telegram' : '');
+      card.appendChild(title);
+      if (r.reason) { const rs = document.createElement('div'); rs.className = 'digest-row'; rs.textContent = r.reason; card.appendChild(rs); }
+      const meta = [];
+      if (r.company) meta.push('Компания: ' + r.company);
+      if (r.angle) meta.push('Угол: ' + r.angle);
+      if (r.customer_face) meta.push('Лицо клиента: ' + r.customer_face);
+      if (r.business_mechanism) meta.push('Механика: ' + r.business_mechanism);
+      if (r.score && r.score.total !== undefined) meta.push(`Оценка: ${r.score.total} из 12 (интерес ${r.score.interest}, новизна ${r.score.novelty}, клиент ${r.score.customer_face}, механика ${r.score.business_mechanism}, угол ${r.score.author_angle}, доказательность ${r.score.evidence})`);
+      if (data.mix) meta.push(`Последние 20: NEWS ${data.mix.news}, FEATURE ${data.mix.feature}, MECHANIC ${data.mix.mechanic}, OPINION ${data.mix.opinion}`);
+      meta.forEach(t => { const d = document.createElement('div'); d.className = 'digest-row'; d.textContent = t; card.appendChild(d); });
+      if (Array.isArray(r.internal_fact_check) && r.internal_fact_check.length) {
+        const d = document.createElement('div'); d.className = 'digest-row';
+        d.textContent = 'Проверка фактов: ' + r.internal_fact_check.map(x => `${x.claim} (${x.support})`).join('; ');
+        card.appendChild(d);
+      }
+      if (r.post_text) {
+        const ta = document.createElement('textarea');
+        ta.value = r.post_text; ta.style.minHeight = '120px';
+        const counter = document.createElement('div'); counter.className = 'digest-row';
+        const upd = () => { const n = thLen(ta.value); counter.textContent = `${n} из ${TH_MAX}`; counter.style.color = n > TH_MAX ? 'var(--red)' : ''; };
+        ta.addEventListener('input', upd); upd();
+        card.appendChild(ta); card.appendChild(counter);
+        if (r.status === 'ready') {
+          const when = document.createElement('input');
+          when.type = 'datetime-local'; when.value = thToInput(data.slot || '');
+          const q = document.createElement('button');
+          q.className = 'generate-btn tg-btn'; q.textContent = 'Поставить в очередь';
+          q.addEventListener('click', async () => {
+            if (thState.busy) return;
+            if (thLen(ta.value) > TH_MAX) { showToast('Длиннее ' + TH_MAX + ' символов', true); return; }
+            const w = thFromInput(when.value);
+            if (!w) { showToast('Выбери время', true); return; }
+            thState.busy = true; q.disabled = true; q.textContent = 'Ставлю…';
+            try {
+              await queueCall('/api/threads-schedule', { method: 'POST', body: JSON.stringify({ items: [{ text: ta.value, when: w, meta: { type: r.content_type, goal: r.goal || 'reach', company: r.company || '', angle: r.angle || '' } }] }) });
+              showToast('В очереди');
+              box.innerHTML = '';
+            } catch (e) { showToast(thErr(e), true); q.disabled = false; q.textContent = 'Поставить в очередь'; }
+            finally { thState.busy = false; }
+            thLoadQueue();
+          });
+          card.appendChild(when); card.appendChild(q);
+        }
+      }
+      box.appendChild(card);
     }
 
     // ===== ДАЙДЖЕСТ: источник тем для входа 1 =====

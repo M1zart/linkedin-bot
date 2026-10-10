@@ -2042,7 +2042,11 @@ function pageToRow(p) {
     status: (pr.Status && pr.Status.select && pr.Status.select.name) || null,
     owner: pr.Owner && pr.Owner.number !== undefined ? pr.Owner.number : null,
     link: (pr.Link && pr.Link.url) || null,
-    error: fromRichText(pr.Error && pr.Error.rich_text)
+    error: fromRichText(pr.Error && pr.Error.rich_text),
+    type: (pr.Type && pr.Type.select && pr.Type.select.name) || null,
+    company: fromRichText(pr.Company && pr.Company.rich_text),
+    angle: fromRichText(pr.Angle && pr.Angle.rich_text),
+    goal: (pr.Goal && pr.Goal.select && pr.Goal.select.name) || null
   };
 }
 
@@ -2334,7 +2338,7 @@ async function publishToThreads(text, replyToId) {
   return { id: pub.id, link };
 }
 
-async function tCreate(text, iso, owner) {
+async function tCreate(text, iso, owner, meta) {
   const page = await notionReq('POST', '/v1/pages', {
     parent: { type: 'data_source_id', data_source_id: NOTION_SCHEDULE_DS_ID },
     properties: {
@@ -2342,7 +2346,11 @@ async function tCreate(text, iso, owner) {
       Text: { rich_text: toRichText(text) },
       'Publish At': { date: { start: iso } },
       Status: { select: { name: TS.scheduled } },
-      Owner: { number: owner }
+      Owner: { number: owner },
+      ...(meta && meta.type ? { Type: { select: { name: meta.type } } } : {}),
+      ...(meta && meta.goal ? { Goal: { select: { name: meta.goal } } } : {}),
+      ...(meta && meta.company ? { Company: { rich_text: toRichText(meta.company) } } : {}),
+      ...(meta && meta.angle ? { Angle: { rich_text: toRichText(meta.angle) } } : {})
     }
   });
   return pageToRow(page);
@@ -2528,6 +2536,12 @@ function threadsRoute(req, res) {
         return send(200, { posts: batch.posts.map((text, i) => ({ text, when: slots[i] || '' })), dropped: batch.dropped });
       }
 
+      if (req.method === 'POST' && url === '/api/threads-editor') {
+        const body = await readJsonBody(req, 512 * 1024);
+        const out = await runEditor(body.candidate || {}, body.telegram_asset || {});
+        return send(200, out);
+      }
+
       if (req.method === 'POST' && url === '/api/threads-schedule') {
         if (!threadsConfigured()) return send(503, { error: 'Threads не настроен: задай THREADS_ACCESS_TOKEN в переменных Railway' });
         const { items } = await readJsonBody(req, 1024 * 1024);
@@ -2541,9 +2555,16 @@ function threadsRoute(req, res) {
           if (len > THREADS_MAX) throw httpError(400, `Пост ${i + 1}: ${len} символов, лимит ${THREADS_MAX}`);
           const parsed = parseWarsawDateTime(it.when);
           if (!parsed.ok) throw httpError(400, `Пост ${i + 1}: ${parsed.error}`);
-          return { text, iso: parsed.iso };
+          const mt = it.meta && typeof it.meta === 'object' ? it.meta : null;
+          const meta = mt ? {
+            type: EDITOR_TYPES.includes(mt.type) ? mt.type : null,
+            goal: ['reach', 'telegram_bridge'].includes(mt.goal) ? mt.goal : null,
+            company: String(mt.company || '').slice(0, 100),
+            angle: String(mt.angle || '').slice(0, 300)
+          } : null;
+          return { text, iso: parsed.iso, meta };
         });
-        for (const p of prepared) await tCreate(p.text, p.iso, Number(auth.userId));
+        for (const p of prepared) await tCreate(p.text, p.iso, Number(auth.userId), p.meta);
         return send(200, { ok: true, count: prepared.length });
       }
 
@@ -2587,6 +2608,170 @@ function threadsRoute(req, res) {
   })();
   return true;
 }
+// ── Редакционный алгоритм Threads (версия 1.0 от 10.10.2026): кандидат → проверка → JSON → статус ──
+const EDITOR_TYPES = ['news', 'feature', 'mechanic', 'opinion'];
+
+function editorSystemPrompt() {
+  return `Ты редактор русскоязычного Threads-медиа Дмитрия об iGaming и sportsbook. Твоя задача: создавать охватный, понятный человеку вне индустрии контент с операторской глубиной. Threads набирает массовый тематический охват, Telegram хранит более глубокие материалы и со временем становится рекламной B2B-площадкой.
+
+Пиши как опытный sportsbook-оператор, а не как журналист, affiliate, маркетолог, мотиватор или AI-копирайтер. Главная оптика каждого поста: что увидит клиент, какое его поведение хочет изменить компания, как это связано с экономикой и где ограничение решения.
+
+Пропорция последних 20 постов: NEWS 30%, FEATURE 30%, MECHANIC 30%, OPINION 10%. Минимум 60% постов напрямую связаны со sportsbook или betting. Не публикуй общую бизнес-мудрость без индустриального объекта. Не публикуй слабую новость ради квоты.
+
+NEWS: факт, клиентский эффект, операторская оптика, вывод, первичный URL отдельной последней строкой. FEATURE: одна функция, одно клиентское изменение, одна бизнес-цель, одно условие успеха или ограничение, первичный URL для реального релиза отдельной последней строкой. MECHANIC: знакомое наблюдение, скрытая механика, экономика, вывод. OPINION: конкретное индустриальное наблюдение, причина, последствие, позиция.
+
+Не пытайся разобрать всю функцию в 500 символов. Выбери один угол: проблема клиента, изменение поведения, бизнес-метрика, компромисс, риск или условие успеха. Если нельзя объяснить, что изменится для клиента прямо или косвенно, FEATURE не публикуется.
+
+Режимы: 80% постов полностью раскрывают мысль в Threads (goal=reach). Не более 20% ведут в Telegram (goal=telegram_bridge), и только если telegram_asset.available=true и там есть конкретная дополнительная ценность. В таком посте последняя строка это URL из telegram_asset, а текст перед ним называет, что именно читатель получит в Telegram. Запрещены «подробнее в канале» и «продолжение по ссылке». Не скрывай основной ответ ради перехода. Новостной пост со ссылкой на источник не получает второй внешний CTA, мост в Telegram не делается для NEWS.
+
+Финальный post_text вместе с URL не длиннее 500 символов Unicode. Рабочий ориентир без ссылки 300-480. Один пост, одна мысль, не больше одной внешней ссылки. Русский язык простой, разговорный, буква е без точек, без эмодзи, хэштегов, Markdown, канцелярита и рекламных эпитетов. Цифры по-человечески, не больше пяти-шести на пост, проценты знаком %. Незнакомый термин раскрой в той же фразе, базовые термины индустрии (GGR, NGR, маржа) не расшифровывай. Слово «книга» в значении линии букмекера не используй. Не пиши про американский гемблинг (рынок США, штаты, американские операторы), исключение: prediction markets.
+
+Запрещены: «Вот почему», «Вот что», «Давайте разберемся», «Дело не в X, а в Y», «Это не просто X, это Y», «Почему это важно?», «Результат?», «Что думаете?», «Согласны?», «Делитесь в комментариях», «В современном мире», «играет ключевую роль», «выводит на новый уровень», заголовки «3 урока», «5 вещей», три симметричные короткие фразы ради ритма, повтор мысли разными словами, драматические тире. Предметный вопрос допустим не чаще чем в 20% постов и только с ограниченным предметом ответа.
+
+Не придумывай цифры, цитаты, кейсы, мотивы компании и личный опыт автора. Для NEWS и FEATURE используй первичный источник. Отделяй подтвержденные факты от обещаний компании и своей интерпретации: заявление компании маркируй как заявление. Новость старше 72 часов допустима только с новым углом, тогда это уже FEATURE или MECHANIC. Если source_text недоступен, факта не хватает или утверждение нельзя подтвердить, верни needs_input или skip, никогда не заполняй пробел догадкой.
+
+Перед текстом внутренне оцени кандидата по шести критериям 0-2: interest, novelty, customer_face, business_mechanism, author_angle, evidence. Порог 8 из 12. Для NEWS и FEATURE evidence должна быть 2, для FEATURE customer_face минимум 1, для любого типа author_angle минимум 1. Сначала внутренне ответь на пять вопросов клиентского лица: что клиент увидит, какое действие станет проще, дороже или вероятнее, какого поведения хочет компания, на какой показатель это влияет, какой риск или ограничение. Выбери один главный конфликт. Если suggested_type не auto, используй его, если он не противоречит материалу.
+
+Статусы: ready (пройдены пороги, факты подтверждены, ссылка там где нужна, длина не больше 500, нет дубля и запрещенного), needs_input (не хватает источника, даты, числа, контекста или содержания Telegram-материала), skip (нет клиентского лица и механики, чистый пресс-релиз, факт не подтвердить, тема недавно выходила с тем же выводом, нужно выдумывать, не про iGaming, устарело, реклама букмекера). Для skip и needs_input post_text оставь пустым.
+
+Тебе приходит JSON с полями current_date, candidate (title, source_url, source_text, published_at, suggested_type), recent_posts, mix_last_20, telegram_asset. Верни ТОЛЬКО валидный JSON без Markdown:
+{"status":"ready|needs_input|skip","content_type":"news|feature|mechanic|opinion","goal":"reach|telegram_bridge","company":"","angle":"","customer_face":"","business_mechanism":"","source_url":"","source_quality":"primary|secondary|not_required|insufficient","suggested_topic":"","post_text":"","character_count":0,"score":{"interest":0,"novelty":0,"customer_face":0,"business_mechanism":0,"author_angle":0,"evidence":0,"total":0},"internal_fact_check":[{"claim":"","support":""}],"reason":""}`;
+}
+
+async function tRecent(limit = 20) {
+  const data = await notionReq('POST', `/v1/data_sources/${NOTION_SCHEDULE_DS_ID}/query`, {
+    filter: { or: [{ property: 'Status', select: { equals: TS.published } }, { property: 'Status', select: { equals: TS.scheduled } }] },
+    sorts: [{ property: 'Publish At', direction: 'descending' }], page_size: limit
+  });
+  return (data.results || []).map(pageToRow);
+}
+
+function parseEditorJson(raw) {
+  const m = String(raw || '').replace(/^```(?:json)?\s*|\s*```$/g, '').match(/\{[\s\S]*\}/);
+  if (!m) return null;
+  try { return JSON.parse(m[0]); } catch { return null; }
+}
+
+const EDITOR_BAD = [
+  [/вот почему|вот что|давайте разберемся/i, 'шаблонная фраза («Вот почему», «Вот что», «Давайте разберемся»)'],
+  [/это не просто|почему это важно|(^|\n)результат\?/i, 'шаблонная конструкция'],
+  [/что думаете|согласны\?|делитесь в комментариях/i, 'призыв к комментариям'],
+  [/в современном мире|играет ключевую роль|выводит на новый уровень/i, 'штамп'],
+  [/подробнее в канале|продолжение по ссылке|подробнее по ссылке/i, 'пустой призыв перейти'],
+  [/(^|[\s(])#\S/, 'хэштег'],
+  [/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/u, 'эмодзи'],
+  [/\*\*|^#{1,3}\s|`/m, 'Markdown'],
+  [/(^|[^а-яё])книг[аиуе]([^а-яё]|$)/i, 'слово «книга»'],
+  [/(^|\s)\d+\s+(урок|вещ|причин)/i, 'заголовок-счетчик'],
+  [/(^|[^а-яё])я (видел|помню|наблюдал)|в моей практике|у нас (был|была|было|были)([^а-яё]|$)/i, 'выдуманный личный опыт']
+];
+const US_GAMBLING = /(draftkings|fanduel|betmgm|caesars sportsbook|espn bet|fanatics sportsbook|hard rock bet|сша|американск|штат[аоы]?(?![а-я]))/i;
+const PRED_MARKET = /kalshi|polymarket|prediction market|предикшн|рынк[а-я]* предсказани/i;
+
+// Проверки сверху модели: возвращает { fix: [...], skip: [...] }
+function validateEditorResult(res, input, recent) {
+  const fix = [], skip = [];
+  const text = String(res.post_text || '');
+  const type = res.content_type;
+  const url = (res.source_url || input.candidate.source_url || '').trim();
+  const urls = text.match(/https?:\/\/\S+/g) || [];
+  if (!EDITOR_TYPES.includes(type)) skip.push('неизвестный тип поста');
+  if (!text.trim()) fix.push('пустой текст поста');
+  const len = threadsLength(text);
+  if (len > THREADS_MAX) fix.push(`длина ${len} из ${THREADS_MAX}`);
+  if (/ё/i.test(text)) fix.push('буква ё');
+  for (const [re, why] of EDITOR_BAD) if (re.test(text)) fix.push(why);
+  if (findNegContrast(text).length) fix.push('конструкция «не X, а Y»');
+  if (/[—–]/.test(text) || /\s-\s/.test(text)) fix.push('тире');
+  if (urls.length > 1) fix.push('больше одной ссылки');
+  const lastLine = text.trim().split('\n').pop().trim();
+  if ((type === 'news' || type === 'feature') && url && res.goal !== 'telegram_bridge') {
+    if (lastLine !== url) fix.push('ссылка на источник должна стоять отдельной последней строкой');
+  }
+  if (res.goal === 'telegram_bridge') {
+    const asset = input.telegram_asset || {};
+    if (!asset.available || !asset.url) skip.push('нет материала в Telegram для перехода');
+    else if (lastLine !== asset.url) fix.push('ссылка на Telegram должна стоять отдельной последней строкой');
+    if (type === 'news') skip.push('для NEWS мост в Telegram не делается');
+  }
+  if (US_GAMBLING.test(text) && !PRED_MARKET.test(text)) skip.push('американский гемблинг');
+  // Пороги по шкале
+  const sc = res.score || {};
+  const total = ['interest', 'novelty', 'customer_face', 'business_mechanism', 'author_angle', 'evidence'].reduce((a, k) => a + (Number(sc[k]) || 0), 0);
+  res.score = { ...sc, total };
+  if (total < 8) skip.push(`оценка ${total} из 12, порог 8`);
+  if ((type === 'news' || type === 'feature') && Number(sc.evidence) !== 2) skip.push('для NEWS и FEATURE доказательность должна быть 2');
+  if (type === 'feature' && Number(sc.customer_face) < 1) skip.push('у FEATURE нет лица клиента');
+  if (Number(sc.author_angle) < 1) skip.push('нет авторского угла');
+  // Свежесть новости
+  const pub = Date.parse(input.candidate.published_at || '');
+  if (type === 'news' && pub && Date.now() - pub > 72 * 3600 * 1000) skip.push('новости больше 72 часов, нового угла нет');
+  // Лента: дубли, серии, квоты
+  const last20 = recent.slice(0, 20), last10 = recent.slice(0, 10);
+  const co = String(res.company || '').trim().toLowerCase();
+  if (co && last10.filter(r => String(r.company || '').trim().toLowerCase() === co).length >= 2) skip.push('эта компания уже в двух из последних десяти постов');
+  const t2 = recent.slice(0, 2).map(r => r.type);
+  if (t2.length === 2 && t2[0] && t2[0] === t2[1] && t2[0] === type) skip.push('третий пост подряд одного типа');
+  if (type === 'news' && last20.filter(r => r.type === 'news').length >= 8) skip.push('лимит NEWS 40% в последних 20 постах');
+  if (res.goal === 'telegram_bridge' && last20.filter(r => r.goal === 'telegram_bridge').length >= 4) skip.push('лимит 20% постов с переходом в Telegram');
+  return { fix, skip };
+}
+
+function editorMix(recent) {
+  const mix = { news: 0, feature: 0, mechanic: 0, opinion: 0 };
+  recent.slice(0, 20).forEach(r => { if (mix[r.type] !== undefined) mix[r.type]++; });
+  return mix;
+}
+
+async function runEditor(cand, tg) {
+  const input0 = {
+    current_date: new Date().toISOString().slice(0, 10),
+    candidate: {
+      title: String(cand.title || '').slice(0, 300),
+      source_url: String(cand.source_url || '').trim().slice(0, 600),
+      source_text: String(cand.source_text || '').slice(0, 12000),
+      published_at: String(cand.published_at || '').slice(0, 40),
+      suggested_type: EDITOR_TYPES.concat(['auto']).includes(cand.suggested_type) ? cand.suggested_type : 'auto'
+    },
+    telegram_asset: { available: !!(tg && tg.available && tg.url), url: String((tg && tg.url) || '').trim(), extra_value: String((tg && tg.extra_value) || '').slice(0, 500) }
+  };
+  const needsSource = input0.candidate.suggested_type === 'news' || input0.candidate.suggested_type === 'feature';
+  if (needsSource && !input0.candidate.source_text.trim()) {
+    return { result: { status: 'needs_input', reason: 'Для NEWS и FEATURE нужен текст источника: вставь его, угадывать содержание по ссылке нельзя.', post_text: '' } };
+  }
+  if (!input0.candidate.source_text.trim() && !input0.candidate.title.trim()) {
+    return { result: { status: 'needs_input', reason: 'Нужна тема или текст источника.', post_text: '' } };
+  }
+  const recentRows = await tRecent(20);
+  const recent = recentRows.map(r => ({ published_at: r.publishAt, type: r.type || '', company: r.company || '', angle: r.angle || '', goal: r.goal || '', post_text: r.text }));
+  const input = { ...input0, recent_posts: recent.map(r => ({ published_at: r.published_at, content_type: r.type, company: r.company, angle: r.angle, post_text: r.post_text })), mix_last_20: editorMix(recent) };
+  const raw = await claudeCall(editorSystemPrompt(), JSON.stringify(input), 3000);
+  let res = parseEditorJson(raw);
+  if (!res) throw httpError(502, 'Модель вернула не JSON, попробуй еще раз');
+  res.post_text = noYo(String(res.post_text || '').trim());
+  res.character_count = threadsLength(res.post_text);
+  if (res.status !== 'ready') {
+    return { result: res, mix: input.mix_last_20 };
+  }
+  let v = validateEditorResult(res, input, recent);
+  // Одна попытка починить оформление, если нарушены только форматные правила
+  if (v.fix.length && !v.skip.length) {
+    const fixed = await claudeCall(editorSystemPrompt(),
+      `Исправь post_text, не меняя смысла и фактов. Нарушения: ${v.fix.join('; ')}. Верни тот же JSON целиком, status оставь ready.\n\n` + JSON.stringify({ input, previous: res }), 3000);
+    const res2 = parseEditorJson(fixed);
+    if (res2) {
+      res2.post_text = noYo(String(res2.post_text || '').trim());
+      res2.character_count = threadsLength(res2.post_text);
+      res = res2;
+      v = validateEditorResult(res, input, recent);
+    }
+  }
+  if (v.skip.length) { res.status = 'skip'; res.reason = v.skip.join('; '); res.post_text = res.post_text; }
+  else if (v.fix.length) { res.status = 'needs_input'; res.reason = 'Не прошел проверку оформления: ' + v.fix.join('; '); }
+  const taken = new Set(recentRows.filter(r => r.status === TS.scheduled && r.publishAt).map(r => Math.floor(Date.parse(r.publishAt) / 60000)));
+  return { result: res, mix: input.mix_last_20, slot: nextThreadsSlots(1, taken)[0] || '' };
+}
+
 // ── конец блока Threads ──
 
 // ── Ответы на комментарии под постами канала ──
