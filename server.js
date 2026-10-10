@@ -2832,24 +2832,37 @@ const ANGLE_LENSES = [
   'глазами игрока: что он увидит и как изменится его поведение',
   'что в заявлении компании пока только обещание и чем это проверить'
 ];
-function anglesSystemPrompt(maxBody) {
-  return `Ты редактор русскоязычного Threads Дмитрия об iGaming и sportsbook. По одной новости напиши 6 разных постов, каждый под своим углом. Углы: ${ANGLE_LENSES.map((a, i) => (i + 1) + ') ' + a).join('; ')}. Можно заменить угол более острым, но все шесть должны отличаться по мысли, а не по формулировке. Провокация должна быть в мысли или вопросе к индустрии, не в обвинении компании и не в нападках на нее по имени.
+function anglesSystemPrompt(maxBody, hasUrl) {
+  return `Ты редактор русскоязычного Threads Дмитрия об iGaming и sportsbook. По одной новости или посту напиши 6 разных постов, каждый под своим углом. Углы: ${ANGLE_LENSES.map((a, i) => (i + 1) + ') ' + a).join('; ')}. Можно заменить угол более острым, но все шесть должны отличаться по мысли, а не по формулировке. Провокация должна быть в мысли или вопросе к индустрии, не в обвинении компании и не в нападках на нее по имени.
 
-Правила. Только факты из source_text, заявление компании маркируй как заявление, свои выводы подавай как интерпретацию. Не придумывай цифры, цитаты, кейсы и личный опыт автора («я видел», «в моей практике», «у нас был»). Каждый пост: факт, вывод оператора, позиция. Длина текста поста не больше ${maxBody} символов, ссылку не пиши, ее добавит система. Русский простой разговорный, буква е без точек, без эмодзи, хэштегов, Markdown, тире (только дефис внутри слов), без «Вот почему», «Вот что», «Дело не в X, а в Y», «Это не просто X, это Y», «Результат?», «Что думаете?», «Согласны?», без призывов к комментариям, без трех симметричных коротких фраз. Цифр не больше трех-четырех на пост, проценты знаком %. Слово «книга» в значении линии букмекера не используй. Не пиши про американский гемблинг (рынок США, штаты), кроме prediction markets. Базовые термины (GGR, NGR, маржа) не расшифровывай.
+Правила. Только факты из source_text, заявление компании маркируй как заявление, свои выводы подавай как интерпретацию. Не придумывай цифры, цитаты, кейсы и личный опыт автора («я видел», «в моей практике», «у нас был»). Каждый пост: факт, вывод оператора, позиция. Длина текста поста не больше ${maxBody} символов${hasUrl ? ', ссылку не пиши, ее добавит система' : ', ссылок и адресов сайтов в тексте нет'}. Русский простой разговорный, буква е без точек, без эмодзи, хэштегов, Markdown, тире (только дефис внутри слов), без «Вот почему», «Вот что», «Дело не в X, а в Y», «Это не просто X, это Y», «Результат?», «Что думаете?», «Согласны?», без призывов к комментариям, без трех симметричных коротких фраз. Цифр не больше трех-четырех на пост, проценты знаком %. Слово «книга» в значении линии букмекера не используй. Не пиши про американский гемблинг (рынок США, штаты), кроме prediction markets. Базовые термины (GGR, NGR, маржа) не расшифровывай.
 
 Верни ТОЛЬКО JSON без Markdown: {"posts":[{"angle":"название угла 2-5 слов","text":"текст поста"}]}`;
+}
+const PERSONAL_LENSES = ['начать с момента или детали', 'начать с решения, которое было принято', 'начать с честного чувства', 'начать с вопроса к себе', 'самая короткая версия, одна мысль'];
+function personalVariantsPrompt() {
+  return `Ты редактор русскоязычного Threads Дмитрия, оператора sportsbook. Из его личного материала напиши 6 разных коротких постов, после которых читатель ему доверяет и сопереживает. Заходы: ${PERSONAL_LENSES.map((a, i) => (i + 1) + ') ' + a).join('; ')}. Все варианты должны различаться заходом и мыслью.
+
+Главное правило: только факты, события, чувства и числа из source_text. Не придумывай сцены, диалоги, цифры, людей, даты и обстоятельства. Каждый пост даем с дословной цитатой из source_text, на которую он опирается. Первое лицо, живая речь, без пафоса, без мотивационного тона, без поучений и «жизненных уроков», не объясняй читателю, что он должен почувствовать. Длина до 480 символов, ссылок в тексте нет. Русский простой разговорный, буква е без точек, без эмодзи, хэштегов, Markdown, тире (только дефис внутри слов), без «Вот почему», «Вот что», «Дело не в X, а в Y», «Это не просто X, это Y», «Результат?», «Что думаете?», «Согласны?», без призывов к комментариям, без трех симметричных коротких фраз. Не называй людей и компании, которых нет в материале. Не пиши про американский гемблинг.
+
+Верни ТОЛЬКО JSON без Markdown: {"posts":[{"angle":"название захода 2-4 слова","text":"текст поста","quote":"дословная цитата из source_text"}]}`;
 }
 async function generateAngles(cand) {
   const title = String(cand.title || '').slice(0, 300);
   const urlSrc = String(cand.source_url || '').trim().slice(0, 600);
   const srcText = String(cand.source_text || '').slice(0, 12000);
-  if (!srcText.trim()) throw httpError(400, 'Нужен текст новости: вставь его в поле источника');
-  if (!/^https?:\/\/\S+$/.test(urlSrc)) throw httpError(400, 'Нужна ссылка на источник: она ставится в конец каждого поста');
-  const maxBody = THREADS_MAX - threadsLength(urlSrc) - 1 - 10;
+  const personal = cand.suggested_type === 'personal';
+  if (!srcText.trim()) throw httpError(400, 'Нужен текст: вставь его в поле источника');
+  if (urlSrc && !/^https?:\/\/\S+$/.test(urlSrc)) throw httpError(400, 'Ссылка выглядит неверно: она должна начинаться с http');
+  const hasUrl = !!urlSrc && !personal;
+  const maxBody = personal ? 480 : THREADS_MAX - (hasUrl ? threadsLength(urlSrc) + 1 : 0) - 10;
   if (maxBody < 150) throw httpError(400, 'Ссылка слишком длинная, на текст остается меньше 150 символов');
-  const raw = await claudeCall(anglesSystemPrompt(maxBody), JSON.stringify({ title, source_url: urlSrc, source_text: srcText }), 4000);
+  if (personal && srcText.trim().length < 80) throw httpError(400, 'Для личных постов вставь свой материал подробнее: что произошло и что ты почувствовал. Придумывать за тебя бот не будет.');
+  const raw = await claudeCall(personal ? personalVariantsPrompt() : anglesSystemPrompt(maxBody, hasUrl), JSON.stringify({ title, source_url: hasUrl ? urlSrc : '', source_text: srcText }), 4000);
   const parsed = parseEditorJson(raw);
   if (!parsed || !Array.isArray(parsed.posts)) throw httpError(502, 'Модель вернула не JSON, попробуй еще раз');
+  const norm = t => String(t || '').toLowerCase().replace(/ё/g, 'е').replace(/[\s ]+/g, ' ').replace(/[«»"“”„'’.,!?;:()\-–—]/g, '').trim();
+  const nsrc = norm(srcText);
   const posts = [], dropped = [];
   for (const it of parsed.posts) {
     const body = noYo(String((it && it.text) || '').trim()).replace(/https?:\/\/\S+/g, '').trim();
@@ -2857,14 +2870,15 @@ async function generateAngles(cand) {
     const why = [];
     if (!body) why.push('пусто');
     if (threadsLength(body) > maxBody) why.push('длинно');
-    if (EDITOR_BAD.some(([re]) => re.test(body))) why.push('шаблонная фраза');
+    for (const [re, w] of EDITOR_BAD) { if (personal && w === 'выдуманный личный опыт') continue; if (re.test(body)) { why.push('шаблонная фраза'); break; } }
     if (findNegContrast(body).length) why.push('не X, а Y');
     if (/[—–]/.test(body) || /\s-\s/.test(body)) why.push('тире');
     if (US_GAMBLING.test(body) && !PRED_MARKET.test(body)) why.push('США');
-    if (why.length) { dropped.push(`${angle || 'угол'}: ${why.join(', ')}`); continue; }
-    posts.push({ angle, text: body + '\n' + urlSrc });
+    if (personal) { const q = norm(it && it.quote); if (!q || !nsrc.includes(q)) why.push('цитата не найдена в твоем тексте'); }
+    if (why.length) { dropped.push(`${angle || 'вариант'}: ${why.join(', ')}`); continue; }
+    posts.push({ angle, text: hasUrl ? body + '\n' + urlSrc : body });
   }
-  return { posts: posts.slice(0, 5), dropped };
+  return { posts: posts.slice(0, 5), dropped, personal };
 }
 // ── конец блока углов ──
 // ── конец блока Threads ──

@@ -775,10 +775,8 @@
 
   <div class="mode-tabs">
     <button class="tab active" onclick="switchMode('topic')">Тема</button>
-    <button class="tab" onclick="switchMode('thought')">Мысль</button>
     <button class="tab" onclick="switchMode('comment')">Коммент</button>
     <button class="tab tg-tab" onclick="switchMode('telegram')">TG</button>
-    <button class="tab tg-tab" onclick="switchMode('newsquote')">Готовый</button>
     <button class="tab" onclick="switchMode('digest')">Дайджест</button>
     <button class="tab" onclick="switchMode('queue')">Очередь</button>
     <button class="tab" onclick="switchMode('threads')">Threads</button>
@@ -786,8 +784,11 @@
 
   <!-- Режим 1: По теме -->
   <div id="mode-topic" class="mode-panel active">
-    <div class="field-label">Тема поста</div>
-    <input type="text" id="topic-input" placeholder="Например: second bet conversion, live betting, bonus cost..." />
+    <div class="tone-selector" id="topic-kind" style="margin-bottom:10px;">
+      <button class="tone-btn selected" data-kind="topic">Тема</button>
+      <button class="tone-btn" data-kind="thought">Моя мысль</button>
+    </div>
+    <textarea id="topic-input" placeholder="Тема: second bet conversion, live betting, bonus cost... Или выбери «Моя мысль» и накидай как есть: факт, наблюдение, случай из практики" style="min-height:90px;"></textarea>
 
     <div class="field-label">Тон</div>
     <div class="tone-selector" id="topic-tone">
@@ -796,7 +797,7 @@
       <button class="tone-btn" data-tone="contrarian">Провокация</button>
     </div>
 
-    <button class="generate-btn" onclick="generate('topic')">Написать пост</button>
+    <button class="generate-btn" onclick="generateTopicOrThought()">Написать пост</button>
   </div>
 
   <!-- Режим 2: Из мысли -->
@@ -877,44 +878,12 @@
     <input type="text" id="ed-url" placeholder="Ссылка на первичный источник" />
     <textarea id="ed-text" placeholder="Текст источника: вставь сюда статью или релиз. Без текста NEWS и FEATURE не пишутся" style="margin-top:8px;min-height:120px;"></textarea>
     <select id="ed-type" style="margin-top:8px;">
-      <option value="auto">Тип: определить автоматически</option>
-      <option value="news">NEWS: новость с позицией</option>
-      <option value="feature">FEATURE: разбор функции или релиза</option>
-      <option value="mechanic">MECHANIC: механика или миф</option>
-      <option value="opinion">OPINION: наблюдение</option>
-      <option value="personal">PERSONAL: личное, из моего текста</option>
+      <option value="auto">Новость или чужой пост: углы</option>
+      <option value="personal">Личное: из моего текста</option>
     </select>
-    <label style="display:flex;align-items:center;gap:8px;margin:10px 0 6px;font-size:14px;"><input type="checkbox" id="ed-tg" onchange="document.getElementById('ed-tg-box').style.display=this.checked?'block':'none'" /> Есть материал в Telegram для перехода</label>
-    <div id="ed-tg-box" style="display:none;">
-      <input type="text" id="ed-tg-url" placeholder="Ссылка на материал или пригласительная ссылка Threds" />
-      <input type="text" id="ed-tg-extra" placeholder="Что читатель получит там дополнительно" style="margin-top:8px;" />
-    </div>
-    <button class="generate-btn" id="ed-run" onclick="thEditorRun()">Подготовить пост</button>
-    <button class="generate-btn" id="ed-angles" onclick="thAnglesRun()" style="margin-top:8px;">5 постов под разными углами</button>
+    <button class="generate-btn" id="ed-angles" onclick="thAnglesRun()" style="margin-top:8px;">5 вариантов поста</button>
     <div id="ed-result"></div>
 
-    <div class="field-label">Формат</div>
-    <select id="th-format">
-      <option value="mix">Микс</option>
-      <option value="mechanics">Механика денег и вероятности</option>
-      <option value="humor">Сухой сарказм</option>
-      <option value="decisions">Решения в неопределенности</option>
-      <option value="question">Вопрос к аудитории</option>
-    </select>
-    <div class="field-label">Сколько постов</div>
-    <select id="th-count">
-      <option value="5">5</option>
-      <option value="7" selected>7</option>
-      <option value="10">10</option>
-      <option value="14">14</option>
-    </select>
-    <button class="generate-btn" id="th-gen-btn" onclick="thGenerate()">Сгенерировать партию</button>
-    <div class="digest-meta" id="th-batch-meta"></div>
-    <div id="th-batch"></div>
-    <div id="th-batch-actions" style="display:none;">
-      <button class="action-btn" onclick="thAddOwn()" style="width:100%;margin-bottom:8px;">Добавить свой пост</button>
-      <button class="generate-btn tg-btn" id="th-queue-all" onclick="thScheduleAll()">Поставить все в очередь</button>
-    </div>
     <div class="field-label" style="margin-top:20px;">В очереди Threads</div>
     <div class="digest-meta" id="th-queue-meta" style="display:block;">Загружаю…</div>
     <div id="th-queue"></div>
@@ -1067,7 +1036,7 @@
 
     function switchMode(mode) {
       currentMode = mode;
-      const tabOrder = ['topic', 'thought', 'comment', 'telegram', 'newsquote', 'digest', 'queue', 'threads'];
+      const tabOrder = ['topic', 'comment', 'telegram', 'digest', 'queue', 'threads'];
       document.querySelectorAll('.tab').forEach((t, i) => {
         t.classList.toggle('active', tabOrder[i] === mode);
       });
@@ -1097,6 +1066,16 @@
     let lastInput = '';
     let lastTone = '';
     let lastRubric = 'auto'; // рубрика последнего запуска «рубрикатора», нужна для «Ещё раз»
+
+    function generateTopicOrThought() {
+      const kind = document.querySelector('#topic-kind .tone-btn.selected')?.dataset.kind || 'topic';
+      if (kind === 'thought') {
+        document.getElementById('thought-input').value = document.getElementById('topic-input').value;
+        const tone = getSelectedTone('topic');
+        document.querySelectorAll('#thought-tone .tone-btn').forEach(b => b.classList.toggle('selected', b.dataset.tone === tone));
+      }
+      return generate(kind);
+    }
 
     async function generate(mode) {
       let input;
@@ -2409,28 +2388,24 @@
     }
 
     function thClearAll() {
-      ['ed-url', 'ed-text', 'ed-tg-url', 'ed-tg-extra'].forEach(id => { const el = document.getElementById(id); if (el) el.value = ''; });
+      ['ed-url', 'ed-text'].forEach(id => { const el = document.getElementById(id); if (el) el.value = ''; });
       const t = document.getElementById('ed-type'); if (t) t.value = 'auto';
-      const c = document.getElementById('ed-tg'); if (c) { c.checked = false; document.getElementById('ed-tg-box').style.display = 'none'; }
       document.getElementById('ed-result').innerHTML = '';
-      document.getElementById('th-batch').innerHTML = '';
-      document.getElementById('th-batch-meta').textContent = '';
-      document.getElementById('th-batch-actions').style.display = 'none';
-      thState.items = []; edState.last = null;
+      edState.last = null;
     }
 
     async function thAnglesRun() {
       if (edState.busy) return;
-      const body = { candidate: { title: '', source_url: document.getElementById('ed-url').value.trim(), source_text: document.getElementById('ed-text').value.trim() } };
+      const body = { candidate: { title: '', source_url: document.getElementById('ed-url').value.trim(), source_text: document.getElementById('ed-text').value.trim(), suggested_type: document.getElementById('ed-type').value } };
       const btn = document.getElementById('ed-angles');
       const box = document.getElementById('ed-result');
-      edState.busy = true; btn.disabled = true; btn.textContent = 'Пишу 5 углов…'; box.innerHTML = '';
+      edState.busy = true; btn.disabled = true; btn.textContent = 'Пишу варианты…'; box.innerHTML = '';
       try {
         const data = await queueCall('/api/threads-angles', { method: 'POST', body: JSON.stringify(body) });
         anglesRender(data);
         try { box.scrollIntoView({ behavior: 'smooth', block: 'start' }); } catch (_) {}
       } catch (e) { box.textContent = thErr(e); }
-      finally { edState.busy = false; btn.disabled = false; btn.textContent = '5 постов под разными углами'; }
+      finally { edState.busy = false; btn.disabled = false; btn.textContent = '5 вариантов поста'; }
     }
 
     function anglesRender(data) {
@@ -2439,7 +2414,7 @@
       const posts = data.posts || [];
       if (!posts.length) { box.textContent = 'Ни один вариант не прошел проверку' + ((data.dropped || []).length ? ': ' + data.dropped.join('; ') : '') + '. Нажми еще раз.'; return; }
       const head = document.createElement('div'); head.className = 'digest-row'; head.style.fontWeight = '600';
-      head.textContent = 'Бот написал ' + posts.length + ' разных постов по твоей новости. Выбери нужный, поправь и поставь в очередь. Ссылка уже в конце каждого.';
+      head.textContent = 'Бот написал ' + posts.length + ' вариантов. Выбери нужный, поправь и поставь в очередь.' + (data.personal ? ' Всё взято только из твоего текста.' : (document.getElementById('ed-url').value.trim() ? ' Ссылка уже в конце каждого.' : ''));
       box.appendChild(head);
       posts.forEach(p => {
         const card = document.createElement('div'); card.className = 'digest-card';
@@ -2457,7 +2432,7 @@
           if (!w) { showToast('Выбери время', true); return; }
           thState.busy = true; q.disabled = true; q.textContent = 'Ставлю…';
           try {
-            await queueCall('/api/threads-schedule', { method: 'POST', body: JSON.stringify({ items: [{ text: ta.value, when: w, meta: { type: 'news', goal: 'reach', angle: p.angle || '' } }] }) });
+            await queueCall('/api/threads-schedule', { method: 'POST', body: JSON.stringify({ items: [{ text: ta.value, when: w, meta: { type: data.personal ? 'personal' : 'news', goal: 'reach', angle: p.angle || '' } }] }) });
             showToast('В очереди'); card.remove();
           } catch (e) { showToast(thErr(e), true); q.disabled = false; q.textContent = 'Поставить в очередь'; }
           finally { thState.busy = false; }
