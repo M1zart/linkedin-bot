@@ -717,6 +717,64 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // ── Очередь в Mini App: список запланированных постов (вкладка «Очередь») ──
+  if (req.method === 'GET' && req.url.split('?')[0] === '/api/scheduled-list') {
+    const send = (status, obj) => { res.writeHead(status, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(obj)); };
+    try {
+      if (!scheduleConfigured()) return send(503, { error: 'Расписание не настроено: нужен NOTION_API_KEY в переменных Railway' });
+      const auth = await authorizeUser(req);
+      if (!auth.ok) return send(auth.status, { error: auth.error });
+      const rows = await schedQuery({ and: [
+        { property: 'Owner', number: { equals: Number(auth.userId) } },
+        { or: [statusIs('scheduled'), statusIs('missed'), statusIs('failed')] }
+      ] }, 100);
+      // Сорвавшиеся посты (missed, failed) показываем две недели, чтобы они не копились в списке вечно
+      const cutoff = Date.now() - 14 * 24 * 3600 * 1000;
+      const items = rows
+        .filter(r => r.status === 'scheduled' || (r.publishAt && Date.parse(r.publishAt) >= cutoff))
+        .map(r => ({ id: r.id, text: r.text, status: r.status, publishAt: r.publishAt, local: r.publishAt ? formatWarsaw(r.publishAt) : '', error: r.error || '' }));
+      send(200, { items });
+    } catch (err) {
+      console.error('scheduled-list error:', scrubToken(err.message));
+      send(err.httpStatus || 500, { error: scrubToken(err.message) });
+    }
+    return;
+  }
+
+  // ── Очередь в Mini App: отмена и публикация сразу (перенос идет через /api/reschedule) ──
+  if (req.method === 'POST' && req.url === '/api/scheduled-action') {
+    let body = '';
+    req.on('data', chunk => { body += chunk; if (body.length > 64 * 1024) req.destroy(); });
+    req.on('end', async () => {
+      const send = (status, obj) => { res.writeHead(status, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(obj)); };
+      try {
+        if (!scheduleConfigured()) return send(503, { error: 'Расписание не настроено: нужен NOTION_API_KEY в переменных Railway' });
+        const auth = await authorizeUser(req);
+        if (!auth.ok) return send(auth.status, { error: auth.error });
+        const { id, action } = JSON.parse(body);
+        if (!/^[0-9a-f-]{32,40}$/i.test(String(id || ''))) return send(400, { error: 'Некорректный id поста' });
+        if (action !== 'cancel' && action !== 'publish') return send(400, { error: 'Неизвестное действие' });
+        let row;
+        try { row = await schedGet(id); } catch { return send(404, { error: 'Пост не найден или очередь недоступна' }); }
+        if (String(row.owner) !== auth.userId) return send(403, { error: 'Это не твой пост' });
+        if (row.status !== 'scheduled') return send(409, { error: `Пост уже не в очереди: ${row.status}` });
+        if (action === 'cancel') {
+          if (schedInFlight.has(row.id)) return send(409, { error: 'Пост публикуется прямо сейчас' });
+          await schedUpdate(row.id, { status: 'cancelled' });
+          return send(200, { ok: true, status: 'cancelled' });
+        }
+        const r = await runScheduledPost(row, { checkStale: false, notify: false });
+        if (r.status === 'published') return send(200, { ok: true, status: 'published', link: r.link || null });
+        if (r.status === 'busy') return send(409, { error: 'Пост уже публикуется' });
+        return send(502, { error: `Не удалось опубликовать: ${r.error}` });
+      } catch (err) {
+        console.error('scheduled-action error:', scrubToken(err.message));
+        send(err.httpStatus || 500, { error: scrubToken(err.message) });
+      }
+    });
+    return;
+  }
+
   // ── Вебхук бота: команда /scheduled и кнопки «Отменить» / «Опубликовать сейчас» ──
   if (req.method === 'POST' && req.url === '/api/telegram-webhook') {
     let body = '';

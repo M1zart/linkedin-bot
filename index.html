@@ -413,6 +413,35 @@
       word-break: break-all;
     }
 
+    .queue-text {
+      font-size: 13px;
+      line-height: 1.5;
+      color: var(--text);
+      white-space: pre-wrap;
+      word-break: break-word;
+      max-height: 7.5em;
+      overflow: hidden;
+      margin: 6px 0;
+    }
+
+    .queue-text.open {
+      max-height: none;
+    }
+
+    .queue-toggle {
+      background: none;
+      border: none;
+      color: var(--tg);
+      font-size: 12px;
+      padding: 0;
+      cursor: pointer;
+      margin-bottom: 4px;
+    }
+
+    .queue-card.failed .digest-title {
+      color: var(--red, #ff6b6b);
+    }
+
     .digest-actions {
       display: flex;
       gap: 8px;
@@ -750,6 +779,7 @@
     <button class="tab tg-tab" onclick="switchMode('telegram')">TG</button>
     <button class="tab tg-tab" onclick="switchMode('newsquote')">Готовый</button>
     <button class="tab" onclick="switchMode('digest')">Дайджест</button>
+    <button class="tab" onclick="switchMode('queue')">Очередь</button>
   </div>
 
   <!-- Режим 1: По теме -->
@@ -828,6 +858,13 @@
 
 
   <!-- Режим: Дайджест (источник тем для входа 1) -->
+  <!-- Очередь: запланированные посты -->
+  <div id="mode-queue" class="mode-panel">
+    <div class="digest-meta" id="queue-meta" style="display:block;">Загружаю очередь…</div>
+    <div id="queue-list"></div>
+    <button class="action-btn" id="queue-refresh" onclick="loadQueue()" style="width:100%;margin-top:4px;">Обновить</button>
+  </div>
+
   <div id="mode-digest" class="mode-panel">
     <div class="field-label">Дайджест целиком</div>
     <textarea id="digest-input" placeholder="Вставь сводку из Claude: заголовки новостей, «Угол для поста», оценки, ссылки..." style="min-height:140px;"></textarea>
@@ -974,7 +1011,7 @@
 
     function switchMode(mode) {
       currentMode = mode;
-      const tabOrder = ['topic', 'thought', 'comment', 'telegram', 'newsquote', 'digest'];
+      const tabOrder = ['topic', 'thought', 'comment', 'telegram', 'newsquote', 'digest', 'queue'];
       document.querySelectorAll('.tab').forEach((t, i) => {
         t.classList.toggle('active', tabOrder[i] === mode);
       });
@@ -982,6 +1019,7 @@
       document.getElementById(`mode-${mode}`).classList.add('active');
       hideResult();
       hideCommentsResult();
+      if (mode === 'queue') loadQueue();
     }
 
     document.querySelectorAll('.tone-selector').forEach(selector => {
@@ -1889,10 +1927,18 @@
 
     // ===== ЭКРАН ПЕРЕНОСА (открывается кнопкой «Выбрать дату и время» в карточке /scheduled: /?reschedule=<id>&m=<сообщение>) =====
     // Пост в очереди остаётся тем же: меняется только время. Карточку в чате обновляет сервер.
-    const rescheduleState = { id: null, messageId: null, busy: false, done: false };
+    const rescheduleState = { id: null, messageId: null, busy: false, done: false, fromQueue: false };
 
     function closeRescheduleScreen() {
       if (rescheduleState.busy) return;
+      // Открыт из вкладки «Очередь»: просто закрываем экран и обновляем список, приложение остается открытым
+      if (rescheduleState.fromQueue) {
+        rescheduleState.fromQueue = false;
+        document.getElementById('reschedule-screen').classList.remove('show');
+        document.getElementById('reschedule-close').textContent = 'Закрыть';
+        loadQueue();
+        return;
+      }
       const wa = window.Telegram?.WebApp;
       // Это одноразовый экран из чата: в Telegram закрываем приложение и возвращаем в чат
       if (wa && typeof wa.close === 'function' && wa.initData) { wa.close(); return; }
@@ -1970,6 +2016,116 @@
       const m = parseInt(params.get('m'), 10);
       openRescheduleScreen(id, Number.isInteger(m) && m > 0 ? m : null);
     })();
+
+    // ===== ОЧЕРЕДЬ: запланированные посты прямо в приложении (вместо /scheduled в чате) =====
+    const queueState = { busy: false };
+
+    async function queueCall(url, options) {
+      const response = await fetch(url, { ...options, headers: { 'Content-Type': 'application/json', 'X-Telegram-Init-Data': getInitData(), ...(options && options.headers) } });
+      return readApi(response);
+    }
+
+    async function loadQueue() {
+      const meta = document.getElementById('queue-meta');
+      const list = document.getElementById('queue-list');
+      if (queueState.busy) return;
+      queueState.busy = true;
+      meta.style.display = 'block';
+      meta.textContent = 'Загружаю очередь…';
+      try {
+        const data = await queueCall('/api/scheduled-list');
+        renderQueue(data.items || []);
+      } catch (e) {
+        list.innerHTML = '';
+        meta.textContent = e.message.replace(/ \(HTTP \d+\)$/, '');
+      } finally {
+        queueState.busy = false;
+      }
+    }
+
+    function renderQueue(items) {
+      const meta = document.getElementById('queue-meta');
+      const list = document.getElementById('queue-list');
+      list.innerHTML = '';
+      const planned = items.filter(i => i.status === 'scheduled');
+      meta.textContent = planned.length ? `Запланировано: ${planned.length}. Время по Варшаве.` : 'Запланированных постов нет.';
+      const labels = { missed: 'Не вышел: просрочен', failed: 'Не вышел: ошибка публикации' };
+      items.forEach(it => {
+        const card = document.createElement('div');
+        card.className = 'digest-card queue-card' + (it.status === 'scheduled' ? '' : ' failed');
+        const head = document.createElement('div');
+        head.className = 'digest-head';
+        const title = document.createElement('div');
+        title.className = 'digest-title';
+        title.textContent = '🕒 ' + (it.local || 'время не задано') + (it.status === 'scheduled' ? '' : ' · ' + (labels[it.status] || it.status));
+        head.appendChild(title);
+        card.appendChild(head);
+
+        const text = document.createElement('div');
+        text.className = 'queue-text';
+        text.textContent = String(it.text || '').replace(/\*\*/g, '').trim();
+        card.appendChild(text);
+        if (text.textContent.length > 280) {
+          const toggle = document.createElement('button');
+          toggle.className = 'queue-toggle';
+          toggle.textContent = 'Показать полностью';
+          toggle.addEventListener('click', () => {
+            const open = text.classList.toggle('open');
+            toggle.textContent = open ? 'Свернуть' : 'Показать полностью';
+          });
+          card.appendChild(toggle);
+        }
+        if (it.error) {
+          const er = document.createElement('div');
+          er.className = 'digest-row';
+          er.textContent = it.error;
+          card.appendChild(er);
+        }
+
+        if (it.status === 'scheduled') {
+          const actions = document.createElement('div');
+          actions.className = 'digest-actions';
+          const mv = document.createElement('button');
+          mv.className = 'action-btn';
+          mv.textContent = 'Перенести';
+          mv.addEventListener('click', () => { rescheduleState.fromQueue = true; openRescheduleScreen(it.id, null); });
+          const now = document.createElement('button');
+          now.className = 'action-btn primary tg';
+          now.textContent = 'Опубликовать сейчас';
+          now.addEventListener('click', () => queueAction(it.id, 'publish', now));
+          const cancel = document.createElement('button');
+          cancel.className = 'action-btn';
+          cancel.textContent = 'Отменить';
+          cancel.addEventListener('click', () => queueAction(it.id, 'cancel', cancel));
+          actions.appendChild(mv);
+          actions.appendChild(now);
+          actions.appendChild(cancel);
+          card.appendChild(actions);
+        }
+        list.appendChild(card);
+      });
+    }
+
+    async function queueAction(id, action, btn) {
+      if (queueState.busy) return;
+      const ask = action === 'publish' ? 'Опубликовать этот пост в канал прямо сейчас?' : 'Отменить публикацию? Пост не выйдет.';
+      if (!(await confirmAsk(ask))) return;
+      queueState.busy = true;
+      const old = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = action === 'publish' ? 'Публикую…' : 'Отменяю…';
+      try {
+        const data = await queueCall('/api/scheduled-action', { method: 'POST', body: JSON.stringify({ id, action }) });
+        showToast(data.status === 'published' ? 'Опубликовано' : 'Отменено');
+      } catch (e) {
+        showToast(e.message.replace(/ \(HTTP \d+\)$/, ''), true);
+        btn.disabled = false;
+        btn.textContent = old;
+      } finally {
+        queueState.busy = false;
+      }
+      loadQueue();
+    }
 
     // ===== ДАЙДЖЕСТ: источник тем для входа 1 =====
     // Формат сводки задаёт задание igaming-morning-digest. Текущий: «**N. Заголовок**», «Что произошло», «Как прокомментировать»
