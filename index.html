@@ -348,6 +348,46 @@
       margin-bottom: 14px;
     }
 
+    #schedule-when {
+      width: 100%;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      color: var(--text);
+      color-scheme: dark;
+      font-size: 16px;
+      padding: 12px 14px;
+      min-height: 46px;
+      margin-bottom: 12px;
+      font-family: inherit;
+      outline: none;
+    }
+
+    #schedule-when:focus {
+      border-color: var(--tg);
+    }
+
+    .schedule-presets {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-bottom: 12px;
+    }
+
+    .schedule-preview {
+      font-size: 13px;
+      color: var(--green);
+      margin: -2px 0 12px;
+    }
+
+    .schedule-preview.warn {
+      color: var(--red);
+    }
+
+    .schedule-preview:empty {
+      display: none;
+    }
+
     .modal-note {
       font-size: 13px;
       color: #e0a43a;
@@ -768,7 +808,14 @@
     <div class="modal-card">
       <div class="modal-title">Запланировать публикацию</div>
       <div class="field-label">Дата и время, Варшава</div>
-      <input type="text" id="schedule-when" placeholder="ДД.ММ ЧЧ:ММ, например 15.10 09:30" autocomplete="off" />
+      <input type="datetime-local" id="schedule-when" autocomplete="off" />
+      <div class="schedule-presets">
+        <button type="button" class="tone-btn" data-preset="h1">Через 1 час</button>
+        <button type="button" class="tone-btn" data-preset="h3">Через 3 часа</button>
+        <button type="button" class="tone-btn" data-preset="same">Завтра в это же время</button>
+        <button type="button" class="tone-btn" data-preset="nine">Завтра 09:00</button>
+      </div>
+      <div class="schedule-preview" id="schedule-preview"></div>
       <div class="modal-note" id="schedule-cover-note"></div>
       <div class="modal-error" id="schedule-error"></div>
       <div class="result-actions">
@@ -1564,6 +1611,53 @@
     // Список запланированного, отмена и «опубликовать сейчас»: команда /scheduled в чате с ботом.
     const scheduleState = { busy: false };
 
+    // Время всегда по Варшаве, как на сервере. Нативный выбор даты не знает часового пояса, поэтому «сейчас»,
+    // границы выбора и быстрые кнопки считаются по часам Варшавы, а не телефона (на Кипре они отличаются на час).
+    const WARSAW_FMT = new Intl.DateTimeFormat('en-GB', { timeZone: 'Europe/Warsaw', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
+    const pad2 = n => String(n).padStart(2, '0');
+    const ceil5 = ms => Math.ceil(ms / 300000) * 300000;
+
+    function warsawWall(ms) {
+      const p = Object.fromEntries(WARSAW_FMT.formatToParts(new Date(ms)).map(x => [x.type, x.value]));
+      return { y: +p.year, mo: +p.month, d: +p.day, h: +p.hour, mi: +p.minute };
+    }
+    const wallToInput = p => `${p.y}-${pad2(p.mo)}-${pad2(p.d)}T${pad2(p.h)}:${pad2(p.mi)}`;
+    function wallAddDays(p, n) {
+      const d = new Date(Date.UTC(p.y, p.mo - 1, p.d + n, p.h, p.mi));
+      return { y: d.getUTCFullYear(), mo: d.getUTCMonth() + 1, d: d.getUTCDate(), h: d.getUTCHours(), mi: d.getUTCMinutes() };
+    }
+
+    // Значения для быстрых кнопок (в формате поля datetime-local, часы Варшавы)
+    function presetValue(kind) {
+      const now = Date.now();
+      if (kind === 'h1') return wallToInput(warsawWall(ceil5(now + 3600000)));
+      if (kind === 'h3') return wallToInput(warsawWall(ceil5(now + 3 * 3600000)));
+      const w = warsawWall(now);
+      if (kind === 'same') return wallToInput(wallAddDays(w, 1));
+      if (kind === 'nine') return wallToInput({ ...wallAddDays(w, 1), h: 9, mi: 0 });
+      return '';
+    }
+
+    // Строка под полем: что выбрано и сколько сейчас в Варшаве; для прошедшего времени предупреждение
+    function updateSchedulePreview() {
+      const box = document.getElementById('schedule-preview');
+      const raw = document.getElementById('schedule-when').value;
+      const now = warsawWall(Date.now());
+      const nowText = `Сейчас в Варшаве: ${pad2(now.h)}:${pad2(now.mi)}`;
+      const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/.exec(raw);
+      box.classList.remove('warn');
+      if (!m) { box.textContent = nowText; return; }
+      if (m[0] <= wallToInput(now)) {
+        box.classList.add('warn');
+        box.textContent = `Это время уже прошло. ${nowText}.`;
+        return;
+      }
+      const parts = Object.fromEntries(new Intl.DateTimeFormat('ru-RU', { timeZone: 'UTC', weekday: 'short', day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' })
+        .formatToParts(new Date(Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5]))).map(x => [x.type, x.value]));
+      const year = +parts.year !== now.y ? `.${parts.year}` : '';
+      box.textContent = `Выйдет: ${parts.weekday}, ${parts.day}.${parts.month}${year} ${parts.hour}:${parts.minute} (Варшава). ${nowText}.`;
+    }
+
     function openScheduleModal() {
       if (!lastGenerated.trim()) return;
       const hasCover = !!getCoverDataUrl();
@@ -1572,8 +1666,19 @@
         : '';
       document.getElementById('schedule-submit').textContent = hasCover ? 'Запланировать без картинки' : 'Запланировать';
       document.getElementById('schedule-error').textContent = '';
+
+      const input = document.getElementById('schedule-when');
+      if (input.type === 'datetime-local') {
+        input.min = wallToInput(warsawWall(Date.now() + 60000));
+        input.max = wallToInput(warsawWall(Date.now() + 365 * 86400000));
+        input.value = presetValue('h1');
+      } else {
+        // Встроенный браузер не умеет выбор даты и показал обычное поле: подсказываем формат
+        input.placeholder = 'ДД.ММ ЧЧ:ММ, например 15.10 09:30';
+        input.value = '';
+      }
+      updateSchedulePreview();
       document.getElementById('schedule-modal').classList.add('show');
-      document.getElementById('schedule-when').focus();
     }
 
     function closeScheduleModal() {
@@ -1583,9 +1688,13 @@
 
     async function submitSchedule() {
       if (scheduleState.busy) return;
-      const when = document.getElementById('schedule-when').value.trim();
+      const raw = document.getElementById('schedule-when').value.trim();
       const errBox = document.getElementById('schedule-error');
-      if (!when) { errBox.textContent = 'Введи дату и время, например 15.10 09:30'; return; }
+      if (!raw) { errBox.textContent = 'Выбери дату и время'; return; }
+      const iso = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/.exec(raw);
+      if (iso && iso[0] <= wallToInput(warsawWall(Date.now()))) { errBox.textContent = 'Это время уже прошло: выбери позже'; return; }
+      // Серверу уходит ДД.ММ.ГГГГ ЧЧ:ММ по Варшаве; запасной ручной ввод ДД.ММ ЧЧ:ММ тоже принимается как есть
+      const when = iso ? `${iso[3]}.${iso[2]}.${iso[1]} ${iso[4]}:${iso[5]}` : raw;
       const submit = document.getElementById('schedule-submit');
       const label = submit.textContent;
       scheduleState.busy = true;
@@ -1617,6 +1726,18 @@
     document.getElementById('schedule-when').addEventListener('keydown', e => {
       if (e.key === 'Enter') submitSchedule();
       if (e.key === 'Escape') closeScheduleModal();
+    });
+    ['input', 'change'].forEach(ev => document.getElementById('schedule-when').addEventListener(ev, updateSchedulePreview));
+
+    // Быстрые кнопки только подставляют время в поле: отправляет окно основная кнопка
+    document.querySelectorAll('.schedule-presets [data-preset]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const input = document.getElementById('schedule-when');
+        if (input.type !== 'datetime-local') return; // в текстовом запасном поле формат другой
+        input.value = presetValue(btn.dataset.preset);
+        document.getElementById('schedule-error').textContent = '';
+        updateSchedulePreview();
+      });
     });
 
     // ===== ВХОД 2: готовый текст =====
