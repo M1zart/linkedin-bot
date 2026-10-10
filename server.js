@@ -3098,12 +3098,14 @@ function threadsReplyCard(c, variants, sentIdx = -1) {
   return { text: lines.join('\n').slice(0, 4000), reply_markup: { inline_keyboard: rows } };
 }
 
-async function threadsRepliesTick() {
+async function threadsRepliesTick(opts = {}) {
   if (threadsRepliesRunning || !threadsConfigured() || !ANTHROPIC_API_KEY || !TELEGRAM_BOT_TOKEN || !TELEGRAM_ALLOWED_USER_IDS.length) return;
   if (process.env.THREADS_REPLIES === 'off') return;
   const hourStart = Math.floor(Date.now() / 3600000) * 3600000;
-  if (threadsReplyState.doneHour >= hourStart) return;       // этот час уже обработан
-  const winFrom = hourStart - 3600000;
+  if (!opts.manual && threadsReplyState.doneHour >= hourStart) return;       // этот час уже обработан
+  const winFrom = opts.manual ? Date.now() - (Number(opts.hours) || 24) * 3600000 : hourStart - 3600000;
+  const winTo = opts.manual ? Date.now() : hourStart;
+  const result = { found: 0, error: '' };
   threadsRepliesRunning = true;
   threadsReplyState.lastTickAt = new Date().toISOString();
   try {
@@ -3126,13 +3128,14 @@ async function threadsRepliesTick() {
         const text = String(it.text || '').trim();
         if (!text || it.is_reply_owned_by_me === true || (it.username && it.username === mine)) continue;
         const ts = Date.parse(it.timestamp || 0);
-        if (!(ts >= winFrom && ts < hourStart)) continue;       // только окно предыдущего часа
+        if (!(ts >= winFrom && ts < winTo)) continue;       // только окно предыдущего часа
         const parent = it.replied_to && it.replied_to.id && byId.get(it.replied_to.id);
         fresh.push({ post, it, text, parentText: parent ? String(parent.text || '') : '' });
       }
     }
-    threadsReplyState.doneHour = hourStart;
-    threadsReplyState.lastWindow = new Date(winFrom).toISOString() + ' – ' + new Date(hourStart).toISOString();
+    if (!opts.manual) threadsReplyState.doneHour = hourStart;
+    threadsReplyState.lastWindow = new Date(winFrom).toISOString() + ' – ' + new Date(winTo).toISOString();
+    result.found = fresh.length;
     threadsReplyState.lastError = null;
     for (const f of fresh.slice(0, 20)) {
       const c = { id: ++commentCtxSeq, platform: 'threads', replyId: f.it.id, postText: f.post.text || '', parentText: f.parentText, commentText: f.text, author: f.it.username || '', link: f.it.permalink || '', variants: [], sentIdx: -1 };
@@ -3150,10 +3153,12 @@ async function threadsRepliesTick() {
     }
   } catch (e) {
     threadsReplyState.lastError = scrubToken(e.message);
+    result.error = threadsReplyState.lastError;
     console.error('threads replies:', threadsReplyState.lastError);
   } finally {
     threadsRepliesRunning = false;
   }
+  return result;
 }
 
 // Кнопки карточки: tp:<id>:<номер варианта> отправить ответ, tm:<id> другие варианты
@@ -3224,8 +3229,17 @@ async function handleBotUpdate(update) {
       return botSend(msg.chat.id, `Не удалось получить очередь: ${scrubToken(e.message).slice(0, 300)}`).catch(() => {});
     }
   }
+  if (cmd === '/replies') {
+    if (!threadsConfigured()) return botSend(msg.chat.id, 'Threads не настроен: нет THREADS_ACCESS_TOKEN.');
+    const hours = Math.min(168, Math.max(1, Number((String(msg.text || '').match(/\d+/) || [24])[0]) || 24));
+    await botSend(msg.chat.id, `Ищу ответы в Threads за последние ${hours} ч…`);
+    const r = await threadsRepliesTick({ manual: true, hours });
+    if (!r) return botSend(msg.chat.id, 'Проверка уже идет или не хватает настроек, попробуй через минуту.');
+    if (r.error) return botSend(msg.chat.id, 'Не получилось: ' + r.error.slice(0, 300));
+    return botSend(msg.chat.id, r.found ? `Нашел ответов: ${r.found}. Карточки выше.` : 'За этот период чужих ответов нет.');
+  }
   if (cmd === '/start' || cmd === '/help') {
-    return botSend(msg.chat.id, 'Команды:\n/scheduled: запланированные посты, отмена и публикация сразу.\n\nСоздавать и планировать посты нужно в приложении (кнопка меню).');
+    return botSend(msg.chat.id, 'Команды:\n/scheduled: запланированные посты, отмена и публикация сразу.\n/replies 24: найти ответы в Threads за последние 24 часа (число часов можно менять).\n\nСоздавать и планировать посты нужно в приложении (кнопка меню).');
   }
 }
 
