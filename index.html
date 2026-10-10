@@ -2072,6 +2072,7 @@
       if (it.fact) parts.push('Цифра / факт: ' + q(it.fact));
       if (it.angle) parts.push('Угол для поста: ' + q(it.angle));
       if (it.comment) parts.push('Моя позиция (варианты из дайджеста, выбери одну или сведи): ' + q(it.comment));
+      if (it.url) { try { parts.push('Источник (назови издание по имени, без ссылки и домена): ' + new URL(it.url).hostname.replace(/^www\./, '')); } catch {} }
       return multiline ? parts.join('\n') : parts.join('. ').replace(/\.\.\s/g, '. ');
     }
 
