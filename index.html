@@ -2186,6 +2186,15 @@
       return n;
     }
     const thErr = e => e.message.replace(/ \(HTTP \d+\)$/, '');
+    // Поле выбора даты и времени: в браузере value «ГГГГ-ММ-ДДTЧЧ:ММ», серверу нужно «ДД.ММ.ГГГГ ЧЧ:ММ» (Варшава)
+    function thToInput(w) {
+      const m = /^\s*(\d{1,2})\.(\d{1,2})\.(\d{4})\s+(\d{1,2}):(\d{2})\s*$/.exec(w || '');
+      return m ? `${m[3]}-${m[2].padStart(2, '0')}-${m[1].padStart(2, '0')}T${m[4].padStart(2, '0')}:${m[5]}` : '';
+    }
+    function thFromInput(v) {
+      const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/.exec(v || '');
+      return m ? `${m[3]}.${m[2]}.${m[1]} ${m[4]}:${m[5]}` : '';
+    }
 
     async function thGenerate() {
       if (thState.busy) return;
@@ -2223,8 +2232,8 @@
         const row = document.createElement('div');
         row.className = 'digest-actions';
         const when = document.createElement('input');
-        when.type = 'text'; when.value = it.when; when.placeholder = 'ДД.ММ ЧЧ:ММ';
-        when.addEventListener('input', () => { it.when = when.value; });
+        when.type = 'datetime-local'; when.value = thToInput(it.when);
+        when.addEventListener('input', () => { it.when = thFromInput(when.value); });
         when.style.flex = '1';
         const del = document.createElement('button');
         del.className = 'action-btn'; del.textContent = 'Убрать';
@@ -2248,7 +2257,7 @@
       if (!items.length) { showToast('Нет постов', true); return; }
       const bad = items.findIndex(i => thLen(i.text) > TH_MAX);
       if (bad >= 0) { showToast(`Пост ${bad + 1} длиннее ${TH_MAX} символов`, true); return; }
-      if (items.some(i => !i.when.trim())) { showToast('У каждого поста должно быть время ДД.ММ ЧЧ:ММ', true); return; }
+      if (items.some(i => !i.when.trim())) { showToast('У каждого поста должно быть время', true); return; }
       if (!(await confirmAsk(`Поставить в очередь постов: ${items.length}? Они выйдут в Threads сами.`))) return;
       thState.busy = true;
       const btn = document.getElementById('th-queue-all');
@@ -2301,10 +2310,10 @@
         const actions = document.createElement('div');
         actions.className = 'digest-actions';
         const when = document.createElement('input');
-        when.type = 'text'; when.placeholder = 'ДД.ММ ЧЧ:ММ'; when.style.flex = '1';
+        when.type = 'datetime-local'; when.style.flex = '1';
         const mv = document.createElement('button');
         mv.className = 'action-btn'; mv.textContent = 'Перенести';
-        mv.addEventListener('click', () => thAction(it.id, 'reschedule', mv, when.value));
+        mv.addEventListener('click', () => thAction(it.id, 'reschedule', mv, thFromInput(when.value)));
         const now = document.createElement('button');
         now.className = 'action-btn primary tg'; now.textContent = it.status === 'scheduled' ? 'Опубликовать сейчас' : 'Опубликовать снова';
         now.addEventListener('click', () => thAction(it.id, 'publish', now));
@@ -2323,7 +2332,7 @@
 
     async function thAction(id, action, btn, when) {
       if (thState.busy) return;
-      if (action === 'reschedule' && !String(when || '').trim()) { showToast('Впиши новое время ДД.ММ ЧЧ:ММ', true); return; }
+      if (action === 'reschedule' && !String(when || '').trim()) { showToast('Выбери новое время', true); return; }
       if (action !== 'reschedule') {
         const ask = action === 'publish' ? 'Опубликовать этот пост в Threads прямо сейчас?' : 'Отменить публикацию? Пост не выйдет.';
         if (!(await confirmAsk(ask))) return;

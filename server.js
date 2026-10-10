@@ -2412,7 +2412,7 @@ function nextThreadsSlots(n, taken = new Set()) {
       const ms = warsawToUtcMs(y, mo, d, h, mi);
       if (ms === null || ms < now + 10 * 60 * 1000) continue;
       if (taken.has(Math.floor(ms / 60000))) continue;
-      out.push(`${String(d).padStart(2, '0')}.${String(mo).padStart(2, '0')} ${slot}`);
+      out.push(`${String(d).padStart(2, '0')}.${String(mo).padStart(2, '0')}.${y} ${slot}`);
     }
   }
   return out;
