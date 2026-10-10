@@ -13,6 +13,14 @@ const TELEGRAM_BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || '').trim() || unde
 const TELEGRAM_CHANNEL_ID = normalizeChannelId(process.env.TELEGRAM_CHANNEL_ID);
 const TELEGRAM_ALLOWED_USER_IDS = (process.env.TELEGRAM_ALLOWED_USER_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
 const INIT_DATA_MAX_AGE_SEC = 24 * 60 * 60;
+// Очередь запланированных постов живёт в базе Notion «PostBot: расписание публикаций» (Railway стирает файлы при деплое).
+// Идентификаторы можно переопределить переменными окружения. Версия API Notion 2025-09-03: страницы и запросы идут через data source.
+const NOTION_SCHEDULE_DB_ID = process.env.NOTION_SCHEDULE_DB_ID || '9774b7e9-9511-41d4-b563-978931704e5d';
+const NOTION_SCHEDULE_DS_ID = process.env.NOTION_SCHEDULE_DS_ID || 'b818813e-8172-4dc4-8893-e5ea30c6a726';
+const SCHEDULER_INTERVAL_MS = Number(process.env.SCHEDULER_INTERVAL_MS) || 30 * 1000;
+// Пост, который просрочен больше чем на это время (сервер был недоступен), не публикуется сам: пользователь решает
+const SCHEDULE_STALE_MS = (Number(process.env.SCHEDULE_STALE_MINUTES) || 30) * 60 * 1000;
+const SCHEDULE_TZ = 'Europe/Warsaw';
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 // Модель и адрес вынесены в переменные окружения: у Google они менялись, и подстроить их можно без правки кода
 const GEMINI_IMAGE_MODEL = process.env.GEMINI_IMAGE_MODEL || 'gemini-nano-banana-2.1';
@@ -555,16 +563,8 @@ const server = http.createServer(async (req, res) => {
         if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHANNEL_ID) {
           return send(503, { error: 'Публикация не настроена: задай TELEGRAM_BOT_TOKEN и TELEGRAM_CHANNEL_ID в переменных Railway' });
         }
-        const auth = verifyTelegramInitData(req.headers['x-telegram-init-data']);
-        if (!auth.ok) {
-          // Самая частая причина «подпись не прошла»: Mini App открыто через другого бота, не через того,
-          // чей токен лежит в TELEGRAM_BOT_TOKEN. Называем нужного бота, чтобы не гадать.
-          const hint = auth.signatureMismatch ? await botHint() : '';
-          return send(auth.status, { error: auth.error + hint });
-        }
-        if (!TELEGRAM_ALLOWED_USER_IDS.includes(auth.userId)) {
-          return send(403, { error: `Твой Telegram ID ${auth.userId} не в списке разрешённых. Добавь его в переменную TELEGRAM_ALLOWED_USER_IDS в Railway.` });
-        }
+        const auth = await authorizeUser(req);
+        if (!auth.ok) return send(auth.status, { error: auth.error });
         const { text, imageDataUrl } = JSON.parse(body);
         send(200, await publishToChannel(text, imageDataUrl));
       } catch (err) {
@@ -572,6 +572,91 @@ const server = http.createServer(async (req, res) => {
         send(err.httpStatus || 500, { error: scrubToken(err.message) });
       }
     });
+    return;
+  }
+
+  // ── Планирование: поставить пост в очередь (из Mini App). Публикует планировщик на сервере ──
+  if (req.method === 'POST' && req.url === '/api/schedule') {
+    let body = '';
+    req.on('data', chunk => { body += chunk; if (body.length > 5 * 1024 * 1024) req.destroy(); });
+    req.on('end', async () => {
+      const send = (status, obj) => { res.writeHead(status, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(obj)); };
+      try {
+        if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHANNEL_ID) {
+          return send(503, { error: 'Публикация не настроена: задай TELEGRAM_BOT_TOKEN и TELEGRAM_CHANNEL_ID в переменных Railway' });
+        }
+        if (!scheduleConfigured()) return send(503, { error: 'Расписание не настроено: нужен NOTION_API_KEY в переменных Railway' });
+        const auth = await authorizeUser(req);
+        if (!auth.ok) return send(auth.status, { error: auth.error });
+        const { text, when } = JSON.parse(body);
+        assertPostText(text);
+        const parsed = parseWarsawDateTime(when);
+        if (!parsed.ok) return send(400, { error: parsed.error });
+        const row = await schedCreate(text, parsed.iso, Number(auth.userId));
+        send(200, { ok: true, id: row.id, publishAt: parsed.iso, local: formatWarsaw(parsed.iso) });
+      } catch (err) {
+        console.error('schedule error:', scrubToken(err.message));
+        send(err.httpStatus || 500, { error: scrubToken(err.message) });
+      }
+    });
+    return;
+  }
+
+  // ── Вебхук бота: команда /scheduled и кнопки «Отменить» / «Опубликовать сейчас» ──
+  if (req.method === 'POST' && req.url === '/api/telegram-webhook') {
+    let body = '';
+    req.on('data', chunk => { body += chunk; if (body.length > 1024 * 1024) req.destroy(); });
+    req.on('end', () => {
+      const given = String(req.headers['x-telegram-bot-api-secret-token'] || '');
+      if (!TELEGRAM_BOT_TOKEN || !safeEqual(given, webhookSecret())) {
+        res.writeHead(403);
+        res.end('forbidden');
+        return;
+      }
+      // Telegram ждёт быстрый ответ 200, иначе повторяет доставку: обрабатываем после ответа
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end('{"ok":true}');
+      let update;
+      try { update = JSON.parse(body); } catch { return; }
+      handleBotUpdate(update).catch(e => console.error('bot update error:', scrubToken(e.message)));
+    });
+    return;
+  }
+
+  // ── Состояние планирования: Notion, планировщик, вебхук бота ──
+  if (req.method === 'GET' && req.url.split('?')[0] === '/api/schedule-diag') {
+    const out = {
+      notionTokenPresent: !!NOTION_API_KEY,
+      databaseId: NOTION_SCHEDULE_DB_ID,
+      dataSourceId: NOTION_SCHEDULE_DS_ID,
+      intervalMs: SCHEDULER_INTERVAL_MS,
+      staleMinutes: SCHEDULE_STALE_MS / 60000,
+      scheduler: schedulerState,
+      webhook: { ...webhookState }
+    };
+    try {
+      if (NOTION_API_KEY) {
+        try {
+          const ds = await notionReq('GET', `/v1/data_sources/${NOTION_SCHEDULE_DS_ID}`);
+          const need = ['Name', 'Text', 'Publish At', 'Status', 'Owner', 'Link', 'Error'];
+          out.notion = { reachable: true, title: (ds.title && ds.title[0] && ds.title[0].plain_text) || null, missingProperties: need.filter(k => !(ds.properties && ds.properties[k])) };
+          out.notion.scheduledNow = (await schedQuery(statusIs('scheduled'), 100)).length;
+        } catch (e) {
+          out.notion = { reachable: false, error: scrubToken(e.message) };
+        }
+      }
+      if (TELEGRAM_BOT_TOKEN) {
+        try {
+          const wi = await tgApi('getWebhookInfo', {});
+          out.webhook.current = { url: wi.url || null, pendingUpdates: wi.pending_update_count, lastError: wi.last_error_message || null };
+        } catch (e) { out.webhook.currentError = scrubToken(e.message); }
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify(out, null, 2));
+    } catch (err) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: scrubToken(err.message) }));
+    }
     return;
   }
 
@@ -1492,10 +1577,15 @@ async function sendPhotoToChannel(photo, captionText) {
 
 // Подпись к фото в Telegram не длиннее 1024 символов, обычное сообщение не длиннее 4096.
 // Короткий пост с картинкой уходит одним сообщением, длинный: сначала картинка, потом текст.
-async function publishToChannel(text, imageDataUrl) {
+function assertPostText(text) {
   if (typeof text !== 'string' || !text.trim()) throw httpError(400, 'Пустой текст поста');
   const len = visibleLength(toTelegramHtml(text));
   if (len > 4096) throw httpError(400, `Пост длиннее лимита Telegram: ${len} из 4096 символов`);
+  return len;
+}
+
+async function publishToChannel(text, imageDataUrl) {
+  const len = assertPostText(text);
 
   let photo = null;
   if (imageDataUrl) {
@@ -1516,6 +1606,352 @@ async function publishToChannel(text, imageDataUrl) {
     throw httpError(502, ids.length ? `Картинка опубликована, а текст нет. Не публикуй её повторно. ${msg}` : msg);
   }
   return { ok: true, messageIds: ids, link: channelLink(ids[0]), withImage: !!photo, parts: ids.length };
+}
+
+// ── Планирование публикаций ──────────────────────────────────────────
+
+function safeEqual(a, b) {
+  const x = Buffer.from(String(a));
+  const y = Buffer.from(String(b));
+  return x.length === y.length && crypto.timingSafeEqual(x, y);
+}
+
+// Общая проверка пользователя: подпись Telegram и список разрешённых ID (одинаково для публикации и планирования)
+async function authorizeUser(req) {
+  if (!TELEGRAM_BOT_TOKEN) return { ok: false, status: 503, error: 'Не задан TELEGRAM_BOT_TOKEN в переменных Railway' };
+  const auth = verifyTelegramInitData(req.headers['x-telegram-init-data']);
+  if (!auth.ok) {
+    // Самая частая причина «подпись не прошла»: Mini App открыто через другого бота, не через того,
+    // чей токен лежит в TELEGRAM_BOT_TOKEN. Называем нужного бота, чтобы не гадать.
+    const hint = auth.signatureMismatch ? await botHint() : '';
+    return { ok: false, status: auth.status, error: auth.error + hint };
+  }
+  if (!TELEGRAM_ALLOWED_USER_IDS.includes(auth.userId)) {
+    return { ok: false, status: 403, error: `Твой Telegram ID ${auth.userId} не в списке разрешённых. Добавь его в переменную TELEGRAM_ALLOWED_USER_IDS в Railway.` };
+  }
+  return { ok: true, userId: auth.userId };
+}
+
+// --- Дата и время по Варшаве (ДД.ММ ЧЧ:ММ) ---
+
+function warsawParts(ms) {
+  const f = new Intl.DateTimeFormat('en-GB', { timeZone: SCHEDULE_TZ, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
+  const p = Object.fromEntries(f.formatToParts(new Date(ms)).map(x => [x.type, x.value]));
+  return { y: +p.year, mo: +p.month, d: +p.day, h: +p.hour, mi: +p.minute };
+}
+
+// Момент времени (мс UTC), при котором в Варшаве на часах заданные дата и время; null, если такого времени нет
+// (например, час, пропущенный при переходе на летнее время)
+function warsawToUtcMs(y, mo, d, h, mi) {
+  const target = Date.UTC(y, mo - 1, d, h, mi);
+  let guess = target;
+  for (let i = 0; i < 3; i++) {
+    const p = warsawParts(guess);
+    const shown = Date.UTC(p.y, p.mo - 1, p.d, p.h, p.mi);
+    const diff = target - shown;
+    if (diff === 0) break;
+    guess += diff;
+  }
+  const p = warsawParts(guess);
+  return (p.y === y && p.mo === mo && p.d === d && p.h === h && p.mi === mi) ? guess : null;
+}
+
+function parseWarsawDateTime(input, nowMs = Date.now()) {
+  const m = /^\s*(\d{1,2})\.(\d{1,2})(?:\.(\d{4}))?\s+(\d{1,2}):(\d{2})\s*$/.exec(String(input || ''));
+  if (!m) return { ok: false, error: 'Неверный формат. Нужно ДД.ММ ЧЧ:ММ, например 15.10 09:30 (время по Варшаве)' };
+  const d = +m[1], mo = +m[2], h = +m[4], mi = +m[5];
+  let y = m[3] ? +m[3] : null;
+  if (mo < 1 || mo > 12 || d < 1 || h > 23 || mi > 59) return { ok: false, error: 'Такой даты или времени не бывает' };
+  const now = warsawParts(nowMs);
+  if (y === null) {
+    y = now.y;
+    // Без года берём ближайшую будущую дату: если день в этом году уже прошёл, то в следующем
+    if (Date.UTC(y, mo - 1, d) < Date.UTC(now.y, now.mo - 1, now.d)) y += 1;
+  }
+  const check = new Date(Date.UTC(y, mo - 1, d));
+  if (check.getUTCMonth() !== mo - 1 || check.getUTCDate() !== d) return { ok: false, error: 'Такой даты не бывает' };
+  const ms = warsawToUtcMs(y, mo, d, h, mi);
+  if (ms === null) return { ok: false, error: 'В этот момент в Варшаве такого времени нет (переход на летнее время). Выбери другое' };
+  if (ms < nowMs + 60 * 1000) return { ok: false, error: 'Это время уже прошло или наступит меньше чем через минуту' };
+  if (ms > nowMs + 366 * 24 * 3600 * 1000) return { ok: false, error: 'Можно планировать не дальше чем на год вперёд' };
+  return { ok: true, iso: new Date(ms).toISOString(), ms };
+}
+
+function formatWarsaw(iso) {
+  const f = new Intl.DateTimeFormat('ru-RU', { timeZone: SCHEDULE_TZ, weekday: 'short', day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
+  const p = Object.fromEntries(f.formatToParts(new Date(iso)).map(x => [x.type, x.value]));
+  const year = Number(p.year) !== warsawParts(Date.now()).y ? `.${p.year}` : '';
+  return `${p.weekday}, ${p.day}.${p.month}${year} ${p.hour}:${p.minute}`;
+}
+
+// --- Очередь в Notion ---
+
+function scheduleConfigured() {
+  return !!(NOTION_API_KEY && NOTION_SCHEDULE_DS_ID);
+}
+
+async function notionReq(method, apiPath, body) {
+  const resp = await fetch('https://api.notion.com' + apiPath, {
+    method,
+    headers: { 'Authorization': `Bearer ${NOTION_API_KEY}`, 'Content-Type': 'application/json', 'Notion-Version': '2025-09-03' },
+    body: body ? JSON.stringify(body) : undefined
+  });
+  const data = await resp.json().catch(() => null);
+  if (!resp.ok) throw new Error(`Notion ${resp.status}: ${(data && (data.message || data.code)) || 'ошибка'}`);
+  return data;
+}
+
+// Один блок rich_text в Notion не длиннее 2000 символов: длинный текст режем на несколько блоков
+function toRichText(text) {
+  const out = [];
+  for (let i = 0; i < text.length; i += 2000) out.push({ type: 'text', text: { content: text.slice(i, i + 2000) } });
+  return out;
+}
+const fromRichText = arr => (arr || []).map(x => (x.plain_text !== undefined ? x.plain_text : (x.text && x.text.content) || '')).join('');
+
+function shortPreview(text, max = 300) {
+  const t = String(text || '').replace(/\*\*/g, '').replace(/\s+/g, ' ').trim();
+  return t.length > max ? t.slice(0, max) + '…' : t;
+}
+
+function pageToRow(p) {
+  const pr = p.properties || {};
+  return {
+    id: p.id,
+    parentOk: !p.parent || p.parent.data_source_id === NOTION_SCHEDULE_DS_ID || p.parent.database_id === NOTION_SCHEDULE_DB_ID,
+    text: fromRichText(pr.Text && pr.Text.rich_text),
+    publishAt: (pr['Publish At'] && pr['Publish At'].date && pr['Publish At'].date.start) || null,
+    status: (pr.Status && pr.Status.select && pr.Status.select.name) || null,
+    owner: pr.Owner && pr.Owner.number !== undefined ? pr.Owner.number : null,
+    link: (pr.Link && pr.Link.url) || null,
+    error: fromRichText(pr.Error && pr.Error.rich_text)
+  };
+}
+
+const statusIs = s => ({ property: 'Status', select: { equals: s } });
+
+async function schedQuery(filter, pageSize = 50) {
+  const data = await notionReq('POST', `/v1/data_sources/${NOTION_SCHEDULE_DS_ID}/query`, {
+    filter, sorts: [{ property: 'Publish At', direction: 'ascending' }], page_size: pageSize
+  });
+  return (data.results || []).map(pageToRow);
+}
+
+async function schedCreate(text, iso, owner) {
+  const page = await notionReq('POST', '/v1/pages', {
+    parent: { type: 'data_source_id', data_source_id: NOTION_SCHEDULE_DS_ID },
+    properties: {
+      Name: { title: [{ type: 'text', text: { content: shortPreview(text, 80) || 'Пост' } }] },
+      Text: { rich_text: toRichText(text) },
+      'Publish At': { date: { start: iso } },
+      Status: { select: { name: 'scheduled' } },
+      Owner: { number: owner }
+    }
+  });
+  return pageToRow(page);
+}
+
+async function schedGet(id) {
+  const row = pageToRow(await notionReq('GET', `/v1/pages/${encodeURIComponent(id)}`));
+  if (!row.parentOk) throw new Error('Страница не из базы расписания');
+  return row;
+}
+
+async function schedUpdate(id, { status, link, error }) {
+  const properties = {};
+  if (status) properties.Status = { select: { name: status } };
+  if (link !== undefined) properties.Link = { url: link || null };
+  if (error !== undefined) properties.Error = { rich_text: error ? toRichText(String(error).slice(0, 1800)) : [] };
+  return notionReq('PATCH', `/v1/pages/${encodeURIComponent(id)}`, { properties });
+}
+
+// --- Публикация по расписанию ---
+
+const schedInFlight = new Set();
+const schedulerState = { started: false, lastTickAt: null, lastError: null, lastPublishedId: null };
+
+async function notifyOwner(row, text) {
+  if (!row.owner) return;
+  try { await tgApi('sendMessage', { chat_id: row.owner, text }); }
+  catch (e) { console.error('уведомление владельцу не доставлено:', scrubToken(e.message)); }
+}
+
+// Публикует запланированный пост. checkStale: просроченный больше чем на SCHEDULE_STALE_MS не публикуется сам.
+// notify: прислать владельцу итог в личку (из чата с ботом итог показывается на самой карточке).
+async function runScheduledPost(row, { checkStale = true, notify = true } = {}) {
+  if (schedInFlight.has(row.id)) return { status: 'busy' };
+  schedInFlight.add(row.id);
+  try {
+    const late = Date.now() - Date.parse(row.publishAt);
+    if (checkStale && late > SCHEDULE_STALE_MS) {
+      const err = `Просрочен на ${Math.round(late / 60000)} мин (сервер был недоступен). Автоматически не опубликован`;
+      await schedUpdate(row.id, { status: 'missed', error: err });
+      if (notify) await notifyOwner(row, `⚠️ Пост не вышел вовремя: ${err}.\n\n${shortPreview(row.text)}\n\nОпубликуй вручную или запланируй заново.`);
+      return { status: 'missed', error: err };
+    }
+
+    // Сначала метка «публикуется»: если дальше что-то оборвётся, пост не уйдёт в канал повторно
+    await schedUpdate(row.id, { status: 'publishing' });
+    let result;
+    try {
+      result = await publishToChannel(row.text, null);
+    } catch (e) {
+      const msg = scrubToken(e.message);
+      await schedUpdate(row.id, { status: 'failed', error: msg }).catch(() => {});
+      if (notify) await notifyOwner(row, `❌ Не удалось опубликовать запланированный пост:\n${msg}\n\n${shortPreview(row.text)}`);
+      return { status: 'failed', error: msg };
+    }
+    // Пост уже в канале: сбой записи статуса не должен выглядеть как неудачная публикация
+    await schedUpdate(row.id, { status: 'published', link: result.link }).catch(e => console.error('статус published не записан:', scrubToken(e.message)));
+    schedulerState.lastPublishedId = row.id;
+    if (notify) await notifyOwner(row, `✅ Опубликовано в канале${result.link ? '\n' + result.link : ''}\n\n${shortPreview(row.text)}`);
+    return { status: 'published', link: result.link };
+  } finally {
+    schedInFlight.delete(row.id);
+  }
+}
+
+let schedTickRunning = false;
+async function schedulerTick() {
+  if (schedTickRunning || !scheduleConfigured() || !TELEGRAM_BOT_TOKEN || !TELEGRAM_CHANNEL_ID) return;
+  schedTickRunning = true;
+  schedulerState.lastTickAt = new Date().toISOString();
+  try {
+    const due = await schedQuery({ and: [statusIs('scheduled'), { property: 'Publish At', date: { on_or_before: new Date().toISOString() } }] }, 25);
+    schedulerState.lastError = null;
+    for (const row of due) await runScheduledPost(row, { checkStale: true, notify: true });
+  } catch (e) {
+    schedulerState.lastError = scrubToken(e.message);
+    console.error('ошибка планировщика:', schedulerState.lastError);
+  } finally {
+    schedTickRunning = false;
+  }
+}
+
+// После перезапуска сервера пост со статусом «publishing» мог выйти, а мог нет: автоматически не повторяем
+async function recoverStuckPublishing() {
+  const rows = await schedQuery(statusIs('publishing'), 25);
+  for (const row of rows) {
+    if (Date.now() - Date.parse(row.publishAt) < 5 * 60 * 1000 || schedInFlight.has(row.id)) continue;
+    const err = 'Публикация оборвалась при перезапуске сервера. Проверь канал: пост мог выйти. Автоматически не повторяется';
+    await schedUpdate(row.id, { status: 'failed', error: err });
+    await notifyOwner(row, `⚠️ ${err}.\n\n${shortPreview(row.text)}`);
+  }
+}
+
+// --- Бот: вебхук, /scheduled, кнопки ---
+
+const webhookState = { status: 'not-started', desired: null, foreignUrl: null, error: null };
+
+function webhookSecret() {
+  return crypto.createHmac('sha256', TELEGRAM_BOT_TOKEN).update('postbot-webhook').digest('hex');
+}
+
+function publicBaseUrl() {
+  if (process.env.PUBLIC_URL) return process.env.PUBLIC_URL.replace(/\/+$/, '');
+  if (process.env.RAILWAY_PUBLIC_DOMAIN) return 'https://' + process.env.RAILWAY_PUBLIC_DOMAIN;
+  return null;
+}
+
+// Если у бота уже есть чужой вебхук, не затираем его: им может пользоваться другой сервис
+async function setupTelegramBot() {
+  const base = publicBaseUrl();
+  if (!base) { webhookState.status = 'no-public-url'; return; }
+  const desired = base + '/api/telegram-webhook';
+  webhookState.desired = desired;
+  const info = await tgApi('getWebhookInfo', {});
+  if (info.url && info.url !== desired && process.env.TELEGRAM_FORCE_WEBHOOK !== '1') {
+    webhookState.status = 'foreign';
+    webhookState.foreignUrl = info.url;
+    console.log('У бота уже есть другой вебхук, не трогаю:', info.url);
+    return;
+  }
+  await tgApi('setWebhook', { url: desired, secret_token: webhookSecret(), allowed_updates: ['message', 'callback_query'] });
+  await tgApi('setMyCommands', { commands: [{ command: 'scheduled', description: 'Запланированные посты' }] });
+  webhookState.status = 'active';
+}
+
+function startScheduling() {
+  if (!scheduleConfigured() || !TELEGRAM_BOT_TOKEN) {
+    console.log('Планирование выключено: нужны NOTION_API_KEY и TELEGRAM_BOT_TOKEN');
+    return;
+  }
+  schedulerState.started = true;
+  setTimeout(() => recoverStuckPublishing().catch(e => console.error('восстановление очереди:', scrubToken(e.message))), 3000);
+  setTimeout(() => schedulerTick(), 4000);
+  setInterval(() => schedulerTick(), SCHEDULER_INTERVAL_MS);
+  setupTelegramBot().catch(e => { webhookState.status = 'error'; webhookState.error = scrubToken(e.message); console.error('настройка бота:', webhookState.error); });
+}
+
+const botKeyboard = id => ({ inline_keyboard: [[{ text: 'Отменить', callback_data: 'c:' + id }, { text: 'Опубликовать сейчас', callback_data: 'p:' + id }]] });
+const cardText = row => `🕒 ${formatWarsaw(row.publishAt)} (Варшава)\n\n${shortPreview(row.text, 500)}`;
+const botSend = (chatId, text, extra = {}) => tgApi('sendMessage', { chat_id: chatId, text, ...extra });
+
+async function sendScheduledList(chatId, userId) {
+  const rows = await schedQuery({ and: [statusIs('scheduled'), { property: 'Owner', number: { equals: Number(userId) } }] }, 50);
+  if (!rows.length) return botSend(chatId, 'Запланированных постов нет.');
+  await botSend(chatId, `Запланировано постов: ${rows.length}. Время по Варшаве.`);
+  for (const row of rows.slice(0, 15)) await botSend(chatId, cardText(row), { reply_markup: botKeyboard(row.id) });
+  if (rows.length > 15) await botSend(chatId, `…и ещё ${rows.length - 15}. Показаны ближайшие 15.`);
+}
+
+async function handleBotUpdate(update) {
+  if (update.callback_query) return handleBotCallback(update.callback_query);
+  const msg = update.message;
+  if (!msg || !msg.from || !msg.chat || msg.chat.type !== 'private') return;
+  const userId = String(msg.from.id);
+  if (!TELEGRAM_ALLOWED_USER_IDS.includes(userId)) {
+    return botSend(msg.chat.id, `Нет доступа. Твой Telegram ID: ${userId}`);
+  }
+  const cmd = String(msg.text || '').trim().split(/\s|@/)[0].toLowerCase();
+  if (cmd === '/scheduled') {
+    if (!scheduleConfigured()) return botSend(msg.chat.id, 'Расписание не настроено: нет NOTION_API_KEY.');
+    return sendScheduledList(msg.chat.id, userId);
+  }
+  if (cmd === '/start' || cmd === '/help') {
+    return botSend(msg.chat.id, 'Команды:\n/scheduled: запланированные посты, отмена и публикация сразу.\n\nСоздавать и планировать посты нужно в приложении (кнопка меню).');
+  }
+}
+
+async function handleBotCallback(cb) {
+  const answer = (text, alert = false) => tgApi('answerCallbackQuery', { callback_query_id: cb.id, text, show_alert: alert }).catch(() => {});
+  const userId = String(cb.from.id);
+  const chatId = cb.message && cb.message.chat && cb.message.chat.id;
+  const messageId = cb.message && cb.message.message_id;
+  if (!TELEGRAM_ALLOWED_USER_IDS.includes(userId)) return answer('Нет доступа', true);
+  const m = /^([cpby]):([0-9a-f-]{32,40})$/i.exec(String(cb.data || ''));
+  if (!m || !chatId) return answer('Неизвестная кнопка');
+  const [, kind, id] = m;
+  const edit = (text, markup) => tgApi('editMessageText', { chat_id: chatId, message_id: messageId, text, reply_markup: markup || { inline_keyboard: [] } }).catch(e => console.error('editMessageText:', scrubToken(e.message)));
+
+  let row;
+  try { row = await schedGet(id); } catch { return answer('Пост не найден', true); }
+  if (String(row.owner) !== userId) return answer('Это не твой пост', true);
+  if (row.status !== 'scheduled') {
+    await answer(`Уже не в очереди: ${row.status}`);
+    return edit(`${cardText(row)}\n\nСтатус: ${row.status}`);
+  }
+
+  if (kind === 'c') {
+    await schedUpdate(id, { status: 'cancelled' });
+    await answer('Отменено');
+    return edit(`❌ Отменено\n\n${cardText(row)}`);
+  }
+  if (kind === 'p') {
+    await answer();
+    return edit(`${cardText(row)}\n\nОпубликовать в канал прямо сейчас?`, { inline_keyboard: [[{ text: 'Да, опубликовать', callback_data: 'y:' + id }, { text: 'Назад', callback_data: 'b:' + id }]] });
+  }
+  if (kind === 'b') {
+    await answer();
+    return edit(cardText(row), botKeyboard(id));
+  }
+  // kind === 'y': публикация сразу, итог показываем на этой же карточке
+  await answer('Публикую…');
+  await edit(`⏳ Публикую…\n\n${cardText(row)}`);
+  const r = await runScheduledPost(row, { checkStale: false, notify: false });
+  if (r.status === 'published') return edit(`✅ Опубликовано${r.link ? '\n' + r.link : ''}\n\n${shortPreview(row.text, 500)}`);
+  if (r.status === 'busy') return edit(`⏳ Уже публикуется\n\n${cardText(row)}`);
+  return edit(`❌ Не удалось опубликовать: ${r.error}\n\n${shortPreview(row.text, 500)}`);
 }
 
 function getSubstackSystemPrompt() {
@@ -1549,4 +1985,5 @@ Substack — профессиональный канал для практико
 
 server.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
+  startScheduling();
 });

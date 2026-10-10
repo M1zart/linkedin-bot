@@ -313,6 +313,58 @@
       display: block;
     }
 
+    .publish-row {
+      gap: 8px;
+      margin-bottom: 8px;
+    }
+
+    .modal {
+      display: none;
+      position: fixed;
+      inset: 0;
+      z-index: 80;
+      background: rgba(0, 0, 0, 0.7);
+      align-items: center;
+      justify-content: center;
+      padding: 16px;
+    }
+
+    .modal.show {
+      display: flex;
+    }
+
+    .modal-card {
+      width: 100%;
+      max-width: 420px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 18px;
+    }
+
+    .modal-title {
+      font-size: 16px;
+      font-weight: 700;
+      margin-bottom: 14px;
+    }
+
+    .modal-note {
+      font-size: 13px;
+      color: #e0a43a;
+      margin: -6px 0 12px;
+    }
+
+    .modal-note:empty,
+    .modal-error:empty {
+      display: none;
+    }
+
+    .modal-error {
+      font-size: 13px;
+      color: var(--red);
+      margin: -6px 0 12px;
+    }
+
     .publish-info {
       display: none;
       font-size: 13px;
@@ -699,11 +751,29 @@
 
     <div class="editor-footer">
       <div class="publish-info" id="publish-info"></div>
-      <button class="action-btn primary tg" id="publish-btn" style="display:none; width:100%; margin-bottom:8px;" onclick="publishToChannel()">📣 Опубликовать в Telegram-канал</button>
+      <div class="publish-row" id="publish-row" style="display:none;">
+        <button class="action-btn primary tg" id="publish-btn" onclick="publishToChannel()">📣 Опубликовать сейчас</button>
+        <button class="action-btn" id="schedule-btn" onclick="openScheduleModal()">🕒 Запланировать</button>
+      </div>
       <div class="result-actions">
         <button class="action-btn" onclick="regenerate()">🔄 Ещё раз</button>
         <button class="action-btn" id="save-archive-btn" onclick="saveToArchive()">💾 В архив</button>
         <button class="action-btn primary" id="copy-btn" onclick="copyPost()">📋 Копировать</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Окно планирования публикации -->
+  <div class="modal" id="schedule-modal">
+    <div class="modal-card">
+      <div class="modal-title">Запланировать публикацию</div>
+      <div class="field-label">Дата и время, Варшава</div>
+      <input type="text" id="schedule-when" placeholder="ДД.ММ ЧЧ:ММ, например 15.10 09:30" autocomplete="off" />
+      <div class="modal-note" id="schedule-cover-note"></div>
+      <div class="modal-error" id="schedule-error"></div>
+      <div class="result-actions">
+        <button class="action-btn" onclick="closeScheduleModal()">Отмена</button>
+        <button class="action-btn primary tg" id="schedule-submit" onclick="submitSchedule()">Запланировать</button>
       </div>
     </div>
   </div>
@@ -969,7 +1039,7 @@
       // повторное применение продублировало бы лейбл, хэштег и подпись.
       document.getElementById('rubric-section').style.display = isTg && lastMode !== 'newsquote' ? '' : 'none';
       // Публикация в канал только для Telegram-постов; у LinkedIn остаётся копирование
-      document.getElementById('publish-btn').style.display = isTg ? '' : 'none';
+      document.getElementById('publish-row').style.display = isTg ? 'flex' : 'none';
 
       box.classList.add('show');
       document.body.classList.add('editor-open');
@@ -1488,6 +1558,66 @@
         setEditorBusy(false);
       }
     }
+
+    // ===== ПЛАНИРОВАНИЕ ПУБЛИКАЦИИ (время по Варшаве, публикует сервер) =====
+    // Очередь хранится в Notion, поэтому картинка обложки при планировании не сохраняется: пост выйдет текстом.
+    // Список запланированного, отмена и «опубликовать сейчас»: команда /scheduled в чате с ботом.
+    const scheduleState = { busy: false };
+
+    function openScheduleModal() {
+      if (!lastGenerated.trim()) return;
+      const hasCover = !!getCoverDataUrl();
+      document.getElementById('schedule-cover-note').textContent = hasCover
+        ? 'Обложка при планировании не сохраняется: запланированный пост выйдет без картинки.'
+        : '';
+      document.getElementById('schedule-submit').textContent = hasCover ? 'Запланировать без картинки' : 'Запланировать';
+      document.getElementById('schedule-error').textContent = '';
+      document.getElementById('schedule-modal').classList.add('show');
+      document.getElementById('schedule-when').focus();
+    }
+
+    function closeScheduleModal() {
+      if (scheduleState.busy) return;
+      document.getElementById('schedule-modal').classList.remove('show');
+    }
+
+    async function submitSchedule() {
+      if (scheduleState.busy) return;
+      const when = document.getElementById('schedule-when').value.trim();
+      const errBox = document.getElementById('schedule-error');
+      if (!when) { errBox.textContent = 'Введи дату и время, например 15.10 09:30'; return; }
+      const submit = document.getElementById('schedule-submit');
+      const label = submit.textContent;
+      scheduleState.busy = true;
+      submit.disabled = true;
+      submit.textContent = 'Планирую...';
+      errBox.textContent = '';
+      try {
+        const response = await fetch('/api/schedule', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-Telegram-Init-Data': getInitData() },
+          body: JSON.stringify({ text: lastGenerated.trim(), when })
+        });
+        const data = await readApi(response);
+        scheduleState.busy = false;
+        closeScheduleModal();
+        const info = document.getElementById('publish-info');
+        info.textContent = `🕒 Запланировано на ${data.local} (Варшава). Список и отмена: команда /scheduled в чате с ботом.`;
+        info.classList.add('show');
+        showToast('Запланировано');
+      } catch (err) {
+        errBox.textContent = err.message.replace(/ \(HTTP \d+\)$/, '');
+      } finally {
+        scheduleState.busy = false;
+        submit.disabled = false;
+        submit.textContent = label;
+      }
+    }
+
+    document.getElementById('schedule-when').addEventListener('keydown', e => {
+      if (e.key === 'Enter') submitSchedule();
+      if (e.key === 'Escape') closeScheduleModal();
+    });
 
     // ===== ВХОД 2: готовый текст =====
 
