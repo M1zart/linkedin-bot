@@ -39,6 +39,11 @@ const MODEL = 'claude-sonnet-4-6';
 
 // Буква «ё» запрещена во всех текстах Дмитрия. Модели её пропускают (особенно последний проход-критик),
 // поэтому финальный текст чистим кодом, а не просьбой в промпте
+// Домены известных изданий в тексте поста заменяем названием: ссылки и домены в тексте роняют охваты. Разметку [текст](url) не трогаем
+const OUTLETS = { 'igamingbusiness.com': 'iGaming Business', 'next.io': 'Next.io', 'sbcnews.co.uk': 'SBC News', 'gamblinginsider.com': 'Gambling Insider', 'yogonet.com': 'Yogonet', 'egr.global': 'EGR' };
+const nameOutlets = t => Object.entries(OUTLETS).reduce((acc, [dom, name]) =>
+  acc.replace(new RegExp('(?<![/.\\w-])(?:https?://)?(?:www\\.)?' + dom.replace(/\./g, '\\.') + '(?![\\w/-])', 'gi'), name), String(t || ''));
+
 const noYo = t => String(t || '').replace(/ё/g, 'е').replace(/Ё/g, 'Е')
   // Тире и дефис с пробелами как пунктуация («X - Y», «X — Y», «X – Y») модель возвращает даже после запрета: ставим двоеточие
   .replace(/\s+[\u2014\u2013-]\s+/g, ': ');
@@ -56,6 +61,13 @@ const DIGEST_RULE = `
 Хук: самый сильный факт из входа, без метафор про смерть, войну и катастрофу.
 Запрещено: описывать, что «видит регулятор», «думает рынок», «чувствуют люди»; писать про домены, контракты, SEO, долю рынка, сроки восстановления и «единственное, что нужно делать», если этого нет во входе; больше пяти чисел; приписывать цифру источнику, если во входе этого не сказано.
 Если во входе указан источник, назови его одной короткой фразой по имени, без ссылки и домена.`;
+
+// Англицизмы: латиницей остаются только аббревиатуры и имена собственные. Остальное по-русски.
+const ANGLICISM_RULE = `АНГЛИЦИЗМЫ:
+Пиши по-русски. Если у английского слова есть нормальный русский эквивалент, используй его. Не оставляй английские слова латиницей и не записывай их кириллицей («ретеншн», «ретеншен»).
+Примеры замен: retention → удержание игроков; reactivation → возвращение игрока; live (ставки, реклама, коэффициенты) → «по ходу матча», «во время матча»; pre-match → «до матча»; second bet → вторая ставка; second deposit → второй депозит; user journey → путь игрока; acquisition → привлечение; cross-sell → перекрестные продажи; trigger → повод; touchpoint → точка контакта; sportsbook → спортбук; margin и hold → маржа; bonus → бонус.
+Латиницей оставляй только: аббревиатуры (GGR, NGR, CRM, KPI, LTV, CPA, CAC, ROI), названия компаний, регуляторов и продуктов, коды валют. Базовые термины индустрии (GGR, NGR, маржа, прокрут) не расшифровывай.
+Самопроверка: в тексте нет слов латиницей, кроме перечисленных выше.`;
 
 // Личный якорь без выдумок: опыт Дмитрия только из входа, иначе якорь это его позиция в разных формах
 const ANCHOR_RULE = `ЛИЧНЫЙ ОПЫТ И ЯКОРЬ:
@@ -202,7 +214,7 @@ async function runStopSlop(postText) {
 - Короткие декларативные предложения — фирменный голос Дмитрия, не slop
 - Цифры и метрики (GGR, NGR, hold%, margin, CAC, LTV, конкретные проценты)
 - Личный якорь (момент или наблюдение из реального опыта) — не полируй, не вырезай
-- Отраслевые термины: sportsbook, CRM, live betting, second bet, retention
+- Аббревиатуры: GGR, NGR, CRM, KPI, LTV, CPA, CAC (английские слова вроде retention, live, second bet НЕ защищены: заменить русскими)
 - Тире там где грамматически обязательно: подлежащее без глагола-связки, неполное предложение
 
 ПРАВИЛА ПЕРЕПИСИ:
@@ -329,9 +341,11 @@ const server = http.createServer(async (req, res) => {
         if (/Что произошло:/.test(String(prompt || ''))) text = await runFactTrim(prompt, text);
         // Последним: ловим «не X, а Y» кодом (после всех проходов, которые могли его вернуть)
         text = await runNegContrastFix(text);
+        // И последним англицизмы: ловим кодом, правим один раз
+        text = await runAnglicismFix(text);
 
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ text: noYo(text) }));
+        res.end(JSON.stringify({ text: noYo(nameOutlets(text)) }));
 
       } catch (err) {
         res.writeHead(500, { 'Content-Type': 'application/json' });
@@ -389,7 +403,7 @@ const server = http.createServer(async (req, res) => {
 
         const text = data.content?.[0]?.text || postText;
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ text: noYo(text) }));
+        res.end(JSON.stringify({ text: noYo(nameOutlets(text)) }));
 
       } catch (err) {
         console.error('format-post catch error:', err.message);
@@ -552,7 +566,7 @@ const server = http.createServer(async (req, res) => {
         const text = data.content?.[0]?.text || postText;
 
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ text: noYo(text) }));
+        res.end(JSON.stringify({ text: noYo(nameOutlets(text)) }));
 
       } catch (err) {
         console.error('rubric-format catch error:', err.message);
@@ -1221,7 +1235,9 @@ function getSystemPrompt() {
 ---
 
 ПРАВИЛА СТИЛЯ:
-- Пиши ТОЛЬКО на русском. Отраслевые термины на английском: GGR, NGR, sportsbook, CRM, hold%, CAC, LTV, margin, second bet, live betting
+- Пиши ТОЛЬКО на русском. Английские слова латиницей допустимы только как аббревиатуры (GGR, NGR, CRM, KPI, LTV, CPA, CAC) и имена собственные
+
+${ANGLICISM_RULE}
 - Короткие абзацы — 1-3 предложения. Иногда одно слово — норма
 - Личный голос, от первого лица
 - Конкретика — цифры, кейсы, механики, конкретные сцены и детали вместо общих фраз
@@ -1322,6 +1338,8 @@ function getTelegramSystemPrompt() {
 
 ${ANCHOR_RULE}
 
+${ANGLICISM_RULE}
+
 ---
 
 ЧЕМ TELEGRAM ОТЛИЧАЕТСЯ ОТ LINKEDIN:
@@ -1393,6 +1411,8 @@ async function runTelegramStopSlop(postText) {
 ОСТАВИТЬ: только дефис в наречиях типа «по-другому» → нет, тоже убрать, переформулировать.
 
 ПРАВИЛО 3 — ХЭШТЕГИ: удалить полностью включая пробел перед ними.
+
+ДОПОЛНИТЕЛЬНО — англицизмы заменить русскими словами (retention → удержание игроков, live → по ходу матча, pre-match → до матча, second bet → вторая ставка и т.п.); латиницей оставить только аббревиатуры GGR, NGR, CRM, KPI, LTV, CPA, CAC и имена собственные.
 
 ДОПОЛНИТЕЛЬНО — убрать если встречается:
 «Вот как...», «Вот что...», «Результат?», «В заключение...», «Честно говоря...», «Знакомо?», «Что это значит для вас?»
@@ -1519,6 +1539,49 @@ async function runNegContrastFix(postText) {
     return data.content?.[0]?.text || postText;
   } catch (err) {
     console.error('neg-contrast-fix failed:', err.message);
+    return postText;
+  }
+}
+
+// Англицизмы ловим кодом: слова латиницей с маленькой буквы (live, retention, pre-match) и кириллическая запись «ретеншн».
+// Аббревиатуры (GGR, CRM), имена (Entain, iGaming) и коды валют (DKK) не трогаем: они пишутся заглавными или не проходят шаблон
+function findAnglicisms(text) {
+  const cleaned = String(text || '')
+    .replace(/\]\([^)]*\)/g, ']')          // цели markdown-ссылок
+    .replace(/https?:\/\/\S+/g, ' ')        // голые ссылки
+    .replace(/\b[\w-]+(?:\.[\w-]+)*\.(?:com|io|net|org|co\.uk|global|bet)\b/gi, ' ') // домены: ими занимается nameOutlets
+    .replace(/[#@][\w]+/g, ' ');            // хэштеги и упоминания
+  const found = new Set();
+  const re = /(?<![A-Za-z0-9_])([A-Za-z][A-Za-z]*(?:-[A-Za-z]+)*)(?![A-Za-z0-9_])/g;
+  let m;
+  while ((m = re.exec(cleaned))) {
+    const w = m[1];
+    if (w.length < 3) continue;
+    if (/^[A-Z]{2,}$/.test(w)) continue;                         // аббревиатуры
+    if (/[A-Z]/.test(w.slice(1)) && /[a-z]/.test(w)) continue;   // iGaming, DraftKings, eSports: имена
+    if (/^[A-Z][a-z]+$/.test(w) && !/(^|[.!?]\s+|\n)\s*$/.test(cleaned.slice(Math.max(0, m.index - 3), m.index))) continue; // имена в середине фразы
+    if (/^[A-Z]/.test(w) && !/^(Live|Retention|Pre-match|Prematch|Sportsbook|Hold|Margin|Bonus|Cashout|Casino)$/i.test(w)) continue; // имена в начале фразы
+    found.add(w);
+  }
+  (String(text || '').match(/ретенш[еэ]?н|ретеншн/gi) || []).forEach(w => found.add(w));
+  return [...found];
+}
+
+async function runAnglicismFix(postText) {
+  const words = findAnglicisms(postText);
+  if (!words.length) return postText;
+  const system = `Ты редактор. В посте остались английские слова или их кириллическая запись: ${words.join(', ')}.
+Замени их нормальными русскими словами или оборотами, согласуй падежи и род. Примеры: retention/ретеншн → удержание игроков; live (реклама, коэффициенты, ставки) → «по ходу матча», «во время матча»; pre-match → до матча; second bet → вторая ставка; reactivation → возвращение игрока; sportsbook → спортбук; hold, margin → маржа.
+Аббревиатуры (GGR, NGR, CRM, KPI, LTV, CPA, CAC), названия компаний и продуктов, коды валют, хэштеги и ссылки не трогай.
+Остальной текст не меняй ни в одном слове. Не добавляй фактов и чисел. Без тире, без буквы «ё». Жирный (**…**) и разметку сохрани как есть.
+Верни ПОЛНЫЙ текст поста, без пояснений.`;
+  try {
+    const out = await claudeCall(system, postText);
+    if (!out) return postText;
+    console.log('anglicism-fix: заменено слов', words.length, '(' + words.join(', ') + ')');
+    return out;
+  } catch (err) {
+    console.error('anglicism-fix failed:', err.message);
     return postText;
   }
 }
