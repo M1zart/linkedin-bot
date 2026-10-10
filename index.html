@@ -880,6 +880,7 @@
       <option value="feature">FEATURE: разбор функции или релиза</option>
       <option value="mechanic">MECHANIC: механика или миф</option>
       <option value="opinion">OPINION: наблюдение</option>
+      <option value="personal">PERSONAL: личное, из моего текста</option>
     </select>
     <label style="display:flex;align-items:center;gap:8px;margin:10px 0 6px;font-size:14px;"><input type="checkbox" id="ed-tg" onchange="document.getElementById('ed-tg-box').style.display=this.checked?'block':'none'" /> Есть материал в Telegram для перехода</label>
     <div id="ed-tg-box" style="display:none;">
@@ -2477,7 +2478,7 @@
       title.textContent = (names[r.status] || r.status || 'Нет ответа') + (r.content_type ? ' · ' + r.content_type.toUpperCase() : '') + (r.goal === 'telegram_bridge' ? ' · мост в Telegram' : '');
       card.appendChild(title);
       if (r.reason) { const rs = document.createElement('div'); rs.className = 'digest-row'; rs.style.fontWeight = '600'; rs.textContent = r.reason; card.appendChild(rs); }
-      if (!r.post_text) { const h = document.createElement('div'); h.className = 'digest-row'; h.textContent = 'Поста нет: редактор отказался писать по этим правилам. Нажми «5 постов под разными углами», там пост напишется в любом случае.'; card.appendChild(h); }
+      if (!r.post_text) { const h = document.createElement('div'); h.className = 'digest-row'; h.textContent = 'Поста нет. Если материал личный (история, мысли, решение), выбери тип «PERSONAL» и нажми «Подготовить пост». Если это новость, попробуй «5 постов под разными углами».'; card.appendChild(h); }
       let ta = null;
       if (r.post_text) {
         const lab = document.createElement('div'); lab.className = 'digest-row'; lab.style.fontWeight = '600';

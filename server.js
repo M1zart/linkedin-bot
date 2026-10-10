@@ -2566,7 +2566,7 @@ function threadsRoute(req, res) {
           if (!parsed.ok) throw httpError(400, `Пост ${i + 1}: ${parsed.error}`);
           const mt = it.meta && typeof it.meta === 'object' ? it.meta : null;
           const meta = mt ? {
-            type: EDITOR_TYPES.includes(mt.type) ? mt.type : null,
+            type: EDITOR_TYPES.concat(['personal']).includes(mt.type) ? mt.type : null,
             goal: ['reach', 'telegram_bridge'].includes(mt.goal) ? mt.goal : null,
             company: String(mt.company || '').slice(0, 100),
             angle: String(mt.angle || '').slice(0, 300)
@@ -2734,7 +2734,46 @@ function editorMix(recent) {
   return mix;
 }
 
+// ── Личный пост (PERSONAL): пишется только из того, что сказал сам Дмитрий ──
+function personalSystemPrompt() {
+  return `Ты редактор русскоязычного Threads Дмитрия, оператора sportsbook. Задача: превратить его личный материал (заметки, мысли, история) в короткий пост, после которого читатель ему доверяет и сопереживает. Это личный пост, индустриальный объект и бизнес-механика не нужны.
+
+Главное правило: используй только факты, события, чувства и числа из source_text. Не придумывай сцены, диалоги, цифры, людей, даты и обстоятельства. Если материала не хватает для честного поста, верни needs_input и в reason напиши одним вопросом, чего не хватает.
+
+Пост: одна история или одно решение, одно настоящее чувство, один вывод, который следует из самого материала. Первое лицо, живая речь, без пафоса, без мотивационного тона, без поучений и без «жизненных уроков». Не объясняй читателю, что он должен почувствовать. Длина до 480 символов. Русский простой разговорный, буква е без точек, без эмодзи, хэштегов, Markdown, тире (только дефис внутри слов), без «Вот почему», «Вот что», «Дело не в X, а в Y», «Это не просто X, это Y», «Результат?», «Что думаете?», «Согласны?», без призывов к комментариям и без трех симметричных коротких фраз. Не называй людей и компании, если их нет в материале, и не нападай на них по имени. Не пиши про американский гемблинг.
+
+Верни ТОЛЬКО JSON без Markdown: {"status":"ready|needs_input","post_text":"","facts_used":[{"quote":"дословная цитата из source_text, на которую опирается пост"}],"reason":""}`;
+}
+async function runPersonal(cand) {
+  const src = String(cand.source_text || '').slice(0, 12000);
+  if (src.trim().length < 80) return { result: { status: 'needs_input', content_type: 'personal', reason: 'Для личного поста вставь свой материал: что произошло, что ты почувствовал, к чему пришел. Придумывать за тебя бот не будет.', post_text: '' } };
+  const raw = await claudeCall(personalSystemPrompt(), JSON.stringify({ title: String(cand.title || '').slice(0, 300), source_text: src }), 2000);
+  const res = parseEditorJson(raw);
+  if (!res) throw httpError(502, 'Модель вернула не JSON, попробуй еще раз');
+  res.content_type = 'personal'; res.goal = 'reach';
+  res.post_text = noYo(String(res.post_text || '').trim());
+  if (res.status !== 'ready' || !res.post_text) { res.status = 'needs_input'; res.post_text = ''; return { result: res }; }
+  const norm = t => String(t || '').toLowerCase().replace(/ё/g, 'е').replace(/[\s ]+/g, ' ').replace(/[«»"“”„'’.,!?;:()\-–—]/g, '').trim();
+  const nsrc = norm(src);
+  const facts = Array.isArray(res.facts_used) ? res.facts_used : [];
+  const bad = [];
+  if (!facts.length) bad.push('нет опоры на твой текст');
+  facts.forEach(f => { const q = norm(f && f.quote); if (!q || !nsrc.includes(q)) bad.push('цитата не найдена в твоем тексте: «' + String((f && f.quote) || '').slice(0, 80) + '»'); });
+  if (threadsLength(res.post_text) > THREADS_MAX) bad.push('длина больше ' + THREADS_MAX);
+  for (const [re, why] of EDITOR_BAD) if (why !== 'выдуманный личный опыт' && re.test(res.post_text)) bad.push(why);
+  if (findNegContrast(res.post_text).length) bad.push('конструкция «не X, а Y»');
+  if (/[—–]/.test(res.post_text) || /\s-\s/.test(res.post_text)) bad.push('тире');
+  if (US_GAMBLING.test(res.post_text) && !PRED_MARKET.test(res.post_text)) bad.push('американский гемблинг');
+  res.internal_fact_check = facts.map(f => ({ claim: String((f && f.quote) || '').slice(0, 200), support: 'твой текст' }));
+  if (bad.length) { res.status = 'needs_input'; res.reason = 'Пост не прошел проверку: ' + bad.join('; ') + '. Нажми еще раз.'; }
+  const rowsT = await tRecent(30).catch(() => []);
+  const taken = new Set(rowsT.filter(r => r.status === TS.scheduled && r.publishAt).map(r => Math.floor(Date.parse(r.publishAt) / 60000)));
+  return { result: res, slot: nextThreadsSlots(1, taken)[0] || '' };
+}
+// ── конец личных постов ──
+
 async function runEditor(cand, tg) {
+  if (cand && cand.suggested_type === 'personal') return runPersonal(cand);
   const input0 = {
     current_date: new Date().toISOString().slice(0, 10),
     candidate: {
