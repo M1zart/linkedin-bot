@@ -348,7 +348,29 @@
       margin-bottom: 14px;
     }
 
-    #schedule-when {
+    .reschedule-post {
+      font-size: 14px;
+      line-height: 1.5;
+      color: var(--text);
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 10px 12px;
+      margin-bottom: 10px;
+      max-height: 130px;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    .reschedule-current {
+      font-size: 13px;
+      color: var(--text-dim);
+      margin-bottom: 14px;
+    }
+
+    #schedule-when,
+    #reschedule-when {
       width: 100%;
       background: var(--surface);
       border: 1px solid var(--border);
@@ -363,7 +385,8 @@
       outline: none;
     }
 
-    #schedule-when:focus {
+    #schedule-when:focus,
+    #reschedule-when:focus {
       border-color: var(--tg);
     }
 
@@ -810,10 +833,10 @@
       <div class="field-label">Дата и время, Варшава</div>
       <input type="datetime-local" id="schedule-when" autocomplete="off" />
       <div class="schedule-presets">
-        <button type="button" class="tone-btn" data-preset="h1">Через 1 час</button>
-        <button type="button" class="tone-btn" data-preset="h3">Через 3 часа</button>
-        <button type="button" class="tone-btn" data-preset="same">Завтра в это же время</button>
-        <button type="button" class="tone-btn" data-preset="nine">Завтра 09:00</button>
+        <button type="button" class="tone-btn" data-preset="h1" data-target="schedule-when">Через 1 час</button>
+        <button type="button" class="tone-btn" data-preset="h3" data-target="schedule-when">Через 3 часа</button>
+        <button type="button" class="tone-btn" data-preset="same" data-target="schedule-when">Завтра в это же время</button>
+        <button type="button" class="tone-btn" data-preset="nine" data-target="schedule-when">Завтра 09:00</button>
       </div>
       <div class="schedule-preview" id="schedule-preview"></div>
       <div class="modal-note" id="schedule-cover-note"></div>
@@ -821,6 +844,29 @@
       <div class="result-actions">
         <button class="action-btn" onclick="closeScheduleModal()">Отмена</button>
         <button class="action-btn primary tg" id="schedule-submit" onclick="submitSchedule()">Запланировать</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Экран переноса: открывается кнопкой «Выбрать дату и время» в карточке /scheduled (адрес ?reschedule=<id>) -->
+  <div class="modal" id="reschedule-screen">
+    <div class="modal-card">
+      <div class="modal-title">Перенос публикации</div>
+      <div class="reschedule-post" id="reschedule-post">Загружаю пост…</div>
+      <div class="reschedule-current" id="reschedule-current"></div>
+      <div class="field-label">Новые дата и время, Варшава</div>
+      <input type="datetime-local" id="reschedule-when" autocomplete="off" />
+      <div class="schedule-presets">
+        <button type="button" class="tone-btn" data-preset="h1" data-target="reschedule-when">Через 1 час</button>
+        <button type="button" class="tone-btn" data-preset="h3" data-target="reschedule-when">Через 3 часа</button>
+        <button type="button" class="tone-btn" data-preset="same" data-target="reschedule-when">Завтра в это же время</button>
+        <button type="button" class="tone-btn" data-preset="nine" data-target="reschedule-when">Завтра 09:00</button>
+      </div>
+      <div class="schedule-preview" id="reschedule-preview"></div>
+      <div class="modal-error" id="reschedule-error"></div>
+      <div class="result-actions">
+        <button class="action-btn" id="reschedule-close" onclick="closeRescheduleScreen()">Закрыть</button>
+        <button class="action-btn primary tg" id="reschedule-submit" onclick="submitReschedule()" disabled>Перенести</button>
       </div>
     </div>
   </div>
@@ -1639,9 +1685,9 @@
     }
 
     // Строка под полем: что выбрано и сколько сейчас в Варшаве; для прошедшего времени предупреждение
-    function updateSchedulePreview() {
-      const box = document.getElementById('schedule-preview');
-      const raw = document.getElementById('schedule-when').value;
+    function updatePickerPreview(inputId, boxId) {
+      const box = document.getElementById(boxId);
+      const raw = document.getElementById(inputId).value;
       const now = warsawWall(Date.now());
       const nowText = `Сейчас в Варшаве: ${pad2(now.h)}:${pad2(now.mi)}`;
       const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/.exec(raw);
@@ -1658,16 +1704,15 @@
       box.textContent = `Выйдет: ${parts.weekday}, ${parts.day}.${parts.month}${year} ${parts.hour}:${parts.minute} (Варшава). ${nowText}.`;
     }
 
-    function openScheduleModal() {
-      if (!lastGenerated.trim()) return;
-      const hasCover = !!getCoverDataUrl();
-      document.getElementById('schedule-cover-note').textContent = hasCover
-        ? 'Обложка при планировании не сохраняется: запланированный пост выйдет без картинки.'
-        : '';
-      document.getElementById('schedule-submit').textContent = hasCover ? 'Запланировать без картинки' : 'Запланировать';
-      document.getElementById('schedule-error').textContent = '';
+    const updateSchedulePreview = () => updatePickerPreview('schedule-when', 'schedule-preview');
+    // Какие строки под полем относятся к какому полю выбора (окно планирования и экран переноса)
+    const PICKER_UI = {
+      'schedule-when': { preview: 'schedule-preview', error: 'schedule-error' },
+      'reschedule-when': { preview: 'reschedule-preview', error: 'reschedule-error' }
+    };
 
-      const input = document.getElementById('schedule-when');
+    // Подготовка поля выбора: границы и значение «через час», а в запасном текстовом поле подсказка формата
+    function preparePicker(input) {
       if (input.type === 'datetime-local') {
         input.min = wallToInput(warsawWall(Date.now() + 60000));
         input.max = wallToInput(warsawWall(Date.now() + 365 * 86400000));
@@ -1677,6 +1722,27 @@
         input.placeholder = 'ДД.ММ ЧЧ:ММ, например 15.10 09:30';
         input.value = '';
       }
+    }
+
+    // Значение поля в то, что принимает сервер (ДД.ММ.ГГГГ ЧЧ:ММ по Варшаве); прошедшее время отсекается на устройстве
+    function pickerWhen(rawValue) {
+      const raw = String(rawValue || '').trim();
+      if (!raw) return { error: 'Выбери дату и время' };
+      const iso = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/.exec(raw);
+      if (iso && iso[0] <= wallToInput(warsawWall(Date.now()))) return { error: 'Это время уже прошло: выбери позже' };
+      // запасной ручной ввод ДД.ММ ЧЧ:ММ уходит как есть
+      return { when: iso ? `${iso[3]}.${iso[2]}.${iso[1]} ${iso[4]}:${iso[5]}` : raw };
+    }
+
+    function openScheduleModal() {
+      if (!lastGenerated.trim()) return;
+      const hasCover = !!getCoverDataUrl();
+      document.getElementById('schedule-cover-note').textContent = hasCover
+        ? 'Обложка при планировании не сохраняется: запланированный пост выйдет без картинки.'
+        : '';
+      document.getElementById('schedule-submit').textContent = hasCover ? 'Запланировать без картинки' : 'Запланировать';
+      document.getElementById('schedule-error').textContent = '';
+      preparePicker(document.getElementById('schedule-when'));
       updateSchedulePreview();
       document.getElementById('schedule-modal').classList.add('show');
     }
@@ -1688,13 +1754,10 @@
 
     async function submitSchedule() {
       if (scheduleState.busy) return;
-      const raw = document.getElementById('schedule-when').value.trim();
       const errBox = document.getElementById('schedule-error');
-      if (!raw) { errBox.textContent = 'Выбери дату и время'; return; }
-      const iso = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/.exec(raw);
-      if (iso && iso[0] <= wallToInput(warsawWall(Date.now()))) { errBox.textContent = 'Это время уже прошло: выбери позже'; return; }
-      // Серверу уходит ДД.ММ.ГГГГ ЧЧ:ММ по Варшаве; запасной ручной ввод ДД.ММ ЧЧ:ММ тоже принимается как есть
-      const when = iso ? `${iso[3]}.${iso[2]}.${iso[1]} ${iso[4]}:${iso[5]}` : raw;
+      const picked = pickerWhen(document.getElementById('schedule-when').value);
+      if (picked.error) { errBox.textContent = picked.error; return; }
+      const when = picked.when;
       const submit = document.getElementById('schedule-submit');
       const label = submit.textContent;
       scheduleState.busy = true;
@@ -1727,18 +1790,105 @@
       if (e.key === 'Enter') submitSchedule();
       if (e.key === 'Escape') closeScheduleModal();
     });
-    ['input', 'change'].forEach(ev => document.getElementById('schedule-when').addEventListener(ev, updateSchedulePreview));
+    ['input', 'change'].forEach(evName => document.getElementById('schedule-when').addEventListener(evName, updateSchedulePreview));
+    ['input', 'change'].forEach(evName => document.getElementById('reschedule-when').addEventListener(evName, () => updatePickerPreview('reschedule-when', 'reschedule-preview')));
 
-    // Быстрые кнопки только подставляют время в поле: отправляет окно основная кнопка
+    // Быстрые кнопки только подставляют время в поле (в окне планирования и на экране переноса):
+    // отправляет форму основная кнопка
     document.querySelectorAll('.schedule-presets [data-preset]').forEach(btn => {
       btn.addEventListener('click', () => {
-        const input = document.getElementById('schedule-when');
+        const targetId = btn.dataset.target || 'schedule-when';
+        const input = document.getElementById(targetId);
         if (input.type !== 'datetime-local') return; // в текстовом запасном поле формат другой
         input.value = presetValue(btn.dataset.preset);
-        document.getElementById('schedule-error').textContent = '';
-        updateSchedulePreview();
+        document.getElementById(PICKER_UI[targetId].error).textContent = '';
+        updatePickerPreview(targetId, PICKER_UI[targetId].preview);
       });
     });
+
+    // ===== ЭКРАН ПЕРЕНОСА (открывается кнопкой «Выбрать дату и время» в карточке /scheduled: /?reschedule=<id>&m=<сообщение>) =====
+    // Пост в очереди остаётся тем же: меняется только время. Карточку в чате обновляет сервер.
+    const rescheduleState = { id: null, messageId: null, busy: false, done: false };
+
+    function closeRescheduleScreen() {
+      if (rescheduleState.busy) return;
+      const wa = window.Telegram?.WebApp;
+      // Это одноразовый экран из чата: в Telegram закрываем приложение и возвращаем в чат
+      if (wa && typeof wa.close === 'function' && wa.initData) { wa.close(); return; }
+      document.getElementById('reschedule-screen').classList.remove('show');
+    }
+
+    async function openRescheduleScreen(id, messageId) {
+      rescheduleState.id = id;
+      rescheduleState.messageId = messageId;
+      rescheduleState.done = false;
+      const post = document.getElementById('reschedule-post');
+      const current = document.getElementById('reschedule-current');
+      const err = document.getElementById('reschedule-error');
+      const submit = document.getElementById('reschedule-submit');
+      document.getElementById('reschedule-screen').classList.add('show');
+      post.textContent = 'Загружаю пост…';
+      current.textContent = '';
+      err.textContent = '';
+      submit.disabled = true;
+      preparePicker(document.getElementById('reschedule-when'));
+      updatePickerPreview('reschedule-when', 'reschedule-preview');
+      try {
+        const response = await fetch('/api/scheduled-post?id=' + encodeURIComponent(id), { headers: { 'X-Telegram-Init-Data': getInitData() } });
+        const data = await readApi(response);
+        post.textContent = data.text.replace(/\*\*/g, '').trim().slice(0, 600);
+        if (data.status !== 'scheduled') {
+          current.textContent = `Пост уже не в очереди (статус: ${data.status}), перенести его нельзя.`;
+          return;
+        }
+        current.textContent = `Сейчас запланировано: ${data.local} (Варшава)`;
+        submit.disabled = false;
+      } catch (e) {
+        post.textContent = '';
+        err.textContent = e.message.replace(/ \(HTTP \d+\)$/, '');
+      }
+    }
+
+    async function submitReschedule() {
+      if (rescheduleState.busy || !rescheduleState.id || rescheduleState.done) return;
+      const err = document.getElementById('reschedule-error');
+      const picked = pickerWhen(document.getElementById('reschedule-when').value);
+      if (picked.error) { err.textContent = picked.error; return; }
+      const submit = document.getElementById('reschedule-submit');
+      rescheduleState.busy = true;
+      submit.disabled = true;
+      submit.textContent = 'Переношу...';
+      err.textContent = '';
+      try {
+        const body = { id: rescheduleState.id, when: picked.when };
+        if (rescheduleState.messageId) body.messageId = rescheduleState.messageId;
+        const response = await fetch('/api/reschedule', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-Telegram-Init-Data': getInitData() },
+          body: JSON.stringify(body)
+        });
+        const data = await readApi(response);
+        rescheduleState.done = true;
+        document.getElementById('reschedule-current').textContent = `✅ Перенесено на ${data.local} (Варшава)`;
+        document.getElementById('reschedule-close').textContent = 'Готово';
+        showToast('Перенесено');
+      } catch (e) {
+        err.textContent = e.message.replace(/ \(HTTP \d+\)$/, '');
+        submit.disabled = false;
+      } finally {
+        rescheduleState.busy = false;
+        submit.textContent = 'Перенести';
+      }
+    }
+
+    // Открыто из кнопки бота: сразу показываем экран переноса этого поста
+    (function () {
+      const params = new URLSearchParams(location.search);
+      const id = params.get('reschedule');
+      if (!id) return;
+      const m = parseInt(params.get('m'), 10);
+      openRescheduleScreen(id, Number.isInteger(m) && m > 0 ? m : null);
+    })();
 
     // ===== ВХОД 2: готовый текст =====
 

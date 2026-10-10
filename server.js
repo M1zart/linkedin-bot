@@ -217,7 +217,9 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  if (req.method === 'GET' && (req.url === '/' || req.url === '/index.html')) {
+  // Параметры в адресе (например, ?reschedule=<id> из кнопки бота) не должны давать 404
+  const pagePath = req.url.split('?')[0];
+  if (req.method === 'GET' && (pagePath === '/' || pagePath === '/index.html')) {
     const filePath = path.join(__dirname, 'index.html');
     fs.readFile(filePath, (err, data) => {
       if (err) {
@@ -596,6 +598,60 @@ const server = http.createServer(async (req, res) => {
         send(200, { ok: true, id: row.id, publishAt: parsed.iso, local: formatWarsaw(parsed.iso) });
       } catch (err) {
         console.error('schedule error:', scrubToken(err.message));
+        send(err.httpStatus || 500, { error: scrubToken(err.message) });
+      }
+    });
+    return;
+  }
+
+  // ── Перенос: данные поста для экрана переноса (открывается кнопкой бота) ──
+  if (req.method === 'GET' && req.url.split('?')[0] === '/api/scheduled-post') {
+    const send = (status, obj) => { res.writeHead(status, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(obj)); };
+    try {
+      if (!scheduleConfigured()) return send(503, { error: 'Расписание не настроено: нужен NOTION_API_KEY в переменных Railway' });
+      const auth = await authorizeUser(req);
+      if (!auth.ok) return send(auth.status, { error: auth.error });
+      const id = new URL(req.url, 'http://localhost').searchParams.get('id') || '';
+      if (!/^[0-9a-f-]{32,40}$/i.test(id)) return send(400, { error: 'Некорректный id поста' });
+      let row;
+      try { row = await schedGet(id); } catch { return send(404, { error: 'Пост не найден или очередь недоступна' }); }
+      if (String(row.owner) !== auth.userId) return send(403, { error: 'Это не твой пост' });
+      send(200, { id: row.id, text: row.text, status: row.status, publishAt: row.publishAt, local: formatWarsaw(row.publishAt) });
+    } catch (err) {
+      console.error('scheduled-post error:', scrubToken(err.message));
+      send(err.httpStatus || 500, { error: scrubToken(err.message) });
+    }
+    return;
+  }
+
+  // ── Перенос: новое время уже запланированного поста (статус остаётся scheduled) ──
+  if (req.method === 'POST' && req.url === '/api/reschedule') {
+    let body = '';
+    req.on('data', chunk => { body += chunk; if (body.length > 64 * 1024) req.destroy(); });
+    req.on('end', async () => {
+      const send = (status, obj) => { res.writeHead(status, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(obj)); };
+      try {
+        if (!scheduleConfigured()) return send(503, { error: 'Расписание не настроено: нужен NOTION_API_KEY в переменных Railway' });
+        const auth = await authorizeUser(req);
+        if (!auth.ok) return send(auth.status, { error: auth.error });
+        const { id, when, messageId } = JSON.parse(body);
+        if (!/^[0-9a-f-]{32,40}$/i.test(String(id || ''))) return send(400, { error: 'Некорректный id поста' });
+        const parsed = parseWarsawDateTime(when);
+        if (!parsed.ok) return send(400, { error: parsed.error });
+        let row;
+        try { row = await schedGet(id); } catch { return send(404, { error: 'Пост не найден или очередь недоступна' }); }
+        if (String(row.owner) !== auth.userId) return send(403, { error: 'Это не твой пост' });
+        if (row.status !== 'scheduled') return send(409, { error: `Пост уже не в очереди: ${row.status}` });
+        const updated = await rescheduleRow(row, parsed.iso);
+        // Карточка в чате с ботом обновляется на новое время. Правим только сообщение в личном чате самого пользователя
+        // (chat_id = его Telegram ID), чужие чаты и произвольные сообщения этим путём не затронуть.
+        if (Number.isInteger(messageId) && messageId > 0) {
+          tgApi('editMessageText', { chat_id: Number(auth.userId), message_id: messageId, text: `✅ Перенесено\n\n${cardText(updated)}`, reply_markup: botKeyboard(row.id) })
+            .catch(e => console.error('карточка в чате не обновлена:', scrubToken(e.message)));
+        }
+        send(200, { ok: true, id: row.id, publishAt: updated.publishAt, local: formatWarsaw(updated.publishAt) });
+      } catch (err) {
+        console.error('reschedule error:', scrubToken(err.message));
         send(err.httpStatus || 500, { error: scrubToken(err.message) });
       }
     });
@@ -1757,8 +1813,9 @@ async function schedGet(id) {
   return row;
 }
 
-async function schedUpdate(id, { status, link, error }) {
+async function schedUpdate(id, { status, link, error, publishAt }) {
   const properties = {};
+  if (publishAt) properties['Publish At'] = { date: { start: publishAt } };
   if (status) properties.Status = { select: { name: status } };
   if (link !== undefined) properties.Link = { url: link || null };
   if (error !== undefined) properties.Error = { rich_text: error ? toRichText(String(error).slice(0, 1800)) : [] };
@@ -1883,7 +1940,50 @@ function startScheduling() {
   setupTelegramBot().catch(e => { webhookState.status = 'error'; webhookState.error = scrubToken(e.message); console.error('настройка бота:', webhookState.error); });
 }
 
-const botKeyboard = id => ({ inline_keyboard: [[{ text: 'Отменить', callback_data: 'c:' + id }, { text: 'Опубликовать сейчас', callback_data: 'p:' + id }]] });
+const botKeyboard = id => ({ inline_keyboard: [
+  [{ text: 'Отменить', callback_data: 'c:' + id }, { text: 'Опубликовать сейчас', callback_data: 'p:' + id }],
+  [{ text: '🕒 Перенести', callback_data: 'r:' + id }]
+] });
+
+// Меню переноса: быстрые сдвиги и кнопка, которая открывает Mini App с нативным выбором даты и времени
+function rescheduleKeyboard(id, messageId) {
+  const rows = [
+    [{ text: '+1 час', callback_data: 's1:' + id }, { text: '+3 часа', callback_data: 's3:' + id }, { text: '+1 день', callback_data: 'sd:' + id }],
+    [{ text: 'Завтра 09:00', callback_data: 'sn:' + id }]
+  ];
+  const base = publicBaseUrl();
+  // m: номер этой карточки в чате, чтобы после переноса в Mini App сервер обновил её на новое время
+  if (base) rows.push([{ text: '📅 Выбрать дату и время', web_app: { url: `${base}/?reschedule=${id}${messageId ? '&m=' + messageId : ''}` } }]);
+  rows.push([{ text: 'Назад', callback_data: 'b:' + id }]);
+  return { inline_keyboard: rows };
+}
+
+// Новое время для быстрых сдвигов: «+1 час», «+3 часа» от запланированного времени, «+1 день» по календарю Варшавы
+// (в день перехода на летнее время это не ровно 24 часа), «Завтра 09:00» от текущего момента
+function shiftedIso(row, kind, nowMs = Date.now()) {
+  const old = Date.parse(row.publishAt);
+  if (kind === 's1') return new Date(old + 3600000).toISOString();
+  if (kind === 's3') return new Date(old + 3 * 3600000).toISOString();
+  const nextDay = (ms, hour, minute) => {
+    const p = warsawParts(ms);
+    const d = new Date(Date.UTC(p.y, p.mo - 1, p.d + 1, hour ?? p.h, minute ?? p.mi));
+    return warsawToUtcMs(d.getUTCFullYear(), d.getUTCMonth() + 1, d.getUTCDate(), d.getUTCHours(), d.getUTCMinutes());
+  };
+  if (kind === 'sd') return new Date(nextDay(old) ?? old + 86400000).toISOString();
+  if (kind === 'sn') return new Date(nextDay(nowMs, 9, 0) ?? nowMs + 86400000).toISOString();
+  throw new Error('Неизвестный сдвиг');
+}
+
+// Меняет только время публикации; статус остаётся scheduled, текст и владелец те же
+async function rescheduleRow(row, newIso) {
+  const ms = Date.parse(newIso);
+  const now = Date.now();
+  if (!(ms >= now + 60 * 1000)) throw httpError(400, 'Это время уже прошло или наступит меньше чем через минуту');
+  if (ms > now + 366 * 24 * 3600 * 1000) throw httpError(400, 'Можно планировать не дальше чем на год вперёд');
+  if (schedInFlight.has(row.id)) throw httpError(409, 'Пост публикуется прямо сейчас');
+  await schedUpdate(row.id, { publishAt: newIso });
+  return { ...row, publishAt: newIso };
+}
 const cardText = row => `🕒 ${formatWarsaw(row.publishAt)} (Варшава)\n\n${shortPreview(row.text, 500)}`;
 const botSend = (chatId, text, extra = {}) => tgApi('sendMessage', { chat_id: chatId, text, ...extra });
 
@@ -1925,7 +2025,7 @@ async function handleBotCallback(cb) {
   const chatId = cb.message && cb.message.chat && cb.message.chat.id;
   const messageId = cb.message && cb.message.message_id;
   if (!TELEGRAM_ALLOWED_USER_IDS.includes(userId)) return answer('Нет доступа', true);
-  const m = /^([cpby]):([0-9a-f-]{32,40})$/i.exec(String(cb.data || ''));
+  const m = /^(c|p|b|y|r|s1|s3|sd|sn):([0-9a-f-]{32,40})$/i.exec(String(cb.data || ''));
   if (!m || !chatId) return answer('Неизвестная кнопка');
   const [, kind, id] = m;
   const edit = (text, markup) => tgApi('editMessageText', { chat_id: chatId, message_id: messageId, text, reply_markup: markup || { inline_keyboard: [] } }).catch(e => console.error('editMessageText:', scrubToken(e.message)));
@@ -1938,6 +2038,20 @@ async function handleBotCallback(cb) {
     return edit(`${cardText(row)}\n\nСтатус: ${row.status}`);
   }
 
+  if (kind === 'r') {
+    await answer();
+    return edit(`${cardText(row)}\n\nНа какое время перенести?`, rescheduleKeyboard(id, messageId));
+  }
+  if (['s1', 's3', 'sd', 'sn'].includes(kind)) {
+    let updated;
+    try {
+      updated = await rescheduleRow(row, shiftedIso(row, kind));
+    } catch (e) {
+      return answer(String(e.message).slice(0, 190), true);
+    }
+    await answer('Перенесено');
+    return edit(`✅ Перенесено\n\n${cardText(updated)}`, botKeyboard(id));
+  }
   if (kind === 'c') {
     await schedUpdate(id, { status: 'cancelled' });
     await answer('Отменено');
