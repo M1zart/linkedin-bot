@@ -1963,7 +1963,7 @@
       try {
         const response = await fetch('/api/scheduled-post?id=' + encodeURIComponent(id), { headers: { 'X-Telegram-Init-Data': getInitData() } });
         const data = await readApi(response);
-        post.textContent = data.text.replace(/\*\*/g, '').trim().slice(0, 600);
+        renderTgText(post, data.text);
         if (data.status !== 'scheduled') {
           current.textContent = `Пост уже не в очереди (статус: ${data.status}), перенести его нельзя.`;
           return;
@@ -2020,6 +2020,23 @@
     // ===== ОЧЕРЕДЬ: запланированные посты прямо в приложении (вместо /scheduled в чате) =====
     const queueState = { busy: false };
 
+    // Предпросмотр как в канале: сервер при публикации превращает в жирный только **текст** (в пределах одной строки),
+    // всё остальное идет обычным текстом. Строим через DOM, а не innerHTML, чтобы текст поста не мог ничего исполнить
+    function renderTgText(el, text) {
+      el.textContent = '';
+      const src = String(text || '').trim();
+      const re = /\*\*([^\n]+?)\*\*/g;
+      let last = 0, m;
+      while ((m = re.exec(src))) {
+        if (m.index > last) el.appendChild(document.createTextNode(src.slice(last, m.index)));
+        const b = document.createElement('b');
+        b.textContent = m[1];
+        el.appendChild(b);
+        last = m.index + m[0].length;
+      }
+      if (last < src.length) el.appendChild(document.createTextNode(src.slice(last)));
+    }
+
     async function queueCall(url, options) {
       const response = await fetch(url, { ...options, headers: { 'Content-Type': 'application/json', 'X-Telegram-Init-Data': getInitData(), ...(options && options.headers) } });
       return readApi(response);
@@ -2063,7 +2080,7 @@
 
         const text = document.createElement('div');
         text.className = 'queue-text';
-        text.textContent = String(it.text || '').replace(/\*\*/g, '').trim();
+        renderTgText(text, it.text);
         card.appendChild(text);
         if (text.textContent.length > 280) {
           const toggle = document.createElement('button');
