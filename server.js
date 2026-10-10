@@ -1454,7 +1454,7 @@ function findNegContrast(text) {
   for (let i = 0; i < sentences.length; i++) {
     const cur = sentences[i];
     const next = sentences[i + 1] || '';
-    const oneSentence = /(^|[\s«"(])не\s[^.!?]{1,120},\s*а\s/i.test(cur) || /не потому,? что[^.!?]{1,120},\s*а потому/i.test(cur);
+    const oneSentence = /(^|[\s«"(])не\s[^.!?]{1,120},\s*а\s/i.test(cur) || /[^.!?]{3,120},\s*а не\s/i.test(cur) || /не потому,? что[^.!?]{1,120},\s*а потому/i.test(cur);
     const twoSentences = /^(это|речь|дело)?\s*не\s[^.!?]{1,100}[.!?]?$/i.test(cur.trim()) && /^(это|а|просто|именно)\s/i.test(next.trim());
     if (oneSentence) hits.push(cur.trim());
     else if (twoSentences) hits.push((cur.trim() + ' ' + next.trim()).trim());
