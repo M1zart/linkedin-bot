@@ -775,6 +775,9 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // ── Threads: генерация, очередь, действия ──
+  if (threadsRoute(req, res)) return;
+
   // ── Вебхук бота: команда /scheduled и кнопки «Отменить» / «Опубликовать сейчас» ──
   if (req.method === 'POST' && req.url === '/api/telegram-webhook') {
     let body = '';
@@ -1775,7 +1778,9 @@ function httpError(status, message) {
 // Токен бота не должен попасть ни в логи, ни в ответы клиенту
 function scrubToken(msg) {
   const s = String(msg);
-  return TELEGRAM_BOT_TOKEN ? s.split(TELEGRAM_BOT_TOKEN).join('***') : s;
+  let r = TELEGRAM_BOT_TOKEN ? s.split(TELEGRAM_BOT_TOKEN).join('***') : s;
+  const tt = process.env.THREADS_ACCESS_TOKEN;
+  return tt ? r.split(tt).join('***') : r;
 }
 
 function friendlyTelegramError(msg) {
@@ -2194,6 +2199,11 @@ function startScheduling() {
   setTimeout(() => recoverStuckPublishing().catch(e => console.error('восстановление очереди:', scrubToken(e.message))), 3000);
   setTimeout(() => schedulerTick(), 4000);
   setInterval(() => schedulerTick(), SCHEDULER_INTERVAL_MS);
+  if (threadsConfigured()) {
+    setTimeout(() => recoverThreadsPublishing().catch(e => console.error('threads: восстановление очереди:', scrubToken(e.message))), 3500);
+    setTimeout(() => threadsTick(), 5000);
+    setInterval(() => threadsTick(), SCHEDULER_INTERVAL_MS);
+  }
   setupTelegramBot().catch(e => { webhookState.status = 'error'; webhookState.error = scrubToken(e.message); console.error('настройка бота:', webhookState.error); });
 }
 
@@ -2251,6 +2261,330 @@ async function sendScheduledList(chatId, userId) {
   for (const row of rows.slice(0, 15)) await botSend(chatId, cardText(row), { reply_markup: botKeyboard(row.id) });
   if (rows.length > 15) await botSend(chatId, `…и ещё ${rows.length - 15}. Показаны ближайшие 15.`);
 }
+
+// ── Threads: генерация партии постов, очередь и автопубликация ──
+// Очередь лежит в той же базе Notion, что и телеграм-очередь, но с отдельными статусами (t_scheduled и т.д.):
+// телеграм-планировщик, вкладка «Очередь» и команда /scheduled их не видят, схему базы менять не нужно.
+// Нужны переменные Railway: THREADS_ACCESS_TOKEN (долгоживущий токен Threads API), THREADS_USER_ID (необязательно, иначе берется через /me).
+const THREADS_TOKEN = process.env.THREADS_ACCESS_TOKEN || '';
+const THREADS_API = 'https://graph.threads.net/v1.0';
+const THREADS_MAX = 500;
+const THREADS_SAFE = 470;                 // генерируем с запасом: эмодзи в лимите считаются по байтам
+const TS = { scheduled: 't_scheduled', publishing: 't_publishing', published: 't_published', failed: 't_failed', missed: 't_missed', cancelled: 't_cancelled' };
+const THREADS_SLOTS = ['12:30', '19:30'];  // время Варшавы для автоподстановки
+let threadsUserIdCache = process.env.THREADS_USER_ID || '';
+const tSleep = ms => new Promise(r => setTimeout(r, ms));
+const threadsConfigured = () => !!THREADS_TOKEN;
+
+function threadsLength(text) {
+  let n = 0;
+  for (const ch of String(text || '')) {
+    const c = ch.codePointAt(0);
+    n += c > 0xFFFF ? 4 : (c >= 0x2190 && c <= 0x2BFF ? 3 : 1);
+  }
+  return n;
+}
+
+async function threadsReq(method, p, params = {}) {
+  const body = new URLSearchParams({ ...params, access_token: THREADS_TOKEN });
+  let resp;
+  if (method === 'GET') {
+    const u = new URL(THREADS_API + p);
+    body.forEach((v, k) => u.searchParams.set(k, v));
+    resp = await fetch(u);
+  } else {
+    resp = await fetch(THREADS_API + p, { method, headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body });
+  }
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) {
+    const m = (data.error && data.error.message) || ('HTTP ' + resp.status);
+    const e = new Error('Threads: ' + String(m).split(THREADS_TOKEN).join('***'));
+    e.httpStatus = 502;
+    throw e;
+  }
+  return data;
+}
+
+async function threadsUserId() {
+  if (threadsUserIdCache) return threadsUserIdCache;
+  const me = await threadsReq('GET', '/me', { fields: 'id,username' });
+  threadsUserIdCache = me.id;
+  return threadsUserIdCache;
+}
+
+async function publishToThreads(text) {
+  if (!threadsConfigured()) throw httpError(503, 'Threads не настроен: задай THREADS_ACCESS_TOKEN в переменных Railway');
+  if (!String(text || '').trim()) throw httpError(400, 'Пустой текст поста');
+  const len = threadsLength(text);
+  if (len > THREADS_MAX) throw httpError(400, `Пост длиннее лимита Threads: ${len} из ${THREADS_MAX}`);
+  const uid = await threadsUserId();
+  const container = await threadsReq('POST', `/${uid}/threads`, { media_type: 'TEXT', text });
+  let pub = null, lastErr = null;
+  for (let i = 0; i < 4 && !pub; i++) {
+    await tSleep(i === 0 ? 4000 : 8000);   // контейнеру нужно время; для текста обычно хватает пары секунд
+    try { pub = await threadsReq('POST', `/${uid}/threads_publish`, { creation_id: container.id }); }
+    catch (e) { lastErr = e; }
+  }
+  if (!pub) throw lastErr || new Error('Threads не опубликовал пост');
+  let link = null;
+  try { link = (await threadsReq('GET', `/${pub.id}`, { fields: 'permalink' })).permalink || null; } catch { /* ссылка не критична */ }
+  return { id: pub.id, link };
+}
+
+async function tCreate(text, iso, owner) {
+  const page = await notionReq('POST', '/v1/pages', {
+    parent: { type: 'data_source_id', data_source_id: NOTION_SCHEDULE_DS_ID },
+    properties: {
+      Name: { title: [{ type: 'text', text: { content: '🧵 ' + (shortPreview(text, 70) || 'Threads') } }] },
+      Text: { rich_text: toRichText(text) },
+      'Publish At': { date: { start: iso } },
+      Status: { select: { name: TS.scheduled } },
+      Owner: { number: owner }
+    }
+  });
+  return pageToRow(page);
+}
+
+async function runThreadsPost(row, { checkStale = true, notify = true } = {}) {
+  if (schedInFlight.has(row.id)) return { status: 'busy' };
+  schedInFlight.add(row.id);
+  try {
+    const late = Date.now() - Date.parse(row.publishAt);
+    if (checkStale && late > SCHEDULE_STALE_MS) {
+      const err = `Просрочен на ${Math.round(late / 60000)} мин (сервер был недоступен). Автоматически не опубликован`;
+      await schedUpdate(row.id, { status: TS.missed, error: err });
+      if (notify) await notifyOwner(row, `⚠️ Пост в Threads не вышел вовремя: ${err}.\n\n${shortPreview(row.text)}`);
+      return { status: 'missed', error: err };
+    }
+    await schedUpdate(row.id, { status: TS.publishing });
+    let result;
+    try {
+      result = await publishToThreads(row.text);
+    } catch (e) {
+      const msg = scrubToken(e.message);
+      await schedUpdate(row.id, { status: TS.failed, error: msg }).catch(() => {});
+      if (notify) await notifyOwner(row, `❌ Не удалось опубликовать в Threads:\n${msg}\n\n${shortPreview(row.text)}`);
+      return { status: 'failed', error: msg };
+    }
+    await schedUpdate(row.id, { status: TS.published, link: result.link }).catch(e => console.error('threads: статус published не записан:', scrubToken(e.message)));
+    if (notify) await notifyOwner(row, `✅ Опубликовано в Threads${result.link ? '\n' + result.link : ''}\n\n${shortPreview(row.text)}`);
+    return { status: 'published', link: result.link };
+  } finally {
+    schedInFlight.delete(row.id);
+  }
+}
+
+let threadsTickRunning = false;
+async function threadsTick() {
+  if (threadsTickRunning || !threadsConfigured() || !scheduleConfigured() || !TELEGRAM_BOT_TOKEN) return;
+  threadsTickRunning = true;
+  try {
+    const due = await schedQuery({ and: [{ property: 'Status', select: { equals: TS.scheduled } }, { property: 'Publish At', date: { on_or_before: new Date().toISOString() } }] }, 25);
+    for (const row of due) await runThreadsPost(row, { checkStale: true, notify: true });
+  } catch (e) {
+    console.error('threads: ошибка планировщика:', scrubToken(e.message));
+  } finally {
+    threadsTickRunning = false;
+  }
+}
+
+async function recoverThreadsPublishing() {
+  const rows = await schedQuery({ property: 'Status', select: { equals: TS.publishing } }, 25);
+  for (const row of rows) {
+    if (Date.now() - Date.parse(row.publishAt) < 5 * 60 * 1000 || schedInFlight.has(row.id)) continue;
+    const err = 'Публикация оборвалась при перезапуске сервера. Проверь Threads: пост мог выйти. Автоматически не повторяется';
+    await schedUpdate(row.id, { status: TS.failed, error: err });
+    await notifyOwner(row, `⚠️ ${err}.\n\n${shortPreview(row.text)}`);
+  }
+}
+
+// Ближайшие свободные слоты (Варшава) в формате «ДД.ММ ЧЧ:ММ»; taken: множество уже занятых моментов (мс, округленные до минуты)
+function nextThreadsSlots(n, taken = new Set()) {
+  const out = [];
+  const now = Date.now();
+  const base = warsawParts(now);
+  for (let off = 0; off < 120 && out.length < n; off++) {
+    const dt = new Date(Date.UTC(base.y, base.mo - 1, base.d + off));
+    const y = dt.getUTCFullYear(), mo = dt.getUTCMonth() + 1, d = dt.getUTCDate();
+    for (const slot of THREADS_SLOTS) {
+      if (out.length >= n) break;
+      const [h, mi] = slot.split(':').map(Number);
+      const ms = warsawToUtcMs(y, mo, d, h, mi);
+      if (ms === null || ms < now + 10 * 60 * 1000) continue;
+      if (taken.has(Math.floor(ms / 60000))) continue;
+      out.push(`${String(d).padStart(2, '0')}.${String(mo).padStart(2, '0')} ${slot}`);
+    }
+  }
+  return out;
+}
+
+const THREADS_FORMATS = {
+  mechanics: 'МЕХАНИКА ДЕНЕГ И ВЕРОЯТНОСТИ простым языком: почему казино и букмекер в плюсе при том что отдельный игрок иногда выигрывает, почему «почти выиграл» ничего не значит, как работает маржа, почему экспресс бьет по ожиданию, ошибка игрока (после пяти красных «пора на черное»). Только общеизвестная математика и логика, любой факт можно проверить.',
+  humor: 'СУХОЙ САРКАЗМ про индустрию, риск и жизнь рядом со ставками: одна наблюдательная мысль в одну-три строки, без смайлов, без объяснения шутки. Серьезным тоном, как будто это обычное наблюдение.',
+  decisions: 'РЕШЕНИЯ В УСЛОВИЯХ НЕОПРЕДЕЛЕННОСТИ: покер, шахматы, трейдинг линии, ставки на ожидание. Короткие тезисы про разницу между хорошим решением и хорошим результатом, про цену ошибки, про терпение. Без коучинга и без «ты сможешь».',
+  question: 'ВОПРОС К АУДИТОРИИ: одна-две строки контекста и один конкретный вопрос, на который хочется ответить своим мнением (про ставки, риск, покер, спорт, деньги). Не опрос из двух вариантов.',
+  mix: 'МИКС: примерно 40% механика денег и вероятности, 30% сухой сарказм, 20% решения в условиях неопределенности, 10% вопрос к аудитории'
+};
+
+function threadsSystemPrompt(format) {
+  return `Ты пишешь короткие посты для Threads от имени Дмитрия Скакунова: 18 лет в гемблинге, руководитель направления спортбука. Аудитория очень широкая: не только индустрия, а любой взрослый читатель, которому интересны деньги, риск, вероятность, спорт и покер. Язык русский.
+
+ФОРМАТ ПОСТОВ: ${THREADS_FORMATS[format] || THREADS_FORMATS.mix}
+
+ТРЕБОВАНИЯ:
+- Одна мысль на пост. Длина до 400 символов, чаще 150-300. Первая строка цепляет сама, без вступлений.
+- Голос человека, который видел это изнутри индустрии, но без выдуманных историй: никаких «я видел», «у нас был случай», «в моей практике», «однажды». Только общеизвестная механика и логика, которые можно проверить.
+- Никаких выдуманных цифр, компаний, исследований. Числа только общеизвестные (например, в европейской рулетке 37 ячеек), не больше двух на пост. Проценты знаком %.
+- Не мотивационный тон, не коучинг, не советы жить правильно, не «ты можешь».
+- Запрещено: «не X, а Y» и «это не X, это Y» в любом виде, «Вот как», «Вот что», «Результат?», «Честно говоря», вопрос-приманка в конце (кроме формата вопроса), хэштеги, ссылки, названия сайтов, эмодзи, буква ё, тире (только запятые и двоеточия), скобки.
+- Не писать про американский рынок гемблинга. Не использовать слово «книга» в значении линии букмекера.
+- Минимум англицизмов: если есть нормальное русское слово, использовать его. Термины индустрии (GGR, маржа, прокрут) не расшифровывать.
+- Посты не повторяют друг друга ни темой, ни первой строкой, ни ритмом.
+
+ФОРМАТ ОТВЕТА: только тексты постов, между постами строка из трех решеток ### . Без нумерации, заголовков и пояснений.`;
+}
+
+const THREADS_BAD = [
+  [/https?:\/\/|www\.|\b[a-z0-9-]+\.(com|ru|net|io|bet|org)\b/i, 'ссылка или домен'],
+  [/(^|\s)#\S/, 'хэштег'],
+  [/(^|[^а-яё])я (видел|помню|наблюдал|работал)|в моей практике|у нас (был|была|было|были)([^а-яё]|$)|однажды|как-то раз/i, 'выдуманный личный опыт'],
+  [/(^|[^а-яё])книг[аиуе]([^а-яё]|$)/i, 'слово «книга»'],
+  [/(^|[^а-яё])вот (как|что)([^а-яё]|$)|честно говоря|^результат\?/im, 'шаблонная фраза']
+];
+
+function validateThreadsPost(t) {
+  if (threadsLength(t) > THREADS_SAFE) return 'слишком длинный';
+  for (const [re, why] of THREADS_BAD) if (re.test(t)) return why;
+  if (findNegContrast(t).length) return 'конструкция «не X, а Y»';
+  return null;
+}
+
+async function generateThreadsBatch(format, count) {
+  if (!ANTHROPIC_API_KEY) throw httpError(503, 'Не задан ANTHROPIC_API_KEY');
+  const want = Math.min(Math.max(Number(count) || 7, 1), 14);
+  const raw = await claudeCall(threadsSystemPrompt(format), `Напиши ${want + 3} разных постов.`, 3500);
+  if (!raw) throw httpError(502, 'Модель не ответила');
+  const posts = [];
+  let dropped = 0;
+  for (const part of raw.split(/\n\s*#{3}\s*\n?/)) {
+    const t = noYo(part.replace(/^\s*\d+[.)]\s+/, '').trim());
+    if (!t) continue;
+    if (validateThreadsPost(t)) { dropped++; continue; }
+    if (posts.length < want) posts.push(t);
+  }
+  if (!posts.length) throw httpError(502, 'Все черновики не прошли проверку, нажми еще раз');
+  return { posts, dropped };
+}
+
+function readJsonBody(req, limit = 256 * 1024) {
+  return new Promise((resolve, reject) => {
+    let body = '';
+    req.on('data', c => { body += c; if (body.length > limit) { req.destroy(); reject(httpError(413, 'Слишком большой запрос')); } });
+    req.on('end', () => { try { resolve(body ? JSON.parse(body) : {}); } catch { reject(httpError(400, 'Некорректный JSON')); } });
+    req.on('error', reject);
+  });
+}
+
+// Все маршруты /api/threads-*; возвращает true, если маршрут обработан
+function threadsRoute(req, res) {
+  const url = req.url.split('?')[0];
+  if (!url.startsWith('/api/threads-')) return false;
+  const send = (status, obj) => { res.writeHead(status, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(obj)); };
+  (async () => {
+    try {
+      if (url === '/api/threads-diag') {
+        const out = { tokenPresent: threadsConfigured(), scheduleConfigured: scheduleConfigured() };
+        if (threadsConfigured()) {
+          try { const me = await threadsReq('GET', '/me', { fields: 'id,username' }); out.tokenOk = !!me.id; }
+          catch (e) { out.tokenOk = false; out.error = scrubToken(e.message); }
+        }
+        return send(200, out);
+      }
+      const auth = await authorizeUser(req);
+      if (!auth.ok) return send(auth.status, { error: auth.error });
+      if (!scheduleConfigured()) return send(503, { error: 'Расписание не настроено: нужен NOTION_API_KEY в переменных Railway' });
+
+      if (req.method === 'GET' && url === '/api/threads-queue') {
+        const rows = await schedQuery({ and: [
+          { property: 'Owner', number: { equals: Number(auth.userId) } },
+          { or: [{ property: 'Status', select: { equals: TS.scheduled } }, { property: 'Status', select: { equals: TS.missed } }, { property: 'Status', select: { equals: TS.failed } }] }
+        ] }, 100);
+        const cutoff = Date.now() - 14 * 24 * 3600 * 1000;
+        const items = rows
+          .filter(r => r.status === TS.scheduled || (r.publishAt && Date.parse(r.publishAt) >= cutoff))
+          .map(r => ({ id: r.id, text: r.text, status: r.status.replace(/^t_/, ''), publishAt: r.publishAt, local: r.publishAt ? formatWarsaw(r.publishAt) : '', error: r.error || '' }));
+        return send(200, { items, configured: threadsConfigured() });
+      }
+
+      if (req.method === 'POST' && url === '/api/threads-generate') {
+        const { format, count } = await readJsonBody(req);
+        const batch = await generateThreadsBatch(format, count);
+        const rows = await schedQuery({ and: [{ property: 'Status', select: { equals: TS.scheduled } }, { property: 'Owner', number: { equals: Number(auth.userId) } }] }, 100);
+        const taken = new Set(rows.filter(r => r.publishAt).map(r => Math.floor(Date.parse(r.publishAt) / 60000)));
+        const slots = nextThreadsSlots(batch.posts.length, taken);
+        return send(200, { posts: batch.posts.map((text, i) => ({ text, when: slots[i] || '' })), dropped: batch.dropped });
+      }
+
+      if (req.method === 'POST' && url === '/api/threads-schedule') {
+        if (!threadsConfigured()) return send(503, { error: 'Threads не настроен: задай THREADS_ACCESS_TOKEN в переменных Railway' });
+        const { items } = await readJsonBody(req, 1024 * 1024);
+        if (!Array.isArray(items) || !items.length) return send(400, { error: 'Нет постов для очереди' });
+        if (items.length > 30) return send(400, { error: 'За раз можно поставить не больше 30 постов' });
+        // Сначала проверяем все, чтобы не поставить в очередь половину партии
+        const prepared = items.map((it, i) => {
+          const text = noYo(String(it.text || '').trim());
+          if (!text) throw httpError(400, `Пост ${i + 1}: пустой текст`);
+          const len = threadsLength(text);
+          if (len > THREADS_MAX) throw httpError(400, `Пост ${i + 1}: ${len} символов, лимит ${THREADS_MAX}`);
+          const parsed = parseWarsawDateTime(it.when);
+          if (!parsed.ok) throw httpError(400, `Пост ${i + 1}: ${parsed.error}`);
+          return { text, iso: parsed.iso };
+        });
+        for (const p of prepared) await tCreate(p.text, p.iso, Number(auth.userId));
+        return send(200, { ok: true, count: prepared.length });
+      }
+
+      if (req.method === 'POST' && url === '/api/threads-action') {
+        const { id, action, when } = await readJsonBody(req, 64 * 1024);
+        if (!/^[0-9a-f-]{32,40}$/i.test(String(id || ''))) return send(400, { error: 'Некорректный id поста' });
+        if (!['cancel', 'publish', 'reschedule'].includes(action)) return send(400, { error: 'Неизвестное действие' });
+        let row;
+        try { row = await schedGet(id); } catch { return send(404, { error: 'Пост не найден или очередь недоступна' }); }
+        if (String(row.owner) !== auth.userId) return send(403, { error: 'Это не твой пост' });
+        if (!String(row.status || '').startsWith('t_')) return send(403, { error: 'Это не пост Threads' });
+        if (action === 'reschedule') {
+          // Переносить можно и сорвавшийся пост: он снова становится запланированным
+          if (![TS.scheduled, TS.missed, TS.failed].includes(row.status)) return send(409, { error: `Пост уже не в очереди: ${row.status}` });
+          const parsed = parseWarsawDateTime(when);
+          if (!parsed.ok) return send(400, { error: parsed.error });
+          if (schedInFlight.has(row.id)) return send(409, { error: 'Пост публикуется прямо сейчас' });
+          await schedUpdate(row.id, { publishAt: parsed.iso, status: TS.scheduled, error: '' });
+          return send(200, { ok: true, local: formatWarsaw(parsed.iso) });
+        }
+        if (row.status !== TS.scheduled && !(action === 'publish' && (row.status === TS.missed || row.status === TS.failed))) {
+          return send(409, { error: `Пост уже не в очереди: ${row.status}` });
+        }
+        if (action === 'cancel') {
+          if (schedInFlight.has(row.id)) return send(409, { error: 'Пост публикуется прямо сейчас' });
+          await schedUpdate(row.id, { status: TS.cancelled });
+          return send(200, { ok: true, status: 'cancelled' });
+        }
+        // Повторная публикация сорвавшегося поста: failed мог частично выйти, поэтому только по явному нажатию
+        const r = await runThreadsPost({ ...row, publishAt: row.publishAt || new Date().toISOString() }, { checkStale: false, notify: false });
+        if (r.status === 'published') return send(200, { ok: true, status: 'published', link: r.link || null });
+        if (r.status === 'busy') return send(409, { error: 'Пост уже публикуется' });
+        return send(502, { error: `Не удалось опубликовать: ${r.error}` });
+      }
+
+      return send(404, { error: 'Нет такого маршрута' });
+    } catch (err) {
+      console.error('threads route error:', scrubToken(err.message));
+      send(err.httpStatus || 500, { error: scrubToken(err.message) });
+    }
+  })();
+  return true;
+}
+// ── конец блока Threads ──
 
 // ── Ответы на комментарии под постами канала ──
 // Бот должен быть админом в группе обсуждений (или у него выключен режим приватности). Он видит новый комментарий,

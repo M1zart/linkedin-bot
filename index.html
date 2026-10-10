@@ -780,6 +780,7 @@
     <button class="tab tg-tab" onclick="switchMode('newsquote')">Готовый</button>
     <button class="tab" onclick="switchMode('digest')">Дайджест</button>
     <button class="tab" onclick="switchMode('queue')">Очередь</button>
+    <button class="tab" onclick="switchMode('threads')">Threads</button>
   </div>
 
   <!-- Режим 1: По теме -->
@@ -863,6 +864,37 @@
     <div class="digest-meta" id="queue-meta" style="display:block;">Загружаю очередь…</div>
     <div id="queue-list"></div>
     <button class="action-btn" id="queue-refresh" onclick="loadQueue()" style="width:100%;margin-top:4px;">Обновить</button>
+  </div>
+
+  <!-- Threads: партия постов, очередь, автопубликация -->
+  <div id="mode-threads" class="mode-panel">
+    <div class="digest-meta" id="th-meta" style="display:block;">Посты для широкой аудитории, до 500 символов. Время по Варшаве, слоты 12:30 и 19:30.</div>
+    <div class="field-label">Формат</div>
+    <select id="th-format">
+      <option value="mix">Микс</option>
+      <option value="mechanics">Механика денег и вероятности</option>
+      <option value="humor">Сухой сарказм</option>
+      <option value="decisions">Решения в неопределенности</option>
+      <option value="question">Вопрос к аудитории</option>
+    </select>
+    <div class="field-label">Сколько постов</div>
+    <select id="th-count">
+      <option value="5">5</option>
+      <option value="7" selected>7</option>
+      <option value="10">10</option>
+      <option value="14">14</option>
+    </select>
+    <button class="generate-btn" id="th-gen-btn" onclick="thGenerate()">Сгенерировать партию</button>
+    <div class="digest-meta" id="th-batch-meta"></div>
+    <div id="th-batch"></div>
+    <div id="th-batch-actions" style="display:none;">
+      <button class="action-btn" onclick="thAddOwn()" style="width:100%;margin-bottom:8px;">Добавить свой пост</button>
+      <button class="generate-btn tg-btn" id="th-queue-all" onclick="thScheduleAll()">Поставить все в очередь</button>
+    </div>
+    <div class="field-label" style="margin-top:20px;">В очереди Threads</div>
+    <div class="digest-meta" id="th-queue-meta" style="display:block;">Загружаю…</div>
+    <div id="th-queue"></div>
+    <button class="action-btn" onclick="thLoadQueue()" style="width:100%;margin-top:4px;">Обновить</button>
   </div>
 
   <div id="mode-digest" class="mode-panel">
@@ -1011,7 +1043,7 @@
 
     function switchMode(mode) {
       currentMode = mode;
-      const tabOrder = ['topic', 'thought', 'comment', 'telegram', 'newsquote', 'digest', 'queue'];
+      const tabOrder = ['topic', 'thought', 'comment', 'telegram', 'newsquote', 'digest', 'queue', 'threads'];
       document.querySelectorAll('.tab').forEach((t, i) => {
         t.classList.toggle('active', tabOrder[i] === mode);
       });
@@ -1020,6 +1052,7 @@
       hideResult();
       hideCommentsResult();
       if (mode === 'queue') loadQueue();
+      if (mode === 'threads') thLoadQueue();
     }
 
     document.querySelectorAll('.tone-selector').forEach(selector => {
@@ -2142,6 +2175,171 @@
         queueState.busy = false;
       }
       loadQueue();
+    }
+
+    // ===== THREADS: партия постов, очередь, автопубликация =====
+    const thState = { busy: false, items: [] };
+    const TH_MAX = 500;
+    function thLen(t) {
+      let n = 0;
+      for (const ch of String(t || '')) { const c = ch.codePointAt(0); n += c > 0xFFFF ? 4 : (c >= 0x2190 && c <= 0x2BFF ? 3 : 1); }
+      return n;
+    }
+    const thErr = e => e.message.replace(/ \(HTTP \d+\)$/, '');
+
+    async function thGenerate() {
+      if (thState.busy) return;
+      thState.busy = true;
+      const btn = document.getElementById('th-gen-btn');
+      const meta = document.getElementById('th-batch-meta');
+      btn.disabled = true; btn.textContent = 'Пишу партию…';
+      meta.style.display = 'block'; meta.textContent = 'Генерирую, обычно 20-40 секунд…';
+      try {
+        const data = await queueCall('/api/threads-generate', { method: 'POST', body: JSON.stringify({ format: document.getElementById('th-format').value, count: Number(document.getElementById('th-count').value) }) });
+        thState.items = data.posts.map(p => ({ text: p.text, when: p.when }));
+        meta.textContent = `Готово: ${data.posts.length}.` + (data.dropped ? ` Отбраковано автопроверкой: ${data.dropped}.` : '') + ' Поправь текст и время, потом поставь в очередь.';
+        thRenderBatch();
+      } catch (e) {
+        meta.textContent = thErr(e);
+      } finally {
+        thState.busy = false; btn.disabled = false; btn.textContent = 'Сгенерировать партию';
+      }
+    }
+
+    function thRenderBatch() {
+      const box = document.getElementById('th-batch');
+      box.innerHTML = '';
+      thState.items.forEach((it, idx) => {
+        const card = document.createElement('div');
+        card.className = 'digest-card';
+        const ta = document.createElement('textarea');
+        ta.value = it.text;
+        ta.style.minHeight = '90px';
+        const counter = document.createElement('div');
+        counter.className = 'digest-row';
+        const upd = () => { const n = thLen(ta.value); counter.textContent = `${n} из ${TH_MAX}`; counter.style.color = n > TH_MAX ? 'var(--red)' : ''; };
+        ta.addEventListener('input', () => { it.text = ta.value; upd(); });
+        upd();
+        const row = document.createElement('div');
+        row.className = 'digest-actions';
+        const when = document.createElement('input');
+        when.type = 'text'; when.value = it.when; when.placeholder = 'ДД.ММ ЧЧ:ММ';
+        when.addEventListener('input', () => { it.when = when.value; });
+        when.style.flex = '1';
+        const del = document.createElement('button');
+        del.className = 'action-btn'; del.textContent = 'Убрать';
+        del.addEventListener('click', () => { thState.items.splice(idx, 1); thRenderBatch(); });
+        row.appendChild(when); row.appendChild(del);
+        card.appendChild(ta); card.appendChild(counter); card.appendChild(row);
+        box.appendChild(card);
+      });
+      document.getElementById('th-batch-actions').style.display = thState.items.length || document.getElementById('th-batch-meta').textContent ? 'block' : 'none';
+      document.getElementById('th-queue-all').style.display = thState.items.length ? '' : 'none';
+    }
+
+    function thAddOwn() {
+      thState.items.push({ text: '', when: '' });
+      thRenderBatch();
+    }
+
+    async function thScheduleAll() {
+      if (thState.busy) return;
+      const items = thState.items.filter(i => i.text.trim());
+      if (!items.length) { showToast('Нет постов', true); return; }
+      const bad = items.findIndex(i => thLen(i.text) > TH_MAX);
+      if (bad >= 0) { showToast(`Пост ${bad + 1} длиннее ${TH_MAX} символов`, true); return; }
+      if (items.some(i => !i.when.trim())) { showToast('У каждого поста должно быть время ДД.ММ ЧЧ:ММ', true); return; }
+      if (!(await confirmAsk(`Поставить в очередь постов: ${items.length}? Они выйдут в Threads сами.`))) return;
+      thState.busy = true;
+      const btn = document.getElementById('th-queue-all');
+      btn.disabled = true; btn.textContent = 'Ставлю в очередь…';
+      try {
+        await queueCall('/api/threads-schedule', { method: 'POST', body: JSON.stringify({ items: items.map(i => ({ text: i.text, when: i.when })) }) });
+        showToast(`В очереди: ${items.length}`);
+        thState.items = [];
+        document.getElementById('th-batch-meta').textContent = '';
+        thRenderBatch();
+      } catch (e) {
+        showToast(thErr(e), true);
+      } finally {
+        thState.busy = false; btn.disabled = false; btn.textContent = 'Поставить все в очередь';
+      }
+      thLoadQueue();
+    }
+
+    async function thLoadQueue() {
+      const meta = document.getElementById('th-queue-meta');
+      const list = document.getElementById('th-queue');
+      meta.style.display = 'block';
+      try {
+        const data = await queueCall('/api/threads-queue');
+        const planned = data.items.filter(i => i.status === 'scheduled');
+        meta.textContent = (planned.length ? `Запланировано: ${planned.length}.` : 'Запланированных постов нет.') + (data.configured ? '' : ' Threads не подключен: нет THREADS_ACCESS_TOKEN в Railway, публикация не пойдет.');
+        thRenderQueue(data.items);
+      } catch (e) {
+        list.innerHTML = '';
+        meta.textContent = thErr(e);
+      }
+    }
+
+    function thRenderQueue(items) {
+      const list = document.getElementById('th-queue');
+      list.innerHTML = '';
+      const labels = { missed: 'Не вышел: просрочен', failed: 'Не вышел: ошибка публикации' };
+      items.forEach(it => {
+        const card = document.createElement('div');
+        card.className = 'digest-card queue-card' + (it.status === 'scheduled' ? '' : ' failed');
+        const title = document.createElement('div');
+        title.className = 'digest-title';
+        title.textContent = '🕒 ' + (it.local || 'время не задано') + (it.status === 'scheduled' ? '' : ' · ' + (labels[it.status] || it.status));
+        const head = document.createElement('div'); head.className = 'digest-head'; head.appendChild(title);
+        const text = document.createElement('div');
+        text.className = 'queue-text open';
+        text.textContent = it.text;
+        card.appendChild(head); card.appendChild(text);
+        if (it.error) { const er = document.createElement('div'); er.className = 'digest-row'; er.textContent = it.error; card.appendChild(er); }
+        const actions = document.createElement('div');
+        actions.className = 'digest-actions';
+        const when = document.createElement('input');
+        when.type = 'text'; when.placeholder = 'ДД.ММ ЧЧ:ММ'; when.style.flex = '1';
+        const mv = document.createElement('button');
+        mv.className = 'action-btn'; mv.textContent = 'Перенести';
+        mv.addEventListener('click', () => thAction(it.id, 'reschedule', mv, when.value));
+        const now = document.createElement('button');
+        now.className = 'action-btn primary tg'; now.textContent = it.status === 'scheduled' ? 'Опубликовать сейчас' : 'Опубликовать снова';
+        now.addEventListener('click', () => thAction(it.id, 'publish', now));
+        const cancel = document.createElement('button');
+        cancel.className = 'action-btn'; cancel.textContent = 'Отменить';
+        cancel.addEventListener('click', () => thAction(it.id, 'cancel', cancel));
+        actions.appendChild(when); actions.appendChild(mv);
+        card.appendChild(actions);
+        const actions2 = document.createElement('div');
+        actions2.className = 'digest-actions';
+        actions2.appendChild(now); actions2.appendChild(cancel);
+        card.appendChild(actions2);
+        list.appendChild(card);
+      });
+    }
+
+    async function thAction(id, action, btn, when) {
+      if (thState.busy) return;
+      if (action === 'reschedule' && !String(when || '').trim()) { showToast('Впиши новое время ДД.ММ ЧЧ:ММ', true); return; }
+      if (action !== 'reschedule') {
+        const ask = action === 'publish' ? 'Опубликовать этот пост в Threads прямо сейчас?' : 'Отменить публикацию? Пост не выйдет.';
+        if (!(await confirmAsk(ask))) return;
+      }
+      thState.busy = true;
+      const old = btn.textContent; btn.disabled = true; btn.textContent = '…';
+      try {
+        await queueCall('/api/threads-action', { method: 'POST', body: JSON.stringify({ id, action, when }) });
+        showToast(action === 'publish' ? 'Опубликовано' : action === 'cancel' ? 'Отменено' : 'Перенесено');
+      } catch (e) {
+        showToast(thErr(e), true);
+        btn.disabled = false; btn.textContent = old;
+      } finally {
+        thState.busy = false;
+      }
+      thLoadQueue();
     }
 
     // ===== ДАЙДЖЕСТ: источник тем для входа 1 =====
