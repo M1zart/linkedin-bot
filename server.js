@@ -2252,9 +2252,176 @@ async function sendScheduledList(chatId, userId) {
   if (rows.length > 15) await botSend(chatId, `…и ещё ${rows.length - 15}. Показаны ближайшие 15.`);
 }
 
+// ── Ответы на комментарии под постами канала ──
+// Бот должен быть админом в группе обсуждений (или у него выключен режим приватности). Он видит новый комментарий,
+// готовит 3 варианта ответа и присылает владельцу карточку. Публикует ответ сам владелец: кнопка копирует вариант
+// в буфер (copy_text), вторая кнопка открывает именно этот комментарий в группе. Ответ уходит с его аккаунта, не от бота.
+const commentCtx = new Map();      // номер карточки -> контекст для «Другие варианты»
+let commentCtxSeq = 0;
+const postRoots = new Map();       // id автопересылки поста в группе -> текст поста
+const seenComments = new Set();
+let commentTimes = [];             // времена обработанных комментариев: потолок против спама
+let linkedChatCache = { id: null, at: 0 };
+const COMMENT_HOURLY_LIMIT = 30;
+const COMMENT_COPY_MAX = 250;      // copy_text в Telegram принимает до 256 символов
+
+function trimMap(map, max) { while (map.size > max) map.delete(map.keys().next().value); }
+
+async function linkedChatId() {
+  if (linkedChatCache.id && Date.now() - linkedChatCache.at < 3600000) return linkedChatCache.id;
+  const chat = await tgApi('getChat', { chat_id: TELEGRAM_CHANNEL_ID });
+  linkedChatCache = { id: chat.linked_chat_id || null, at: Date.now() };
+  return linkedChatCache.id;
+}
+
+// Ответы коротко и без запретных знаков: без тире, без «ё», не длиннее лимита кнопки копирования
+function cleanReply(t) {
+  let x = String(t || '').replace(/\s*[—–]\s*/g, ', ').replace(/\s+-\s+/g, ', ').replace(/ё/g, 'е').replace(/Ё/g, 'Е').replace(/\s+/g, ' ').trim();
+  if (x.length > COMMENT_COPY_MAX) {
+    const cut = x.slice(0, COMMENT_COPY_MAX);
+    const end = Math.max(cut.lastIndexOf('. '), cut.lastIndexOf('? '), cut.lastIndexOf('! '));
+    x = end > 60 ? cut.slice(0, end + 1) : cut.replace(/\s+\S*$/, '') + '…';
+  }
+  return x;
+}
+
+// Стили и правила те же, что во вкладке «Коммент» (getCommentsSystemPrompt): промпт строится из него подменой нескольких фраз,
+// чтобы правки правил в одном месте попадали и в ответы на комментарии. Если фраза в исходном промпте изменится, замена не сработает,
+// и в логе появится предупреждение (тогда подправить список ниже)
+const REPLY_SWAPS = [
+  ['определи язык исходного поста и пиши ВСЕ 7 комментариев', 'определи язык комментария читателя и пиши ВСЕ 7 ответов'],
+  ['Ты пишешь LinkedIn комментарии от имени Дмитрия Скакунова', 'Ты пишешь ответы на комментарии читателей под постом Telegram-канала от имени Дмитрия Скакунова'],
+  ['Тебе дают пост другого человека. Напиши 7 разных вариантов комментария к этому посту, каждый с своим углом.',
+   'Тебе дают пост канала Дмитрия и комментарий читателя под ним (иногда и комментарий, на который тот отвечает). Напиши 7 разных вариантов ОТВЕТА Дмитрия на этот комментарий, каждый с своим углом. Отвечай комментатору по сути, не пересказывай пост. Ответ короче 230 символов.'],
+  ['аккуратно споришь с автором, указываешь на слабое место в логике', 'аккуратно споришь с комментатором, указываешь на слабое место в его логике'],
+  ['короткий вопрос автору который заставляет копнуть глубже', 'короткий встречный вопрос комментатору который заставляет копнуть глубже'],
+  ['ТИПЫ КОММЕНТАРИЕВ', 'ТИПЫ ОТВЕТОВ'],
+  ['ФОРМАТ ОТВЕТА СТРОГО ТАКОЙ:', 'ФОРМАТ ОТВЕТА СТРОГО ТАКОЙ (текст ответа Дмитрия на комментарий читателя):'],
+  ['Если пост слабый или банальный, не хвали его. Можно осторожно указать на нелогичность', 'Если комментарий слабый или банальный, не хвали его. Можно осторожно указать на нелогичность. Не благодари формально'],
+];
+function getReplySystemPrompt() {
+  let p = getCommentsSystemPrompt();
+  for (const [from, to] of REPLY_SWAPS) {
+    if (!p.includes(from)) console.warn('comments: фраза для замены не найдена в промпте комментариев:', from.slice(0, 50));
+    p = p.split(from).join(to);
+  }
+  return p;
+}
+
+const REPLY_LABEL_SHORT = { 'Спокойный': 'Спокойный', 'Практический': 'Практичный', 'С иронией': 'С иронией', 'С несогласием': 'Несогласие', 'С вопросом': 'С вопросом', 'Короткий': 'Короткий', 'Лучший': 'Лучший' };
+
+async function generateReplyVariants(c, avoid = []) {
+  const lang = detectLanguage(c.commentText);
+  const langInstruction = lang === 'uk' ? 'Всі 7 відповідей пиши ВИКЛЮЧНО українською мовою.'
+    : lang === 'en' ? 'Write ALL 7 replies EXCLUSIVELY in English.'
+    : 'Все 7 ответов пиши ИСКЛЮЧИТЕЛЬНО на русском языке.';
+  const parts = [langInstruction];
+  if (c.postText) parts.push('ПОСТ КАНАЛА (автор Дмитрий):\n' + c.postText.slice(0, 3000));
+  if (c.parentText) parts.push('КОММЕНТАРИЙ, НА КОТОРЫЙ ОТВЕЧАЕТ ЧИТАТЕЛЬ НИЖЕ:\n' + c.parentText.slice(0, 800));
+  parts.push(`КОММЕНТАРИЙ${c.author ? ' ОТ ' + c.author : ''}, НА КОТОРЫЙ НУЖЕН ОТВЕТ ДМИТРИЯ:\n` + c.commentText.slice(0, 1200));
+  if (avoid.length) parts.push('ЭТИ ОТВЕТЫ УЖЕ БЫЛИ, ДАЙ ДРУГИЕ ФОРМУЛИРОВКИ И УГЛЫ:\n' + avoid.map((v, i) => `${i + 1}. ${v}`).join('\n'));
+  const raw = await claudeCall(getReplySystemPrompt(), parts.join('\n\n'), 1600);
+  if (!raw) throw new Error('Модель не ответила');
+  let items = parseComments(raw)
+    .map(x => ({ label: REPLY_LABEL_SHORT[x.label] || x.label || 'Вариант', text: cleanReply(x.text) }))
+    .filter(x => x.text);
+  if (!items.length) throw new Error('Пустой ответ модели');
+  // «Лучший» первым: его чаще всего и берут
+  items.sort((p, q) => (q.label === 'Лучший') - (p.label === 'Лучший'));
+  return items.slice(0, 7);
+}
+
+function commentCard(c, variants) {
+  const lines = [`💬 Комментарий${c.author ? ' от ' + c.author : ''}:`, `«${c.commentText.slice(0, 500)}»`];
+  if (c.postText) lines.push('', 'Под постом: «' + c.postText.replace(/\*\*/g, '').replace(/\s+/g, ' ').slice(0, 90) + '…»');
+  lines.push('', 'Варианты ответа:');
+  variants.forEach(v => lines.push(`[${v.label}] ${v.text}`, ''));
+  lines.push('Нажми 📋 нужного стиля, затем «Открыть комментарий», «Ответить» и вставь.');
+  const buttons = variants.map(v => ({ text: `📋 ${v.label}`, copy_text: { text: v.text } }));
+  const rows = [];
+  for (let i = 0; i < buttons.length; i += 2) rows.push(buttons.slice(i, i + 2));
+  if (c.link) rows.push([{ text: '↗️ Открыть комментарий', url: c.link }]);
+  rows.push([{ text: '🔄 Другие варианты', callback_data: 'cx:' + c.id }]);
+  return { text: lines.join('\n').slice(0, 4000), reply_markup: { inline_keyboard: rows } };
+}
+
+async function handleGroupMessage(msg) {
+  if (process.env.TELEGRAM_COMMENTS === 'off' || !TELEGRAM_CHANNEL_ID || !ANTHROPIC_API_KEY) return;
+  let linked;
+  try { linked = await linkedChatId(); } catch (e) { console.error('comments: не получил группу обсуждений:', scrubToken(e.message)); return; }
+  if (!linked || msg.chat.id !== linked) return;
+
+  // Автопересылка поста канала в группу: запоминаем текст, чтобы отвечать на комментарии в ветке (на них Telegram текст поста не присылает)
+  if (msg.is_automatic_forward) {
+    postRoots.set(msg.message_id, msg.text || msg.caption || '');
+    trimMap(postRoots, 100);
+    return;
+  }
+  if ((msg.from && msg.from.is_bot) || msg.sender_chat) return;                                  // боты, сам канал, анонимные админы
+  if (msg.from && TELEGRAM_ALLOWED_USER_IDS.includes(String(msg.from.id))) return;               // свои сообщения
+  const text = String(msg.text || msg.caption || '').trim();
+  if (text.length < 4 || !/[A-Za-zА-Яа-яЁёІіЇїЄєҐґ]{3}/.test(text)) return;                       // пусто, эмодзи, цифры
+  if (/https?:\/\/|t\.me\/|www\.|@\w{4,}/i.test(text)) return;                                    // реклама и ссылки: не тратим на них ответ
+  const key = msg.chat.id + ':' + msg.message_id;
+  if (seenComments.has(key)) return;
+  seenComments.add(key); trimMap(seenComments, 500);
+  const now = Date.now();
+  commentTimes = commentTimes.filter(t => now - t < 3600000);
+  if (commentTimes.length >= COMMENT_HOURLY_LIMIT) { console.log('comments: лимит в час, пропускаю'); return; }
+  commentTimes.push(now);
+
+  const reply = msg.reply_to_message;
+  const thread = msg.message_thread_id || (reply && reply.message_id) || msg.message_id;
+  const rootText = postRoots.get(thread) || (reply && reply.is_automatic_forward ? (reply.text || reply.caption || '') : '');
+  const parentText = reply && !reply.is_automatic_forward ? (reply.text || reply.caption || '') : '';
+  const link = msg.chat.username
+    ? `https://t.me/${msg.chat.username}/${msg.message_id}?thread=${thread}`
+    : `https://t.me/c/${String(msg.chat.id).replace(/^-100/, '')}/${msg.message_id}?thread=${thread}`;
+  const author = msg.from ? [msg.from.first_name, msg.from.username ? '@' + msg.from.username : ''].filter(Boolean).join(' ') : '';
+  const c = { id: ++commentCtxSeq, postText: rootText, parentText, commentText: text, author, link, variants: [] };
+
+  let variants;
+  try { variants = await generateReplyVariants(c); }
+  catch (e) { console.error('comments: не удалось сгенерировать ответы:', scrubToken(e.message)); return; }
+  c.variants = variants;
+  commentCtx.set(c.id, c); trimMap(commentCtx, 200);
+  const card = commentCard(c, variants);
+  for (const uid of TELEGRAM_ALLOWED_USER_IDS) {
+    await botSend(Number(uid), card.text, { reply_markup: card.reply_markup, disable_web_page_preview: true })
+      .catch(e => console.error('comments: карточка не доставлена:', scrubToken(e.message)));
+  }
+  console.log('comments: карточка отправлена, комментарий', key);
+}
+
+// «Другие варианты» на карточке комментария
+async function handleCommentCallback(cb) {
+  const answer = (text, alert = false) => tgApi('answerCallbackQuery', { callback_query_id: cb.id, text, show_alert: alert }).catch(() => {});
+  if (!TELEGRAM_ALLOWED_USER_IDS.includes(String(cb.from.id))) return answer('Нет доступа', true);
+  const c = commentCtx.get(Number(String(cb.data).split(':')[1]));
+  if (!c) return answer('Карточка устарела (бот перезапускался). Дождись следующего комментария.', true);
+  await answer('Пишу другие варианты…');
+  try {
+    const variants = await generateReplyVariants(c, (c.variants || []).map(v => v.text));
+    c.variants = variants;
+    const card = commentCard(c, variants);
+    await tgApi('editMessageText', { chat_id: cb.message.chat.id, message_id: cb.message.message_id, text: card.text, reply_markup: card.reply_markup, disable_web_page_preview: true });
+  } catch (e) {
+    console.error('comments: другие варианты не вышли:', scrubToken(e.message));
+    await tgApi('answerCallbackQuery', { callback_query_id: cb.id, text: 'Не получилось: ' + scrubToken(e.message).slice(0, 150), show_alert: true }).catch(() => {});
+  }
+}
+// ── конец блока ответов на комментарии ──
+
 async function handleBotUpdate(update) {
-  if (update.callback_query) return handleBotCallback(update.callback_query);
+  if (update.callback_query) {
+    if (/^cx:\d+$/.test(String(update.callback_query.data || ''))) return handleCommentCallback(update.callback_query);
+    return handleBotCallback(update.callback_query);
+  }
   const msg = update.message;
+  // Группа обсуждений канала: комментарии под постами
+  if (msg && msg.chat && (msg.chat.type === 'supergroup' || msg.chat.type === 'group')) {
+    return handleGroupMessage(msg).catch(e => console.error('comments error:', scrubToken(e.message)));
+  }
   if (!msg || !msg.from || !msg.chat || msg.chat.type !== 'private') return;
   const userId = String(msg.from.id);
   if (!TELEGRAM_ALLOWED_USER_IDS.includes(userId)) {
