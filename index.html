@@ -1972,8 +1972,8 @@
     })();
 
     // ===== ДАЙДЖЕСТ: источник тем для входа 1 =====
-    // Формат сводки задаёт задание igaming-morning-digest: «N. Заголовок», затем «Что произошло», «Цифра / факт»,
-    // «Почему важно…», «Угол для поста», «Оценка: N/10 · Тема N» и ссылка. Копия из Claude может прийти и с **, и без них.
+    // Формат сводки задаёт задание igaming-morning-digest. Текущий: «**N. Заголовок**», «Что произошло», «Как прокомментировать»
+    // (два варианта), строка «🔗 ссылка · дата». Старый формат («Цифра / факт», «Угол для поста», «Оценка N/10») тоже читается. Копия из Claude может прийти и с **, и без них.
     const digestState = { raw: '', parsed: null, used: new Set() };
     const DIGEST_STORE = 'postbot.digest.v1';
 
@@ -1982,29 +1982,47 @@
       const lines = text.split('\n');
       const strip = s => String(s || '').replace(/\*\*/g, '').replace(/^[\s#>*_`\-–—:]+/, '').replace(/[\s*_`]+$/, '').replace(/^\[(.*)\]$/, '$1').trim();
 
-      // Начала новостей: строки «1. …», «**2. …**», «### 3) …» строго по порядку 1, 2, 3…
-      const itemRe = /^\s*(?:#{1,4}\s*)?(?:\*\*\s*)?(\d{1,2})\s*[.)]\s*(?:\*\*\s*)?(.+?)\s*$/;
-      const starts = [];
-      let expect = 1;
-      lines.forEach((ln, i) => {
-        const m = itemRe.exec(ln);
-        if (m && Number(m[1]) === expect && strip(m[2])) { starts.push({ i, n: expect, title: strip(m[2]) }); expect++; }
-      });
+      // Начала новостей. Строгий вид: «**1. Заголовок**» или «### 1. Заголовок». Если таких нет, берём простые «1. …».
+      // Строгий режим нужен, чтобы пронумерованные варианты комментария «1) …» внутри новости не считались новостями.
+      const strictRe = /^\s*(?:#{1,4}\s*(?:\*\*\s*)?|\*\*\s*)(\d{1,2})\s*[.)]\s*(.+?)\s*$/;
+      const looseRe = /^\s*(\d{1,2})\s*[.)]\s*(.+?)\s*$/;
+      // В простом режиме, если в сводке есть «Что произошло», новость начинается только со строки, за которой
+      // в ближайших трёх строках идёт «Что произошло»
+      const hasWhat = /Что произошло/i.test(text);
+      const followedByWhat = i => lines.slice(i + 1, i + 4).some(l => /Что произошло/i.test(l));
+      const findStarts = (re, needWhat) => {
+        const out = [];
+        let expect = 1;
+        lines.forEach((ln, i) => {
+          const m = re.exec(ln);
+          if (m && Number(m[1]) === expect && strip(m[2]) && (!needWhat || followedByWhat(i))) { out.push({ i, n: expect, title: strip(m[2]) }); expect++; }
+        });
+        return out;
+      };
+      let starts = findStarts(strictRe, false);
+      if (!starts.length) starts = findStarts(looseRe, hasWhat);
 
-      // Конец последней новости: итоговые строки «Главный тренд дня» / «Для Дмитрия»
-      const tail = lines.findIndex((ln, i) => i > (starts.length ? starts[starts.length - 1].i : -1) && /Главный тренд дня|Для Дмитрия|^\s*💡|^\s*🎯/.test(ln));
+      // Конец последней новости: итоговые строки сводки
+      const TAIL_RE = /Главный тренд дня|Для Дмитрия|Напиши номера|^\s*(?:\*\*)?\s*(?:Сбор|Способ сбора)\b|^\s*💡|^\s*🎯/i;
+      const tail = lines.findIndex((ln, i) => i > (starts.length ? starts[starts.length - 1].i : -1) && TAIL_RE.test(ln));
       const endAll = tail === -1 ? lines.length : tail;
 
       const LABELS = [
         ['what', /Что произошло/i],
         ['fact', /Цифра\s*\/\s*факт/i],
         ['why', /Почему важно[^:\n]*/i],
+        ['comment', /Как прокомментировать/i],
         ['angle', /Угол для поста/i],
         ['score', /Оценка/i]
       ];
 
       const items = starts.map((st, k) => {
-        const block = lines.slice(st.i + 1, k + 1 < starts.length ? starts[k + 1].i : endAll).join('\n');
+        let blockLines = lines.slice(st.i + 1, k + 1 < starts.length ? starts[k + 1].i : endAll);
+        // Строка источника «🔗 ссылка · дата» закрывает новость: всё после неё не относится к теме
+        const srcIdx = blockLines.findIndex(ln => /^\s*🔗/.test(ln));
+        const srcLine = srcIdx === -1 ? '' : blockLines[srcIdx];
+        if (srcIdx !== -1) blockLines = blockLines.slice(0, srcIdx);
+        const block = blockLines.join('\n');
         // Позиции меток (с возможными ** вокруг и двоеточием), значение идёт до следующей метки
         const found = [];
         for (const [key, re] of LABELS) {
@@ -2012,7 +2030,7 @@
           if (m) found.push({ key, at: m.index, valueFrom: m.index + m[0].length });
         }
         found.sort((a, b) => a.at - b.at);
-        const it = { n: st.n, title: st.title, what: '', fact: '', why: '', angle: '', score: null, theme: null, url: '', date: '' };
+        const it = { n: st.n, title: st.title, what: '', fact: '', why: '', comment: '', angle: '', score: null, theme: null, url: '', date: '' };
         found.forEach((f, idx) => {
           const val = block.slice(f.valueFrom, idx + 1 < found.length ? found[idx + 1].at : block.length);
           if (f.key === 'score') {
@@ -2020,18 +2038,22 @@
             if (sm) it.score = Number(sm[1]);
             const tm = /Тема\s*(\d{1,2})/i.exec(val);
             if (tm) it.theme = Number(tm[1]);
+          } else if (f.key === 'comment') {
+            // Варианты комментария: по строкам, без маркеров «1)», «—», «•»
+            it.comment = val.split('\n').map(l => strip(l).replace(/^(?:\d+[.)]|[•·])\s*/, '').trim()).filter(Boolean).join(' / ');
           } else {
             it[f.key] = strip(val).replace(/\s*\n\s*/g, ' ');
           }
         });
         if (!found.length) it.what = strip(block).replace(/\s*\n\s*/g, ' ');
 
-        // Источник: ссылка вида [текст](url) или голый url, дата после «·»
-        const md = /\]\((https?:\/\/[^\s)]+)\)/.exec(block);
-        const bare = /(https?:\/\/[^\s)\]>]+)/.exec(block);
+        // Источник: сначала строка 🔗, иначе весь блок. Ссылка вида [текст](url) или голый url, дата после «·»
+        const src = srcLine || block;
+        const md = /\]\((https?:\/\/[^\s)]+)\)/.exec(src);
+        const bare = /(https?:\/\/[^\s)\]>]+)/.exec(src);
         const url = (md && md[1]) || (bare && bare[1]) || '';
         it.url = url.replace(/[.,;]+$/, '');
-        const dm = /(?:https?:\/\/\S+|\))\s*·\s*([^\n]+)/.exec(block);
+        const dm = srcLine ? /·\s*([^\n]+)$/.exec(srcLine) : /(?:https?:\/\/\S+|\))\s*·\s*([^\n]+)/.exec(block);
         if (dm) it.date = strip(dm[1]);
         return it;
       });
@@ -2049,6 +2071,7 @@
       if (it.what) parts.push('Что произошло: ' + q(it.what));
       if (it.fact) parts.push('Цифра / факт: ' + q(it.fact));
       if (it.angle) parts.push('Угол для поста: ' + q(it.angle));
+      if (it.comment) parts.push('Моя позиция (варианты из дайджеста, выбери одну или сведи): ' + q(it.comment));
       return multiline ? parts.join('\n') : parts.join('. ').replace(/\.\.\s/g, '. ');
     }
 
@@ -2092,6 +2115,7 @@
         row('Цифра / факт', it.fact);
         row('Угол для поста', it.angle);
         if (!it.fact && !it.angle) row('Что произошло', it.what);
+        row('Позиция', it.comment);
         if (it.url && /^https?:\/\//.test(it.url)) {
           const r = document.createElement('div');
           r.className = 'digest-row';
