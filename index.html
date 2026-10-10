@@ -870,9 +870,11 @@
   <!-- Threads: партия постов, очередь, автопубликация -->
   <div id="mode-threads" class="mode-panel">
     <div class="digest-meta" id="th-meta" style="display:block;">Посты для широкой аудитории, до 500 символов. Время по Варшаве, слоты 12:30 и 19:30.</div>
-    <div class="field-label">Из источника (редакционный алгоритм)</div>
-    <input type="text" id="ed-title" placeholder="Заголовок или тема" />
-    <input type="text" id="ed-url" placeholder="Ссылка на первичный источник" style="margin-top:8px;" />
+    <div class="field-label" style="display:flex;justify-content:space-between;align-items:center;">
+      <span>Из источника</span>
+      <button class="action-btn" onclick="thClearAll()" style="padding:4px 12px;font-size:12px;">Очистить всё</button>
+    </div>
+    <input type="text" id="ed-url" placeholder="Ссылка на первичный источник" />
     <textarea id="ed-text" placeholder="Текст источника: вставь сюда статью или релиз. Без текста NEWS и FEATURE не пишутся" style="margin-top:8px;min-height:120px;"></textarea>
     <select id="ed-type" style="margin-top:8px;">
       <option value="auto">Тип: определить автоматически</option>
@@ -889,7 +891,6 @@
     </div>
     <button class="generate-btn" id="ed-run" onclick="thEditorRun()">Подготовить пост</button>
     <button class="generate-btn" id="ed-angles" onclick="thAnglesRun()" style="margin-top:8px;">5 постов под разными углами</button>
-    <button class="action-btn" onclick="thClearAll()" style="width:100%;margin-top:8px;">Очистить всё (очередь не трогаю)</button>
     <div id="ed-result"></div>
 
     <div class="field-label">Формат</div>
@@ -2382,7 +2383,7 @@
       const dateVal = '';
       const body = {
         candidate: {
-          title: document.getElementById('ed-title').value.trim(),
+          title: '',
           source_url: document.getElementById('ed-url').value.trim(),
           source_text: document.getElementById('ed-text').value.trim(),
           published_at: dateVal ? new Date(dateVal).toISOString() : '',
@@ -2399,7 +2400,7 @@
         const data = await queueCall('/api/threads-editor', { method: 'POST', body: JSON.stringify(body) });
         edState.last = data;
         edRender(data);
-        box.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        try { box.scrollIntoView({ behavior: 'smooth', block: 'start' }); } catch (_) {}
       } catch (e) {
         box.textContent = thErr(e);
       } finally {
@@ -2408,7 +2409,7 @@
     }
 
     function thClearAll() {
-      ['ed-title', 'ed-url', 'ed-text', 'ed-tg-url', 'ed-tg-extra'].forEach(id => { const el = document.getElementById(id); if (el) el.value = ''; });
+      ['ed-url', 'ed-text', 'ed-tg-url', 'ed-tg-extra'].forEach(id => { const el = document.getElementById(id); if (el) el.value = ''; });
       const t = document.getElementById('ed-type'); if (t) t.value = 'auto';
       const c = document.getElementById('ed-tg'); if (c) { c.checked = false; document.getElementById('ed-tg-box').style.display = 'none'; }
       document.getElementById('ed-result').innerHTML = '';
@@ -2420,14 +2421,14 @@
 
     async function thAnglesRun() {
       if (edState.busy) return;
-      const body = { candidate: { title: document.getElementById('ed-title').value.trim(), source_url: document.getElementById('ed-url').value.trim(), source_text: document.getElementById('ed-text').value.trim() } };
+      const body = { candidate: { title: '', source_url: document.getElementById('ed-url').value.trim(), source_text: document.getElementById('ed-text').value.trim() } };
       const btn = document.getElementById('ed-angles');
       const box = document.getElementById('ed-result');
       edState.busy = true; btn.disabled = true; btn.textContent = 'Пишу 5 углов…'; box.innerHTML = '';
       try {
         const data = await queueCall('/api/threads-angles', { method: 'POST', body: JSON.stringify(body) });
         anglesRender(data);
-        box.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        try { box.scrollIntoView({ behavior: 'smooth', block: 'start' }); } catch (_) {}
       } catch (e) { box.textContent = thErr(e); }
       finally { edState.busy = false; btn.disabled = false; btn.textContent = '5 постов под разными углами'; }
     }
