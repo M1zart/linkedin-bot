@@ -874,8 +874,6 @@
     <input type="text" id="ed-title" placeholder="Заголовок или тема" />
     <input type="text" id="ed-url" placeholder="Ссылка на первичный источник" style="margin-top:8px;" />
     <textarea id="ed-text" placeholder="Текст источника: вставь сюда статью или релиз. Без текста NEWS и FEATURE не пишутся" style="margin-top:8px;min-height:120px;"></textarea>
-    <div class="field-label">Дата публикации источника и тип</div>
-    <input type="datetime-local" id="ed-date" />
     <select id="ed-type" style="margin-top:8px;">
       <option value="auto">Тип: определить автоматически</option>
       <option value="news">NEWS: новость с позицией</option>
@@ -890,6 +888,7 @@
     </div>
     <button class="generate-btn" id="ed-run" onclick="thEditorRun()">Подготовить пост</button>
     <button class="generate-btn" id="ed-angles" onclick="thAnglesRun()" style="margin-top:8px;">5 постов под разными углами</button>
+    <button class="action-btn" onclick="thClearAll()" style="width:100%;margin-top:8px;">Очистить всё (очередь не трогаю)</button>
     <div id="ed-result"></div>
 
     <div class="field-label">Формат</div>
@@ -2379,7 +2378,7 @@
     async function thEditorRun() {
       if (edState.busy) return;
       const tgOn = document.getElementById('ed-tg').checked;
-      const dateVal = document.getElementById('ed-date').value;
+      const dateVal = '';
       const body = {
         candidate: {
           title: document.getElementById('ed-title').value.trim(),
@@ -2404,6 +2403,17 @@
       } finally {
         edState.busy = false; btn.disabled = false; btn.textContent = 'Подготовить пост';
       }
+    }
+
+    function thClearAll() {
+      ['ed-title', 'ed-url', 'ed-text', 'ed-tg-url', 'ed-tg-extra'].forEach(id => { const el = document.getElementById(id); if (el) el.value = ''; });
+      const t = document.getElementById('ed-type'); if (t) t.value = 'auto';
+      const c = document.getElementById('ed-tg'); if (c) { c.checked = false; document.getElementById('ed-tg-box').style.display = 'none'; }
+      document.getElementById('ed-result').innerHTML = '';
+      document.getElementById('th-batch').innerHTML = '';
+      document.getElementById('th-batch-meta').textContent = '';
+      document.getElementById('th-batch-actions').style.display = 'none';
+      thState.items = []; edState.last = null;
     }
 
     async function thAnglesRun() {
