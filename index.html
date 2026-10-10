@@ -2416,6 +2416,41 @@
       title.textContent = (names[r.status] || r.status || 'Нет ответа') + (r.content_type ? ' · ' + r.content_type.toUpperCase() : '') + (r.goal === 'telegram_bridge' ? ' · мост в Telegram' : '');
       card.appendChild(title);
       if (r.reason) { const rs = document.createElement('div'); rs.className = 'digest-row'; rs.textContent = r.reason; card.appendChild(rs); }
+      let ta = null;
+      if (r.post_text) {
+        const lab = document.createElement('div'); lab.className = 'digest-row'; lab.style.fontWeight = '600';
+        lab.textContent = 'Пост для Threads: бот написал его сам по твоему источнику, на русском. Можно править.';
+        card.appendChild(lab);
+        ta = document.createElement('textarea');
+        ta.value = r.post_text; ta.style.width = '100%'; ta.style.boxSizing = 'border-box'; ta.style.minHeight = '220px';
+        const fit = () => { ta.style.height = 'auto'; ta.style.height = Math.max(220, ta.scrollHeight + 4) + 'px'; };
+        const counter = document.createElement('div'); counter.className = 'digest-row';
+        const upd = () => { const n = thLen(ta.value); counter.textContent = `${n} из ${TH_MAX}`; counter.style.color = n > TH_MAX ? 'var(--red)' : ''; fit(); };
+        ta.addEventListener('input', upd);
+        card.appendChild(ta); card.appendChild(counter);
+        setTimeout(upd, 0); upd();
+      }
+      if (ta && r.status === 'ready') {
+        const when = document.createElement('input');
+        when.type = 'datetime-local'; when.value = thToInput(data.slot || '');
+        const q = document.createElement('button');
+        q.className = 'generate-btn tg-btn'; q.textContent = 'Поставить в очередь';
+        q.addEventListener('click', async () => {
+          if (thState.busy) return;
+          if (thLen(ta.value) > TH_MAX) { showToast('Длиннее ' + TH_MAX + ' символов', true); return; }
+          const w = thFromInput(when.value);
+          if (!w) { showToast('Выбери время', true); return; }
+          thState.busy = true; q.disabled = true; q.textContent = 'Ставлю…';
+          try {
+            await queueCall('/api/threads-schedule', { method: 'POST', body: JSON.stringify({ items: [{ text: ta.value, when: w, meta: { type: r.content_type, goal: r.goal || 'reach', company: r.company || '', angle: r.angle || '' } }] }) });
+            showToast('В очереди');
+            box.innerHTML = '';
+          } catch (e) { showToast(thErr(e), true); q.disabled = false; q.textContent = 'Поставить в очередь'; }
+          finally { thState.busy = false; }
+          thLoadQueue();
+        });
+        card.appendChild(when); card.appendChild(q);
+      }
       const meta = [];
       if (r.company) meta.push('Компания: ' + r.company);
       if (r.angle) meta.push('Угол: ' + r.angle);
@@ -2423,40 +2458,13 @@
       if (r.business_mechanism) meta.push('Механика: ' + r.business_mechanism);
       if (r.score && r.score.total !== undefined) meta.push(`Оценка: ${r.score.total} из 12 (интерес ${r.score.interest}, новизна ${r.score.novelty}, клиент ${r.score.customer_face}, механика ${r.score.business_mechanism}, угол ${r.score.author_angle}, доказательность ${r.score.evidence})`);
       if (data.mix) meta.push(`Последние 20: NEWS ${data.mix.news}, FEATURE ${data.mix.feature}, MECHANIC ${data.mix.mechanic}, OPINION ${data.mix.opinion}`);
-      meta.forEach(t => { const d = document.createElement('div'); d.className = 'digest-row'; d.textContent = t; card.appendChild(d); });
-      if (Array.isArray(r.internal_fact_check) && r.internal_fact_check.length) {
-        const d = document.createElement('div'); d.className = 'digest-row';
-        d.textContent = 'Проверка фактов: ' + r.internal_fact_check.map(x => `${x.claim} (${x.support})`).join('; ');
-        card.appendChild(d);
-      }
-      if (r.post_text) {
-        const ta = document.createElement('textarea');
-        ta.value = r.post_text; ta.style.minHeight = '120px';
-        const counter = document.createElement('div'); counter.className = 'digest-row';
-        const upd = () => { const n = thLen(ta.value); counter.textContent = `${n} из ${TH_MAX}`; counter.style.color = n > TH_MAX ? 'var(--red)' : ''; };
-        ta.addEventListener('input', upd); upd();
-        card.appendChild(ta); card.appendChild(counter);
-        if (r.status === 'ready') {
-          const when = document.createElement('input');
-          when.type = 'datetime-local'; when.value = thToInput(data.slot || '');
-          const q = document.createElement('button');
-          q.className = 'generate-btn tg-btn'; q.textContent = 'Поставить в очередь';
-          q.addEventListener('click', async () => {
-            if (thState.busy) return;
-            if (thLen(ta.value) > TH_MAX) { showToast('Длиннее ' + TH_MAX + ' символов', true); return; }
-            const w = thFromInput(when.value);
-            if (!w) { showToast('Выбери время', true); return; }
-            thState.busy = true; q.disabled = true; q.textContent = 'Ставлю…';
-            try {
-              await queueCall('/api/threads-schedule', { method: 'POST', body: JSON.stringify({ items: [{ text: ta.value, when: w, meta: { type: r.content_type, goal: r.goal || 'reach', company: r.company || '', angle: r.angle || '' } }] }) });
-              showToast('В очереди');
-              box.innerHTML = '';
-            } catch (e) { showToast(thErr(e), true); q.disabled = false; q.textContent = 'Поставить в очередь'; }
-            finally { thState.busy = false; }
-            thLoadQueue();
-          });
-          card.appendChild(when); card.appendChild(q);
-        }
+      if (Array.isArray(r.internal_fact_check) && r.internal_fact_check.length) meta.push('Проверка фактов (цитаты из источника на языке оригинала): ' + r.internal_fact_check.map(x => `${x.claim} (${x.support})`).join('; '));
+      if (meta.length) {
+        const det = document.createElement('details'); det.style.marginTop = '10px';
+        const sm = document.createElement('summary'); sm.textContent = 'Подробности и проверка фактов'; sm.style.cursor = 'pointer';
+        det.appendChild(sm);
+        meta.forEach(t => { const d = document.createElement('div'); d.className = 'digest-row'; d.textContent = t; det.appendChild(d); });
+        card.appendChild(det);
       }
       box.appendChild(card);
     }
