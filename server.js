@@ -2203,6 +2203,9 @@ function startScheduling() {
     setTimeout(() => recoverThreadsPublishing().catch(e => console.error('threads: восстановление очереди:', scrubToken(e.message))), 3500);
     setTimeout(() => threadsTick(), 5000);
     setInterval(() => threadsTick(), SCHEDULER_INTERVAL_MS);
+    setTimeout(() => threadsRepliesTick(), 15000);
+    setInterval(() => threadsRepliesTick(), THREADS_REPLIES_EVERY_MS);
+    threadsReplyState.started = true;
   }
   setupTelegramBot().catch(e => { webhookState.status = 'error'; webhookState.error = scrubToken(e.message); console.error('настройка бота:', webhookState.error); });
 }
@@ -2312,13 +2315,13 @@ async function threadsUserId() {
   return threadsUserIdCache;
 }
 
-async function publishToThreads(text) {
+async function publishToThreads(text, replyToId) {
   if (!threadsConfigured()) throw httpError(503, 'Threads не настроен: задай THREADS_ACCESS_TOKEN в переменных Railway');
   if (!String(text || '').trim()) throw httpError(400, 'Пустой текст поста');
   const len = threadsLength(text);
   if (len > THREADS_MAX) throw httpError(400, `Пост длиннее лимита Threads: ${len} из ${THREADS_MAX}`);
   const uid = await threadsUserId();
-  const container = await threadsReq('POST', `/${uid}/threads`, { media_type: 'TEXT', text });
+  const container = await threadsReq('POST', `/${uid}/threads`, { media_type: 'TEXT', text, ...(replyToId ? { reply_to_id: replyToId } : {}) });
   let pub = null, lastErr = null;
   for (let i = 0; i < 4 && !pub; i++) {
     await tSleep(i === 0 ? 4000 : 8000);   // контейнеру нужно время; для текста обычно хватает пары секунд
@@ -2495,7 +2498,7 @@ function threadsRoute(req, res) {
       if (url === '/api/threads-diag') {
         const out = { tokenPresent: threadsConfigured(), scheduleConfigured: scheduleConfigured() };
         if (threadsConfigured()) {
-          try { const me = await threadsReq('GET', '/me', { fields: 'id,username' }); out.tokenOk = !!me.id; }
+          try { const me = await threadsReq('GET', '/me', { fields: 'id,username' }); out.tokenOk = !!me.id; out.replies = threadsReplyState; }
           catch (e) { out.tokenOk = false; out.error = scrubToken(e.message); }
         }
         return send(200, out);
@@ -2633,12 +2636,13 @@ const REPLY_SWAPS = [
   ['ФОРМАТ ОТВЕТА СТРОГО ТАКОЙ:', 'ФОРМАТ ОТВЕТА СТРОГО ТАКОЙ (текст ответа Дмитрия на комментарий читателя):'],
   ['Если пост слабый или банальный, не хвали его. Можно осторожно указать на нелогичность', 'Если комментарий слабый или банальный, не хвали его. Можно осторожно указать на нелогичность. Не благодари формально'],
 ];
-function getReplySystemPrompt() {
+function getReplySystemPrompt(platform) {
   let p = getCommentsSystemPrompt();
   for (const [from, to] of REPLY_SWAPS) {
     if (!p.includes(from)) console.warn('comments: фраза для замены не найдена в промпте комментариев:', from.slice(0, 50));
     p = p.split(from).join(to);
   }
+  if (platform === 'threads') p = p.split('под постом Telegram-канала').join('под постом в Threads').split('Ответ короче 230 символов').join('Ответ короче 230 символов, это комментарий в Threads');
   return p;
 }
 
@@ -2654,7 +2658,7 @@ async function generateReplyVariants(c, avoid = []) {
   if (c.parentText) parts.push('КОММЕНТАРИЙ, НА КОТОРЫЙ ОТВЕЧАЕТ ЧИТАТЕЛЬ НИЖЕ:\n' + c.parentText.slice(0, 800));
   parts.push(`КОММЕНТАРИЙ${c.author ? ' ОТ ' + c.author : ''}, НА КОТОРЫЙ НУЖЕН ОТВЕТ ДМИТРИЯ:\n` + c.commentText.slice(0, 1200));
   if (avoid.length) parts.push('ЭТИ ОТВЕТЫ УЖЕ БЫЛИ, ДАЙ ДРУГИЕ ФОРМУЛИРОВКИ И УГЛЫ:\n' + avoid.map((v, i) => `${i + 1}. ${v}`).join('\n'));
-  const raw = await claudeCall(getReplySystemPrompt(), parts.join('\n\n'), 1600);
+  const raw = await claudeCall(getReplySystemPrompt(c.platform), parts.join('\n\n'), 1600);
   if (!raw) throw new Error('Модель не ответила');
   let items = parseComments(raw)
     .map(x => ({ label: REPLY_LABEL_SHORT[x.label] || x.label || 'Вариант', text: cleanReply(x.text) }))
@@ -2746,9 +2750,163 @@ async function handleCommentCallback(cb) {
 }
 // ── конец блока ответов на комментарии ──
 
+// ── Ответы на комментарии в Threads ──
+// Раз в несколько минут бот смотрит новые ответы под последними постами аккаунта, присылает владельцу карточку
+// с вариантами ответа в 7 стилях. Каждый вариант можно скопировать (и править сам) или отправить в Threads одной кнопкой:
+// ответ уходит с аккаунта владельца через API (reply_to_id).
+// Нужны права threads_read_replies и threads_manage_replies у токена THREADS_ACCESS_TOKEN.
+const THREADS_REPLIES_EVERY_MS = (Number(process.env.THREADS_REPLIES_MINUTES) || 3) * 60 * 1000;
+const THREADS_POSTS_LOOKBACK = 8;                      // сколько последних постов проверять
+const threadsSeen = new Set();                         // id ответов, по которым карточка уже была
+const threadsReplyState = { started: false, baseline: false, lastTickAt: null, lastError: null, lastCards: 0 };
+let threadsMe = null;
+let threadsPermWarned = false;
+let threadsRepliesRunning = false;
+
+async function threadsMyUsername() {
+  if (threadsMe) return threadsMe;
+  const me = await threadsReq('GET', '/me', { fields: 'id,username' });
+  threadsMe = me.username || '';
+  return threadsMe;
+}
+
+// Все ответы под постом (с вложенными). Если API не знает часть полей, повторяем с минимальным набором
+async function threadsConversation(postId) {
+  const fields = 'id,text,username,permalink,timestamp,replied_to,is_reply_owned_by_me';
+  let data;
+  try { data = await threadsReq('GET', `/${postId}/conversation`, { fields, limit: '50' }); }
+  catch (e) {
+    if (/permission|scope|OAuth|access/i.test(e.message)) throw e;
+    data = await threadsReq('GET', `/${postId}/conversation`, { fields: 'id,text,username,permalink,timestamp', limit: '50' });
+  }
+  return data.data || [];
+}
+
+function threadsReplyCard(c, variants, sentIdx = -1) {
+  const lines = [`🧵 Ответ в Threads${c.author ? ' от @' + c.author : ''}:`, `«${c.commentText.slice(0, 500)}»`];
+  if (c.postText) lines.push('', 'Под постом: «' + c.postText.replace(/\s+/g, ' ').slice(0, 90) + '…»');
+  lines.push('', 'Варианты ответа:');
+  variants.forEach(v => lines.push(`[${v.label}] ${v.text}`, ''));
+  if (sentIdx >= 0) lines.push(`✅ Отправлено в Threads: ${variants[sentIdx] ? variants[sentIdx].text : ''}`);
+  else lines.push('📋 копирует текст (можно поправить и отправить самому), 📤 отправляет в Threads сразу.');
+  const rows = [];
+  if (sentIdx < 0) {
+    variants.forEach((v, i) => rows.push([
+      { text: `📋 ${v.label}`, copy_text: { text: v.text } },
+      { text: `📤 ${v.label}`, callback_data: `tp:${c.id}:${i}` }
+    ]));
+  }
+  const last = [];
+  if (c.link) last.push({ text: '↗️ Открыть в Threads', url: c.link });
+  if (sentIdx < 0) last.push({ text: '🔄 Другие варианты', callback_data: `tm:${c.id}` });
+  if (last.length) rows.push(last);
+  return { text: lines.join('\n').slice(0, 4000), reply_markup: { inline_keyboard: rows } };
+}
+
+async function threadsRepliesTick() {
+  if (threadsRepliesRunning || !threadsConfigured() || !ANTHROPIC_API_KEY || !TELEGRAM_BOT_TOKEN || !TELEGRAM_ALLOWED_USER_IDS.length) return;
+  if (process.env.THREADS_REPLIES === 'off') return;
+  threadsRepliesRunning = true;
+  threadsReplyState.lastTickAt = new Date().toISOString();
+  try {
+    const uid = await threadsUserId();
+    const mine = await threadsMyUsername();
+    const posts = (await threadsReq('GET', `/${uid}/threads`, { fields: 'id,text,timestamp', limit: String(THREADS_POSTS_LOOKBACK) })).data || [];
+    const firstPass = !threadsReplyState.baseline;
+    const now = Date.now();
+    const fresh = [];
+    for (const post of posts) {
+      let items;
+      try { items = await threadsConversation(post.id); }
+      catch (e) {
+        if (/permission|scope|OAuth|access/i.test(e.message) && !threadsPermWarned) {
+          threadsPermWarned = true;
+          for (const u of TELEGRAM_ALLOWED_USER_IDS) await botSend(Number(u), '⚠️ Threads: нет доступа к ответам под постами. Добавь в приложении Meta права threads_read_replies и threads_manage_replies, сгенерируй токен заново и обнови THREADS_ACCESS_TOKEN в Railway.').catch(() => {});
+        }
+        throw e;
+      }
+      const byId = new Map(items.map(x => [x.id, x]));
+      for (const it of items) {
+        if (threadsSeen.has(it.id)) continue;
+        threadsSeen.add(it.id);
+        const text = String(it.text || '').trim();
+        if (!text || it.is_reply_owned_by_me === true || (it.username && it.username === mine)) continue;
+        // Первый проход после запуска: старые ответы не поднимаем, только свежие за последние 10 минут
+        if (firstPass && now - Date.parse(it.timestamp || 0) > 10 * 60 * 1000) continue;
+        const parent = it.replied_to && it.replied_to.id && byId.get(it.replied_to.id);
+        fresh.push({ post, it, text, parentText: parent ? String(parent.text || '') : '' });
+      }
+    }
+    threadsReplyState.baseline = true;
+    threadsReplyState.lastError = null;
+    trimMap(threadsSeen, 3000);
+    for (const f of fresh.slice(0, 10)) {
+      const c = { id: ++commentCtxSeq, platform: 'threads', replyId: f.it.id, postText: f.post.text || '', parentText: f.parentText, commentText: f.text, author: f.it.username || '', link: f.it.permalink || '', variants: [], sentIdx: -1 };
+      let variants;
+      try { variants = await generateReplyVariants(c); }
+      catch (e) { console.error('threads replies: не удалось сгенерировать ответы:', scrubToken(e.message)); continue; }
+      c.variants = variants;
+      commentCtx.set(c.id, c); trimMap(commentCtx, 200);
+      const card = threadsReplyCard(c, variants);
+      for (const u of TELEGRAM_ALLOWED_USER_IDS) {
+        await botSend(Number(u), card.text, { reply_markup: card.reply_markup, disable_web_page_preview: true })
+          .catch(e => console.error('threads replies: карточка не доставлена:', scrubToken(e.message)));
+      }
+      threadsReplyState.lastCards++;
+    }
+  } catch (e) {
+    threadsReplyState.lastError = scrubToken(e.message);
+    console.error('threads replies:', threadsReplyState.lastError);
+  } finally {
+    threadsRepliesRunning = false;
+  }
+}
+
+// Кнопки карточки: tp:<id>:<номер варианта> отправить ответ, tm:<id> другие варианты
+async function handleThreadsReplyCallback(cb) {
+  const answer = (text, alert = false) => tgApi('answerCallbackQuery', { callback_query_id: cb.id, text, show_alert: alert }).catch(() => {});
+  if (!TELEGRAM_ALLOWED_USER_IDS.includes(String(cb.from.id))) return answer('Нет доступа', true);
+  const [kind, idStr, idxStr] = String(cb.data).split(':');
+  const c = commentCtx.get(Number(idStr));
+  if (!c || c.platform !== 'threads') return answer('Карточка устарела (бот перезапускался). Дождись следующего ответа.', true);
+  const edit = card => tgApi('editMessageText', { chat_id: cb.message.chat.id, message_id: cb.message.message_id, text: card.text, reply_markup: card.reply_markup, disable_web_page_preview: true });
+
+  if (kind === 'tm') {
+    await answer('Пишу другие варианты…');
+    try {
+      const variants = await generateReplyVariants(c, (c.variants || []).map(v => v.text));
+      c.variants = variants;
+      await edit(threadsReplyCard(c, variants));
+    } catch (e) {
+      await answer('Не получилось: ' + scrubToken(e.message).slice(0, 150), true);
+    }
+    return;
+  }
+
+  // Отправка ответа
+  const idx = Number(idxStr);
+  const v = c.variants && c.variants[idx];
+  if (!v) return answer('Вариант не найден, обнови карточку', true);
+  if (c.sentIdx >= 0) return answer('Ответ уже отправлен', true);
+  if (c.sending) return answer('Уже отправляю…');
+  c.sending = true;
+  await answer('Отправляю в Threads…');
+  try {
+    await publishToThreads(v.text, c.replyId);
+    c.sentIdx = idx;
+    await edit(threadsReplyCard(c, c.variants, idx)).catch(() => {});
+  } catch (e) {
+    await answer('Не отправилось: ' + scrubToken(e.message).slice(0, 180), true);
+  } finally {
+    c.sending = false;
+  }
+}
+// ── конец блока ответов в Threads ──
+
 async function handleBotUpdate(update) {
   if (update.callback_query) {
     if (/^cx:\d+$/.test(String(update.callback_query.data || ''))) return handleCommentCallback(update.callback_query);
+    if (/^(tp:\d+:\d+|tm:\d+)$/.test(String(update.callback_query.data || ''))) return handleThreadsReplyCallback(update.callback_query);
     return handleBotCallback(update.callback_query);
   }
   const msg = update.message;
