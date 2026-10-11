@@ -872,6 +872,13 @@
   <!-- Threads: партия постов, очередь, автопубликация -->
   <div id="mode-threads" class="mode-panel">
     <div class="digest-meta" id="th-meta" style="display:block;">Посты для широкой аудитории, до 500 символов. Время по Варшаве, слоты 12:30 и 19:30.</div>
+    <details id="th-tools" style="margin:10px 0 14px;" ontoggle="if(this.open) thToolsLoad()">
+      <summary style="cursor:pointer;font-size:13px;">Если что-то странное</summary>
+      <div class="digest-meta" id="th-tools-status" style="display:block;margin-top:8px;">Загружаю состояние…</div>
+      <button class="action-btn" onclick="thTool('stats')" style="width:100%;margin-top:8px;">Отчет за вчера, сейчас</button>
+      <button class="action-btn" onclick="thTool('replies')" style="width:100%;margin-top:8px;">Найти ответы за 24 часа</button>
+      <button class="action-btn" onclick="thToolsLoad()" style="width:100%;margin-top:8px;">Обновить состояние</button>
+    </details>
     <div class="field-label" style="display:flex;justify-content:space-between;align-items:center;">
       <span>Из источника</span>
       <button class="action-btn" onclick="thClearAll()" style="padding:4px 12px;font-size:12px;">Очистить всё</button>
@@ -2398,6 +2405,31 @@
       const t = document.getElementById('ed-type'); if (t) t.value = 'auto';
       document.getElementById('ed-result').innerHTML = '';
       edState.last = null;
+    }
+
+    async function thToolsLoad() {
+      const el = document.getElementById('th-tools-status');
+      el.textContent = 'Загружаю состояние…';
+      try {
+        const r = await queueCall('/api/threads-status', {});
+        const lines = [];
+        lines.push(r.tokenPresent ? (r.tokenOk ? '✅ Токен Threads работает' + (r.username ? ' (@' + r.username + ')' : '') : '⚠️ Токен Threads не принимается: ' + (r.error || '')) : '⚠️ Нет токена Threads в Railway');
+        lines.push(r.autoreply ? '🤖 Автоответы включены' : 'Автоответы выключены (ответы кнопкой 📤)');
+        const rp = r.replies || {};
+        lines.push(rp.lastError ? '⚠️ Ответы: ' + rp.lastError : '✅ Сбор ответов без ошибок' + (rp.lastWindow ? ', последнее окно ' + rp.lastWindow.replace(/T/g, ' ').replace(/:00\.000Z/g, '') : ''));
+        const st = r.stats || {};
+        lines.push(st.lastError ? '⚠️ Отчет: ' + st.lastError : '✅ Отчет без ошибок, приходит после ' + r.statsHour + ':00 по Варшаве');
+        el.textContent = lines.join('\n'); el.style.whiteSpace = 'pre-wrap';
+      } catch (e) { el.textContent = '⚠️ ' + thErr(e); }
+    }
+
+    async function thTool(action) {
+      try {
+        showToast(action === 'stats' ? 'Собираю отчет…' : 'Ищу ответы…');
+        const r = await queueCall('/api/threads-tools', { method: 'POST', body: JSON.stringify({ action, hours: 24 }) });
+        showToast(r.message || 'Готово', !r.ok);
+        thToolsLoad();
+      } catch (e) { showToast(thErr(e), true); }
     }
 
     async function thAnglesRun() {

@@ -2517,6 +2517,30 @@ function threadsRoute(req, res) {
       if (!auth.ok) return send(auth.status, { error: auth.error });
       if (!scheduleConfigured()) return send(503, { error: 'Расписание не настроено: нужен NOTION_API_KEY в переменных Railway' });
 
+      if (req.method === 'GET' && url === '/api/threads-status') {
+        const out = { tokenPresent: threadsConfigured(), autoreply: THREADS_AUTOREPLY(), replies: threadsReplyState, stats: statsState, statsHour: STATS_HOUR };
+        if (threadsConfigured()) {
+          try { const me = await threadsReq('GET', '/me', { fields: 'id,username' }); out.tokenOk = !!me.id; out.username = me.username || ''; }
+          catch (e) { out.tokenOk = false; out.error = scrubToken(e.message); }
+        }
+        return send(200, out);
+      }
+
+      if (req.method === 'POST' && url === '/api/threads-tools') {
+        const { action, hours } = await readJsonBody(req);
+        if (action === 'stats') {
+          const r = await statsRun({ manual: true });
+          return send(200, { ok: !!r, message: r ? 'Отчет отправлен в чат с ботом' : 'Отчет уже собирается, подожди минуту' });
+        }
+        if (action === 'replies') {
+          const r = await threadsRepliesTick({ manual: true, hours: Math.min(168, Math.max(1, Number(hours) || 24)) });
+          if (!r) return send(200, { ok: false, message: 'Проверка уже идет, подожди минуту' });
+          if (r.error) return send(200, { ok: false, message: 'Ошибка: ' + r.error.slice(0, 300) });
+          return send(200, { ok: true, message: r.found ? `Нашел ответов: ${r.found}. Карточки в чате с ботом` : 'За этот период чужих ответов нет' });
+        }
+        return send(400, { error: 'Неизвестное действие' });
+      }
+
       if (req.method === 'GET' && url === '/api/threads-queue') {
         const rows = await schedQuery({ and: [
           { property: 'Owner', number: { equals: Number(auth.userId) } },
