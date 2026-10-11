@@ -3328,6 +3328,9 @@ async function buildStatsReport() {
   ]);
   const fromThreads = joins.filter(j => j.text === 'threads').length;
   lines.push(`Пришли по ссылке из Threads: ${fromThreads}. Через другие ссылки или поиск: ${joins.length - fromThreads}.`);
+  const joinsToday = await statsQuery('t_join', [{ property: 'Publish At', date: { on_or_after: new Date(todayStart).toISOString() } }]);
+  const thToday = joinsToday.filter(j => j.text === 'threads').length;
+  lines.push(`Сегодня с начала дня: по ссылке из Threads ${thToday}, остальные ${joinsToday.length - thToday}.`);
   lines.push('Входы считаются с момента, когда бот начал получать эти события.');
   return { text: lines.join('\n'), snapshot, todayStart };
 }
