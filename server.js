@@ -3310,7 +3310,7 @@ async function buildStatsReport() {
     lines.push('Threads', `Просмотры ${u.views || 0}, лайки ${u.likes || 0}, ответы ${u.replies || 0}, репосты ${u.reposts || 0}, цитаты ${u.quotes || 0}`);
     lines.push(`Вышло постов: ${th.postsCount}`);
     if (th.followers != null) { lines.push(`Подписчиков в Threads: ${th.followers}${delta(th.followers, prev && prev.thFollowers)}`); snapshot.thFollowers = th.followers; }
-    if (th.best) lines.push(`Лучший пост: «${String(th.best.post.text || '').replace(/\s+/g, ' ').slice(0, 80)}», просмотров ${th.best.ins.views || 0}, лайков ${th.best.ins.likes || 0}, ответов ${th.best.ins.replies || 0}`);
+    if (th.best) lines.push(`Лучший пост дня (его цифры за все время): «${String(th.best.post.text || '').replace(/\s+/g, ' ').slice(0, 80)}», просмотров ${th.best.ins.views || 0}, лайков ${th.best.ins.likes || 0}, ответов ${th.best.ins.replies || 0}`);
   } else if (th.needPerm) {
     lines.push('Threads', 'Нет доступа к статистике. В приложении Meta добавь право threads_manage_insights, сгенерируй токен заново и обнови THREADS_ACCESS_TOKEN в Railway.');
   } else {
