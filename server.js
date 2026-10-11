@@ -2189,7 +2189,7 @@ async function setupTelegramBot() {
     console.log('У бота уже есть другой вебхук, не трогаю:', info.url);
     return;
   }
-  await tgApi('setWebhook', { url: desired, secret_token: webhookSecret(), allowed_updates: ['message', 'callback_query'] });
+  await tgApi('setWebhook', { url: desired, secret_token: webhookSecret(), allowed_updates: ['message', 'callback_query', 'chat_member'] });
   await tgApi('setMyCommands', { commands: [{ command: 'scheduled', description: 'Запланированные посты' }] });
   webhookState.status = 'active';
 }
@@ -2211,6 +2211,8 @@ function startScheduling() {
     setInterval(() => threadsRepliesTick(), THREADS_REPLIES_EVERY_MS);
     threadsReplyState.started = true;
   }
+  setTimeout(() => statsTick().catch(e => console.error('stats:', scrubToken(e.message))), 25000);
+  setInterval(() => statsTick().catch(e => console.error('stats:', scrubToken(e.message))), 10 * 60 * 1000);
   setupTelegramBot().catch(e => { webhookState.status = 'error'; webhookState.error = scrubToken(e.message); console.error('настройка бота:', webhookState.error); });
 }
 
@@ -3202,7 +3204,164 @@ async function handleThreadsReplyCallback(cb) {
 }
 // ── конец блока ответов в Threads ──
 
+// ── Ежедневный отчет: Threads, канал, переходы из Threads в канал ──
+// Раз в сутки (после STATS_HOUR_WARSAW, по умолчанию 9:00 Варшавы) бот присылает владельцу статистику за вчера.
+// Хранение в Notion: строки со статусом t_stats (снимок чисел на утро) и t_join (каждый вход в канал по пригласительной ссылке).
+// Нужно: у токена Threads право threads_manage_insights; бот админ канала (для числа подписчиков и событий входа).
+const STATS_HOUR = Number(process.env.STATS_HOUR_WARSAW) || 9;
+const THREADS_INVITE_LINK = process.env.THREADS_INVITE_LINK || 'https://t.me/+WLghGJmGwXI3NmYy';
+const statsState = { running: false, lastRunAt: null, lastError: null, joinsSeen: 0 };
+
+const tgLinkCode = l => String(l || '').replace(/^https?:\/\/(t\.me|telegram\.me)\//i, '').replace(/\.+$/, '').trim();
+function isThreadsInvite(il) {
+  if (!il) return false;
+  if (/threads/i.test(String(il.name || ''))) return true;
+  const a = tgLinkCode(il.invite_link), b = tgLinkCode(THREADS_INVITE_LINK);
+  return !!a && !!b && b.startsWith(a);      // Telegram показывает чужие ссылки обрезанными, сравниваем по началу
+}
+
+async function statsCreateRow(name, status, text, iso) {
+  return notionReq('POST', '/v1/pages', {
+    parent: { type: 'data_source_id', data_source_id: NOTION_SCHEDULE_DS_ID },
+    properties: {
+      Name: { title: [{ type: 'text', text: { content: name } }] },
+      Text: { rich_text: toRichText(text) },
+      'Publish At': { date: { start: iso } },
+      Status: { select: { name: status } }
+    }
+  });
+}
+async function statsQuery(status, extraFilters = [], direction = 'descending', size = 100) {
+  try {
+    const data = await notionReq('POST', `/v1/data_sources/${NOTION_SCHEDULE_DS_ID}/query`, {
+      filter: { and: [{ property: 'Status', select: { equals: status } }, ...extraFilters] },
+      sorts: [{ property: 'Publish At', direction }], page_size: size
+    });
+    return (data.results || []).map(pageToRow);
+  } catch (e) {
+    if (/select option|not found|validation/i.test(e.message)) return [];   // такого статуса в базе еще нет
+    throw e;
+  }
+}
+
+// Вход в канал: пишем строку в Notion. Нужен chat_member в allowed_updates вебхука и права админа у бота
+async function handleChatMember(cm) {
+  if (!cm || !cm.chat || cm.chat.type !== 'channel') return;
+  const was = cm.old_chat_member && cm.old_chat_member.status, now = cm.new_chat_member && cm.new_chat_member.status;
+  const wasIn = ['member', 'administrator', 'creator'].includes(was), isIn = ['member', 'administrator', 'creator'].includes(now);
+  if (wasIn || !isIn) return;
+  const via = cm.invite_link ? (isThreadsInvite(cm.invite_link) ? 'threads' : 'other-link') : 'no-link';
+  statsState.joinsSeen++;
+  await statsCreateRow('➕ вход в канал', 't_join', via, new Date().toISOString());
+}
+
+function statsParseInsight(data) {
+  const out = {};
+  for (const m of (data && data.data) || []) {
+    out[m.name] = m.total_value ? (Number(m.total_value.value) || 0) : ((m.values || []).reduce((a, v) => a + (Number(v.value) || 0), 0));
+  }
+  return out;
+}
+async function statsThreads(fromMs, toMs) {
+  const uid = await threadsUserId();
+  const res = { ok: false, needPerm: false };
+  try {
+    const params = { metric: 'views,likes,replies,reposts,quotes', since: String(Math.floor(fromMs / 1000)), until: String(Math.floor(toMs / 1000)), metric_type: 'total_value' };
+    let data;
+    try { data = await threadsReq('GET', `/${uid}/threads_insights`, params); }
+    catch (e) { if (/metric_type/i.test(e.message)) { delete params.metric_type; data = await threadsReq('GET', `/${uid}/threads_insights`, params); } else throw e; }
+    res.user = statsParseInsight(data);
+    try { res.followers = statsParseInsight(await threadsReq('GET', `/${uid}/threads_insights`, { metric: 'followers_count' })).followers_count; } catch { res.followers = null; }
+    const posts = ((await threadsReq('GET', `/${uid}/threads`, { fields: 'id,text,timestamp', limit: '30' })).data || [])
+      .filter(x => { const t = Date.parse(x.timestamp || 0); return t >= fromMs && t < toMs; });
+    res.postsCount = posts.length;
+    let best = null;
+    for (const post of posts.slice(0, 10)) {
+      try {
+        const ins = statsParseInsight(await threadsReq('GET', `/${post.id}/insights`, { metric: 'views,likes,replies' }));
+        if (!best || (ins.views || 0) > (best.ins.views || 0)) best = { post, ins };
+      } catch { /* у отдельного поста метрик может не быть */ }
+    }
+    res.best = best;
+    res.ok = true;
+  } catch (e) {
+    res.error = scrubToken(e.message);
+    res.needPerm = /permission|scope|OAuth|manage_insights|\(#10\)|\(#200\)/i.test(e.message);
+  }
+  return res;
+}
+
+async function buildStatsReport() {
+  const nowMs = Date.now(), np = warsawParts(nowMs);
+  const todayStart = warsawToUtcMs(np.y, np.mo, np.d, 0, 0);
+  const yStart = warsawToUtcMs(np.y, np.mo, np.d - 1, 0, 0);
+  const dd = ms => { const p = warsawParts(ms + 3 * 3600 * 1000); return `${String(p.d).padStart(2, '0')}.${String(p.mo).padStart(2, '0')}`; };
+  const lines = [`📊 Отчет за ${dd(yStart)}`, ''];
+
+  // Прошлый снимок для дельты
+  const prevRows = await statsQuery('t_stats', [{ property: 'Publish At', date: { before: new Date(todayStart).toISOString() } }], 'descending', 1);
+  let prev = null; try { prev = prevRows[0] ? JSON.parse(prevRows[0].text) : null; } catch { prev = null; }
+  const delta = (cur, old) => (cur == null || old == null) ? '' : ` (${cur - old >= 0 ? '+' : ''}${cur - old})`;
+
+  const th = threadsConfigured() ? await statsThreads(yStart, todayStart) : { ok: false, error: 'нет THREADS_ACCESS_TOKEN' };
+  const snapshot = { date: new Date(todayStart).toISOString().slice(0, 10) };
+  if (th.ok) {
+    const u = th.user || {};
+    lines.push('Threads', `Просмотры ${u.views || 0}, лайки ${u.likes || 0}, ответы ${u.replies || 0}, репосты ${u.reposts || 0}, цитаты ${u.quotes || 0}`);
+    lines.push(`Вышло постов: ${th.postsCount}`);
+    if (th.followers != null) { lines.push(`Подписчиков в Threads: ${th.followers}${delta(th.followers, prev && prev.thFollowers)}`); snapshot.thFollowers = th.followers; }
+    if (th.best) lines.push(`Лучший пост: «${String(th.best.post.text || '').replace(/\s+/g, ' ').slice(0, 80)}», просмотров ${th.best.ins.views || 0}, лайков ${th.best.ins.likes || 0}, ответов ${th.best.ins.replies || 0}`);
+  } else if (th.needPerm) {
+    lines.push('Threads', 'Нет доступа к статистике. В приложении Meta добавь право threads_manage_insights, сгенерируй токен заново и обнови THREADS_ACCESS_TOKEN в Railway.');
+  } else {
+    lines.push('Threads', 'Статистика не получена: ' + String(th.error || 'неизвестная ошибка').slice(0, 200));
+  }
+  lines.push('');
+
+  // Канал
+  let members = null;
+  try { members = Number(await tgApi('getChatMemberCount', { chat_id: TELEGRAM_CHANNEL_ID })); } catch (e) { lines.push('Канал: не удалось получить число подписчиков (' + scrubToken(e.message).slice(0, 120) + ')'); }
+  if (members != null) { lines.push(`Подписчиков в канале: ${members}${delta(members, prev && prev.tgMembers)}`); snapshot.tgMembers = members; }
+  const joins = await statsQuery('t_join', [
+    { property: 'Publish At', date: { on_or_after: new Date(yStart).toISOString() } },
+    { property: 'Publish At', date: { before: new Date(todayStart).toISOString() } }
+  ]);
+  const fromThreads = joins.filter(j => j.text === 'threads').length;
+  lines.push(`Пришли по ссылке из Threads: ${fromThreads}. Через другие ссылки или поиск: ${joins.length - fromThreads}.`);
+  lines.push('Входы считаются с момента, когда бот начал получать эти события.');
+  return { text: lines.join('\n'), snapshot, todayStart };
+}
+
+async function statsRun({ manual = false } = {}) {
+  if (statsState.running) return null;
+  statsState.running = true; statsState.lastRunAt = new Date().toISOString();
+  try {
+    const rep = await buildStatsReport();
+    for (const u of TELEGRAM_ALLOWED_USER_IDS) await botSend(Number(u), rep.text, { disable_web_page_preview: true });
+    if (!manual) await statsCreateRow('📊 ' + rep.snapshot.date, 't_stats', JSON.stringify(rep.snapshot), new Date().toISOString());
+    statsState.lastError = null;
+    return rep;
+  } catch (e) {
+    statsState.lastError = scrubToken(e.message);
+    console.error('stats:', statsState.lastError);
+    if (manual) throw e;
+    return null;
+  } finally { statsState.running = false; }
+}
+
+async function statsTick() {
+  if (process.env.STATS_REPORT === 'off' || !scheduleConfigured() || !TELEGRAM_BOT_TOKEN || !TELEGRAM_CHANNEL_ID || !TELEGRAM_ALLOWED_USER_IDS.length) return;
+  const np = warsawParts(Date.now());
+  if (np.h < STATS_HOUR) return;
+  const todayStart = warsawToUtcMs(np.y, np.mo, np.d, 0, 0);
+  const done = await statsQuery('t_stats', [{ property: 'Publish At', date: { on_or_after: new Date(todayStart).toISOString() } }], 'descending', 1).catch(() => null);
+  if (done === null || done.length) return;                // ошибка Notion или отчет за сегодня уже ушел
+  await statsRun();
+}
+// ── конец блока отчета ──
+
 async function handleBotUpdate(update) {
+  if (update.chat_member) return handleChatMember(update.chat_member).catch(e => console.error('chat_member:', scrubToken(e.message)));
   if (update.callback_query) {
     if (/^cx:\d+$/.test(String(update.callback_query.data || ''))) return handleCommentCallback(update.callback_query);
     if (/^(tp:\d+:\d+|tm:\d+)$/.test(String(update.callback_query.data || ''))) return handleThreadsReplyCallback(update.callback_query);
@@ -3238,8 +3397,12 @@ async function handleBotUpdate(update) {
     if (r.error) return botSend(msg.chat.id, 'Не получилось: ' + r.error.slice(0, 300));
     return botSend(msg.chat.id, r.found ? `Нашел ответов: ${r.found}. Карточки выше.` : 'За этот период чужих ответов нет.');
   }
+  if (cmd === '/stats') {
+    try { const r = await statsRun({ manual: true }); if (!r) return botSend(msg.chat.id, 'Отчет уже собирается, подожди минуту.'); return; }
+    catch (e) { return botSend(msg.chat.id, 'Не получилось собрать отчет: ' + scrubToken(e.message).slice(0, 300)).catch(() => {}); }
+  }
   if (cmd === '/start' || cmd === '/help') {
-    return botSend(msg.chat.id, 'Команды:\n/scheduled: запланированные посты, отмена и публикация сразу.\n/replies 24: найти ответы в Threads за последние 24 часа (число часов можно менять).\n\nСоздавать и планировать посты нужно в приложении (кнопка меню).');
+    return botSend(msg.chat.id, 'Команды:\n/scheduled: запланированные посты, отмена и публикация сразу.\n/replies 24: найти ответы в Threads за последние 24 часа (число часов можно менять).\n/stats: отчет по Threads и каналу за вчера.\n\nСоздавать и планировать посты нужно в приложении (кнопка меню).');
   }
 }
 
