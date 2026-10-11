@@ -3139,6 +3139,7 @@ async function threadsRepliesTick(opts = {}) {
     threadsReplyState.lastWindow = new Date(winFrom).toISOString() + ' – ' + new Date(winTo).toISOString();
     result.found = fresh.length;
     threadsReplyState.lastError = null;
+    let autoSent = 0;
     for (const f of fresh.slice(0, 20)) {
       const c = { id: ++commentCtxSeq, platform: 'threads', replyId: f.it.id, postText: f.post.text || '', parentText: f.parentText, commentText: f.text, author: f.it.username || '', link: f.it.permalink || '', variants: [], sentIdx: -1 };
       let variants;
@@ -3146,6 +3147,20 @@ async function threadsRepliesTick(opts = {}) {
       catch (e) { console.error('threads replies: не удалось сгенерировать ответы:', scrubToken(e.message)); continue; }
       c.variants = variants;
       commentCtx.set(c.id, c); trimMap(commentCtx, 200);
+      if (THREADS_AUTOREPLY() && autoSent < THREADS_AUTOREPLY_MAX()) {
+        try {
+          if (await threadsAutoDecision(c)) {
+            const idx = Math.max(0, variants.findIndex(v => v.label === THREADS_AUTOREPLY_STYLE()));
+            await publishToThreads(variants[idx].text, c.replyId);
+            c.sentIdx = idx; autoSent++; statsLogReply('auto');
+            for (const u of TELEGRAM_ALLOWED_USER_IDS) {
+              await botSend(Number(u), `🤖 Ответил автоматически${c.author ? ' @' + c.author : ''}\n\n«${c.commentText.slice(0, 300)}»\n\nМой ответ: ${variants[idx].text}`, { disable_web_page_preview: true }).catch(() => {});
+            }
+            threadsReplyState.lastCards++;
+            continue;
+          }
+        } catch (e) { console.error('threads autoreply:', scrubToken(e.message)); }   // не вышло, отдаем на ручное решение
+      }
       const card = threadsReplyCard(c, variants);
       for (const u of TELEGRAM_ALLOWED_USER_IDS) {
         await botSend(Number(u), card.text, { reply_markup: card.reply_markup, disable_web_page_preview: true })
@@ -3162,6 +3177,20 @@ async function threadsRepliesTick(opts = {}) {
   }
   return result;
 }
+
+// ── Автоответы на комментарии в Threads (режим THREADS_AUTOREPLY=on) ──
+// Бот сам отвечает на безопасные комментарии вариантом выбранного стиля и присылает короткое уведомление.
+// Сомнительные комментарии (оскорбления, спам, ссылки, политика, провокации, просьбы о советах по ставкам) идут обычной карточкой на ручное решение.
+const THREADS_AUTOREPLY = () => process.env.THREADS_AUTOREPLY === 'on';
+const THREADS_AUTOREPLY_STYLE = () => process.env.THREADS_AUTOREPLY_STYLE || 'Лучший';
+const THREADS_AUTOREPLY_MAX = () => Number(process.env.THREADS_AUTOREPLY_MAX) || 8;   // в час
+async function threadsAutoDecision(c) {
+  const sys = 'Ты фильтр комментариев под постами iGaming-эксперта в Threads. Реши, можно ли ответить на комментарий автоматически без проверки человеком. Отвечать можно: по делу, вопрос, согласие, спокойное несогласие, шутка, благодарность. Нельзя (auto=false): оскорбления, агрессия, спам и реклама, ссылки, политика, провокация или троллинг, просьбы дать ставку, прогноз или совет, где играть, вопросы про личное, жалобы на конкретного оператора, всё, где ответ может навредить репутации. Верни ТОЛЬКО JSON: {"auto":true|false,"reason":"коротко"}';
+  const raw = await claudeCall(sys, `ПОСТ:\n${String(c.postText || '').slice(0, 800)}\n\nКОММЕНТАРИЙ:\n${String(c.commentText).slice(0, 800)}`, 300);
+  const j = parseEditorJson(raw);
+  return !!(j && j.auto === true);
+}
+// ── конец автоответов ──
 
 // Кнопки карточки: tp:<id>:<номер варианта> отправить ответ, tm:<id> другие варианты
 async function handleThreadsReplyCallback(cb) {
@@ -3194,7 +3223,7 @@ async function handleThreadsReplyCallback(cb) {
   await answer('Отправляю в Threads…');
   try {
     await publishToThreads(v.text, c.replyId);
-    c.sentIdx = idx;
+    c.sentIdx = idx; statsLogReply('manual');
     await edit(threadsReplyCard(c, c.variants, idx)).catch(() => {});
   } catch (e) {
     await answer('Не отправилось: ' + scrubToken(e.message).slice(0, 180), true);
@@ -3230,6 +3259,11 @@ async function statsCreateRow(name, status, text, iso) {
       Status: { select: { name: status } }
     }
   });
+}
+// Каждый отправленный из бота ответ в Threads фиксируем строкой в Notion (kind: auto или manual), для отчета
+function statsLogReply(kind) {
+  if (!scheduleConfigured()) return;
+  statsCreateRow('↩️ ответ в Threads', 't_reply', kind, new Date().toISOString()).catch(e => console.error('stats reply log:', scrubToken(e.message)));
 }
 async function statsQuery(status, extraFilters = [], direction = 'descending', size = 100) {
   try {
@@ -3309,6 +3343,14 @@ async function buildStatsReport() {
     const u = th.user || {};
     lines.push('Threads', `Просмотры ${u.views || 0}, лайки ${u.likes || 0}, ответы ${u.replies || 0}, репосты ${u.reposts || 0}, цитаты ${u.quotes || 0}`);
     lines.push(`Вышло постов: ${th.postsCount}`);
+    {
+      const rr = await statsQuery('t_reply', [
+        { property: 'Publish At', date: { on_or_after: new Date(yStart).toISOString() } },
+        { property: 'Publish At', date: { before: new Date(todayStart).toISOString() } }
+      ]);
+      const auto = rr.filter(x => x.text === 'auto').length;
+      lines.push(`Ответов от бота в Threads: сам ${auto}, ты кнопкой ${rr.length - auto}`);
+    }
     if (th.followers != null) { lines.push(`Подписчиков в Threads: ${th.followers}${delta(th.followers, prev && prev.thFollowers)}`); snapshot.thFollowers = th.followers; }
     if (th.best) lines.push(`Лучший пост дня (его цифры за все время): «${String(th.best.post.text || '').replace(/\s+/g, ' ').slice(0, 80)}», просмотров ${th.best.ins.views || 0}, лайков ${th.best.ins.likes || 0}, ответов ${th.best.ins.replies || 0}`);
   } else if (th.needPerm) {
