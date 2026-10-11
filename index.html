@@ -777,6 +777,7 @@
     <button class="tab active" onclick="switchMode('topic')">Тема</button>
     <button class="tab" onclick="switchMode('comment')">Коммент</button>
     <button class="tab tg-tab" onclick="switchMode('telegram')">TG</button>
+    <button class="tab tg-tab" onclick="switchMode('newsquote')">Готовый</button>
     <button class="tab" onclick="switchMode('digest')">Дайджест</button>
     <button class="tab" onclick="switchMode('queue')">Очередь</button>
     <button class="tab" onclick="switchMode('threads')">Threads</button>
@@ -1036,7 +1037,7 @@
 
     function switchMode(mode) {
       currentMode = mode;
-      const tabOrder = ['topic', 'comment', 'telegram', 'digest', 'queue', 'threads'];
+      const tabOrder = ['topic', 'comment', 'telegram', 'newsquote', 'digest', 'queue', 'threads'];
       document.querySelectorAll('.tab').forEach((t, i) => {
         t.classList.toggle('active', tabOrder[i] === mode);
       });
