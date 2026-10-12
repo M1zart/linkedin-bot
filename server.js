@@ -17,6 +17,8 @@ const INIT_DATA_MAX_AGE_SEC = 24 * 60 * 60;
 // Идентификаторы можно переопределить переменными окружения. Версия API Notion 2025-09-03: страницы и запросы идут через data source.
 const NOTION_SCHEDULE_DB_ID = process.env.NOTION_SCHEDULE_DB_ID || '9774b7e9-9511-41d4-b563-978931704e5d';
 const NOTION_SCHEDULE_DS_ID = process.env.NOTION_SCHEDULE_DS_ID || 'b818813e-8172-4dc4-8893-e5ea30c6a726';
+const ASK_BUTTON_URL = (process.env.ASK_BUTTON_URL || '').trim() || 'https://t.me/ask_skakunov_bot?start=post';
+const ASK_BUTTON_TEXT = (process.env.ASK_BUTTON_TEXT || '').trim() || 'Задать вопрос';
 const SCHEDULER_INTERVAL_MS = Number(process.env.SCHEDULER_INTERVAL_MS) || 30 * 1000;
 // Пост, который просрочен больше чем на это время (сервер был недоступен), не публикуется сам: пользователь решает
 const SCHEDULE_STALE_MS = (Number(process.env.SCHEDULE_STALE_MINUTES) || 30) * 60 * 1000;
@@ -626,8 +628,8 @@ const server = http.createServer(async (req, res) => {
         }
         const auth = await authorizeUser(req);
         if (!auth.ok) return send(auth.status, { error: auth.error });
-        const { text, imageDataUrl } = JSON.parse(body);
-        send(200, await publishToChannel(text, imageDataUrl));
+        const { text, imageDataUrl, askButton } = JSON.parse(body);
+        send(200, await publishToChannel(text, imageDataUrl, askButton === true));
       } catch (err) {
         console.error('publish error:', scrubToken(err.message));
         send(err.httpStatus || 500, { error: scrubToken(err.message) });
@@ -649,11 +651,11 @@ const server = http.createServer(async (req, res) => {
         if (!scheduleConfigured()) return send(503, { error: 'Расписание не настроено: нужен NOTION_API_KEY в переменных Railway' });
         const auth = await authorizeUser(req);
         if (!auth.ok) return send(auth.status, { error: auth.error });
-        const { text, when } = JSON.parse(body);
+        const { text, when, askButton } = JSON.parse(body);
         assertPostText(text);
         const parsed = parseWarsawDateTime(when);
         if (!parsed.ok) return send(400, { error: parsed.error });
-        const row = await schedCreate(text, parsed.iso, Number(auth.userId));
+        const row = await schedCreate(text, parsed.iso, Number(auth.userId), askButton === true);
         send(200, { ok: true, id: row.id, publishAt: parsed.iso, local: formatWarsaw(parsed.iso) });
       } catch (err) {
         console.error('schedule error:', scrubToken(err.message));
@@ -732,7 +734,7 @@ const server = http.createServer(async (req, res) => {
       const cutoff = Date.now() - 14 * 24 * 3600 * 1000;
       const items = rows
         .filter(r => r.status === 'scheduled' || (r.publishAt && Date.parse(r.publishAt) >= cutoff))
-        .map(r => ({ id: r.id, text: r.text, status: r.status, publishAt: r.publishAt, local: r.publishAt ? formatWarsaw(r.publishAt) : '', error: r.error || '' }));
+        .map(r => ({ id: r.id, text: r.text, status: r.status, publishAt: r.publishAt, local: r.publishAt ? formatWarsaw(r.publishAt) : '', error: r.error || '', askButton: r.askButton }));
       send(200, { items });
     } catch (err) {
       console.error('scheduled-list error:', scrubToken(err.message));
@@ -751,13 +753,19 @@ const server = http.createServer(async (req, res) => {
         if (!scheduleConfigured()) return send(503, { error: 'Расписание не настроено: нужен NOTION_API_KEY в переменных Railway' });
         const auth = await authorizeUser(req);
         if (!auth.ok) return send(auth.status, { error: auth.error });
-        const { id, action } = JSON.parse(body);
+        const { id, action, value } = JSON.parse(body);
         if (!/^[0-9a-f-]{32,40}$/i.test(String(id || ''))) return send(400, { error: 'Некорректный id поста' });
-        if (action !== 'cancel' && action !== 'publish') return send(400, { error: 'Неизвестное действие' });
+        if (action !== 'cancel' && action !== 'publish' && action !== 'ask-button') return send(400, { error: 'Неизвестное действие' });
         let row;
         try { row = await schedGet(id); } catch { return send(404, { error: 'Пост не найден или очередь недоступна' }); }
         if (String(row.owner) !== auth.userId) return send(403, { error: 'Это не твой пост' });
         if (row.status !== 'scheduled') return send(409, { error: `Пост уже не в очереди: ${row.status}` });
+        if (action === 'ask-button') {
+          if (schedInFlight.has(row.id)) return send(409, { error: 'Пост публикуется прямо сейчас' });
+          try { await schedUpdate(row.id, { askButton: value === true }); }
+          catch (e) { return send(502, { error: 'Не удалось сохранить кнопку. Проверь, что в базе расписания есть свойство-checkbox «Кнопка вопроса»' }); }
+          return send(200, { ok: true, askButton: value === true });
+        }
         if (action === 'cancel') {
           if (schedInFlight.has(row.id)) return send(409, { error: 'Пост публикуется прямо сейчас' });
           await schedUpdate(row.id, { status: 'cancelled' });
@@ -1860,22 +1868,29 @@ function channelLink(messageId) {
   return m ? `https://t.me/c/${m[1]}/${messageId}` : null;
 }
 
-async function sendTextToChannel(text) {
+// Inline-кнопка «Задать вопрос» под постом канала (только если включена галочкой)
+function askMarkup() {
+  return { inline_keyboard: [[{ text: ASK_BUTTON_TEXT, url: ASK_BUTTON_URL }]] };
+}
+
+async function sendTextToChannel(text, askButton = false) {
+  const extra = askButton ? { reply_markup: askMarkup() } : {};
   try {
-    return await tgApi('sendMessage', { chat_id: TELEGRAM_CHANNEL_ID, text: toTelegramHtml(text), parse_mode: 'HTML' });
+    return await tgApi('sendMessage', { chat_id: TELEGRAM_CHANNEL_ID, text: toTelegramHtml(text), parse_mode: 'HTML', ...extra });
   } catch (e) {
     // Разметка не принята: публикуем обычным текстом без звёздочек (до этого ничего не отправлено)
     if (/can't parse entities/i.test(e.message)) {
-      return tgApi('sendMessage', { chat_id: TELEGRAM_CHANNEL_ID, text: text.replace(/\*\*/g, '') });
+      return tgApi('sendMessage', { chat_id: TELEGRAM_CHANNEL_ID, text: text.replace(/\*\*/g, ''), ...extra });
     }
     throw e;
   }
 }
 
-async function sendPhotoToChannel(photo, captionText) {
+async function sendPhotoToChannel(photo, captionText, askButton = false) {
   const build = (caption, withHtml) => {
     const f = new FormData();
     f.append('chat_id', TELEGRAM_CHANNEL_ID);
+    if (askButton) f.append('reply_markup', JSON.stringify(askMarkup()));
     f.append('photo', new Blob([photo.buf], { type: photo.mime }), `cover.${photo.ext}`);
     if (caption) {
       f.append('caption', caption);
@@ -1902,7 +1917,7 @@ function assertPostText(text) {
   return len;
 }
 
-async function publishToChannel(text, imageDataUrl) {
+async function publishToChannel(text, imageDataUrl, askButton = false) {
   const len = assertPostText(text);
 
   let photo = null;
@@ -1917,8 +1932,9 @@ async function publishToChannel(text, imageDataUrl) {
   const captionFits = !!photo && len <= 1024;
   const ids = [];
   try {
-    if (photo) ids.push((await sendPhotoToChannel(photo, captionFits ? text : null)).message_id);
-    if (!captionFits) ids.push((await sendTextToChannel(text)).message_id);
+    // Кнопка вешается на последнее сообщение: на фото, если текст в подписи, иначе на текст
+    if (photo) ids.push((await sendPhotoToChannel(photo, captionFits ? text : null, askButton && captionFits)).message_id);
+    if (!captionFits) ids.push((await sendTextToChannel(text, askButton)).message_id);
   } catch (e) {
     const msg = friendlyTelegramError(e.message);
     throw httpError(502, ids.length ? `Картинка опубликована, а текст нет. Не публикуй её повторно. ${msg}` : msg);
@@ -2046,7 +2062,9 @@ function pageToRow(p) {
     type: (pr.Type && pr.Type.select && pr.Type.select.name) || null,
     company: fromRichText(pr.Company && pr.Company.rich_text),
     angle: fromRichText(pr.Angle && pr.Angle.rich_text),
-    goal: (pr.Goal && pr.Goal.select && pr.Goal.select.name) || null
+    goal: (pr.Goal && pr.Goal.select && pr.Goal.select.name) || null,
+    // Старые посты без свойства «Кнопка вопроса» читаются как false
+    askButton: !!(pr['Кнопка вопроса'] && pr['Кнопка вопроса'].checkbox === true)
   };
 }
 
@@ -2059,16 +2077,19 @@ async function schedQuery(filter, pageSize = 50) {
   return (data.results || []).map(pageToRow);
 }
 
-async function schedCreate(text, iso, owner) {
+async function schedCreate(text, iso, owner, askButton = false) {
+  const properties = {
+    Name: { title: [{ type: 'text', text: { content: shortPreview(text, 80) || 'Пост' } }] },
+    Text: { rich_text: toRichText(text) },
+    'Publish At': { date: { start: iso } },
+    Status: { select: { name: 'scheduled' } },
+    Owner: { number: owner }
+  };
+  // Без галочки свойство не пишем: пост создаётся, даже если checkbox «Кнопка вопроса» в базе ещё не заведён
+  if (askButton) properties['Кнопка вопроса'] = { checkbox: true };
   const page = await notionReq('POST', '/v1/pages', {
     parent: { type: 'data_source_id', data_source_id: NOTION_SCHEDULE_DS_ID },
-    properties: {
-      Name: { title: [{ type: 'text', text: { content: shortPreview(text, 80) || 'Пост' } }] },
-      Text: { rich_text: toRichText(text) },
-      'Publish At': { date: { start: iso } },
-      Status: { select: { name: 'scheduled' } },
-      Owner: { number: owner }
-    }
+    properties
   });
   return pageToRow(page);
 }
@@ -2079,8 +2100,9 @@ async function schedGet(id) {
   return row;
 }
 
-async function schedUpdate(id, { status, link, error, publishAt }) {
+async function schedUpdate(id, { status, link, error, publishAt, askButton }) {
   const properties = {};
+  if (askButton !== undefined) properties['Кнопка вопроса'] = { checkbox: !!askButton };
   if (publishAt) properties['Publish At'] = { date: { start: publishAt } };
   if (status) properties.Status = { select: { name: status } };
   if (link !== undefined) properties.Link = { url: link || null };
@@ -2117,7 +2139,7 @@ async function runScheduledPost(row, { checkStale = true, notify = true } = {}) 
     await schedUpdate(row.id, { status: 'publishing' });
     let result;
     try {
-      result = await publishToChannel(row.text, null);
+      result = await publishToChannel(row.text, null, row.askButton);
     } catch (e) {
       const msg = scrubToken(e.message);
       await schedUpdate(row.id, { status: 'failed', error: msg }).catch(() => {});

@@ -966,6 +966,7 @@
     <div class="editor-footer">
       <div class="publish-info" id="publish-info"></div>
       <div class="publish-row" id="publish-row" style="display:none;">
+        <label style="display:flex;align-items:center;gap:8px;width:100%;font-size:14px;cursor:pointer;"><input type="checkbox" id="ask-button-check" style="width:18px;height:18px;"> Кнопка «Задать вопрос»</label>
         <button class="action-btn primary tg" id="publish-btn" onclick="publishToChannel()">📣 Опубликовать сейчас</button>
         <button class="action-btn" id="schedule-btn" onclick="openScheduleModal()">🕒 Запланировать</button>
       </div>
@@ -1781,6 +1782,8 @@
       info.classList.add('show');
     }
 
+    const askButtonOn = () => !!(document.getElementById('ask-button-check') || {}).checked;
+
     async function publishToChannel() {
       if (publishState.busy) return;
       const text = lastGenerated.trim();
@@ -1788,7 +1791,7 @@
       const image = getCoverDataUrl();
 
       const preview = text.replace(/\*\*/g, '').replace(/\s+/g, ' ').slice(0, 80);
-      let message = `Опубликовать в Telegram-канал?\n\n«${preview}…»\n\n` + (image ? 'С обложкой.' : 'Без картинки.');
+      let message = `Опубликовать в Telegram-канал?\n\n«${preview}…»\n\n` + (image ? 'С обложкой.' : 'Без картинки.') + (askButtonOn() ? ' С кнопкой «Задать вопрос».' : '');
       if (publishState.done) message += '\nЭтот пост уже публиковался, будет второй раз.';
 
       // Занято уже на время окна подтверждения: второе нажатие не должно открыть второе окно
@@ -1805,7 +1808,7 @@
         const response = await fetch('/api/publish', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'X-Telegram-Init-Data': getInitData() },
-          body: JSON.stringify({ text, imageDataUrl: image })
+          body: JSON.stringify({ text, imageDataUrl: image, askButton: askButtonOn() })
         });
         const data = await readApi(response);
         publishState.done = true;
@@ -1936,7 +1939,7 @@
         const response = await fetch('/api/schedule', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'X-Telegram-Init-Data': getInitData() },
-          body: JSON.stringify({ text: lastGenerated.trim(), when })
+          body: JSON.stringify({ text: lastGenerated.trim(), when, askButton: askButtonOn() })
         });
         const data = await readApi(response);
         scheduleState.busy = false;
@@ -2149,6 +2152,24 @@
         }
 
         if (it.status === 'scheduled') {
+          const lbl = document.createElement('label');
+          lbl.style.cssText = 'display:flex;align-items:center;gap:8px;font-size:14px;margin:8px 0;cursor:pointer;';
+          const cb = document.createElement('input');
+          cb.type = 'checkbox';
+          cb.checked = !!it.askButton;
+          cb.addEventListener('change', async () => {
+            cb.disabled = true;
+            try {
+              await queueCall('/api/scheduled-action', { method: 'POST', body: JSON.stringify({ id: it.id, action: 'ask-button', value: cb.checked }) });
+              showToast(cb.checked ? 'Кнопка включена' : 'Кнопка выключена');
+            } catch (e) {
+              cb.checked = !cb.checked;
+              showToast(e.message.replace(/ \(HTTP \d+\)$/, ''), true);
+            } finally { cb.disabled = false; }
+          });
+          lbl.appendChild(cb);
+          lbl.appendChild(document.createTextNode('Кнопка «Задать вопрос»'));
+          card.appendChild(lbl);
           const actions = document.createElement('div');
           actions.className = 'digest-actions';
           const mv = document.createElement('button');
