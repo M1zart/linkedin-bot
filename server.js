@@ -50,6 +50,21 @@ const noYo = t => String(t || '').replace(/ё/g, 'е').replace(/Ё/g, 'Е')
   // Тире и дефис с пробелами как пунктуация («X - Y», «X — Y», «X – Y») модель возвращает даже после запрета: ставим двоеточие
   .replace(/\s+[\u2014\u2013-]\s+/g, ': ');
 
+// Рубрика «100 голосов»: оформление не должно менять слова героя. Если после оформления текст без разметки
+// отличается от исходного, берём исходный и добавляем лейбл, хэштег и подпись кодом.
+const VOICE_HASHTAG = '#100_голосов';
+const VOICE_LABEL = '🎙 100 ГОЛОСОВ iGAMING';
+const VOICE_SIGNATURE = '// D.S. //';
+function strictVoiceFormat(formatted, original, label) {
+  const lab = (label || VOICE_LABEL).trim();
+  const plain = s => noYo(s).replace(/\*\*/g, '').replace(/\s+/g, ' ').trim();
+  const service = new Set([lab, VOICE_HASHTAG, VOICE_SIGNATURE]);
+  const body = String(formatted).split('\n').filter(l => !service.has(l.replace(/\*\*/g, '').trim())).join('\n');
+  if (plain(body) === plain(original)) return formatted;
+  console.error('rubric-format: оформление изменило слова героя, использую исходный текст');
+  return `${lab}\n\n${String(original).trim()}\n\n${VOICE_HASHTAG}\n\n\n${VOICE_SIGNATURE}`;
+}
+
 // Пост по новости из дайджеста: фактов во входе мало, и модель растягивает их выдумкой. Лечим причину: короткий пост только из фактов входа.
 // Правило стоит в конце system prompt и перекрывает «длина свободная» и «150-300 слов»
 const DIGEST_RULE = `
@@ -530,6 +545,7 @@ const server = http.createServer(async (req, res) => {
         let systemPrompt = getRubricFormatSystemPrompt();
         if (forcedLabel && forcedHashtag) {
           systemPrompt += `\n\nВАЖНО, ПЕРЕКРЫВАЕТ ШАГ 1: пользователь уже выбрал рубрику вручную. Не пытайся определять рубрику самостоятельно, шаг 1 полностью пропускается. Используй ровно эти значения: визуальный лейбл "${forcedLabel}", хэштег "${forcedHashtag}". Дальше следуй шагу 2 как обычно.`;
+          if (forcedHashtag === VOICE_HASHTAG) systemPrompt += `\n\nСТРОГИЙ РЕЖИМ ДЛЯ ЭТОЙ РУБРИКИ: это прямая речь героя. Не меняй ни одного слова, не переставляй, не удаляй и не добавляй слов, не правь абзацы и строки (в том числе строки в квадратных скобках). Разрешено только: лейбл рубрики сверху, жирные акценты **...** вокруг уже существующих фраз, хэштег и подпись.`;
         }
 
         const response = await fetch('https://api.anthropic.com/v1/messages', {
@@ -568,7 +584,7 @@ const server = http.createServer(async (req, res) => {
         const text = data.content?.[0]?.text || postText;
 
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ text: noYo(nameOutlets(text)) }));
+        res.end(JSON.stringify({ text: forcedHashtag === VOICE_HASHTAG ? strictVoiceFormat(noYo(nameOutlets(text)), postText, forcedLabel) : noYo(nameOutlets(text)) }));
 
       } catch (err) {
         console.error('rubric-format catch error:', err.message);
@@ -3511,6 +3527,9 @@ async function voiceNextNumber() {
   return top && Number.isFinite(top.number) ? top.number + 1 : 1;
 }
 
+// Notion не принимает запятые в названиях select: заменяем на пробел
+const notionSelectName = s => String(s || '').replace(/,/g, ' ').replace(/\s+/g, ' ').trim();
+
 async function voiceCreate({ number, roleTitle, exp, telegram, linkedin, risks, transcript, extra }) {
   const paragraphs = String(extra || '').split(/\n+/).map(s => s.trim()).filter(Boolean);
   const children = paragraphs.length
@@ -3522,7 +3541,7 @@ async function voiceCreate({ number, roleTitle, exp, telegram, linkedin, risks, 
     properties: {
       Name: { title: [{ type: 'text', text: { content: `Голос #${number}` } }] },
       'Номер': { number },
-      'Роль': { select: { name: roleTitle } },
+      'Роль': { select: { name: notionSelectName(roleTitle) } },
       'Стаж': rtFull(exp),
       'Статус': { select: { name: 'черновик' } },
       Telegram: rtFull(telegram),
