@@ -781,6 +781,7 @@
     <button class="tab" onclick="switchMode('digest')">Дайджест</button>
     <button class="tab" onclick="switchMode('queue')">Очередь</button>
     <button class="tab" onclick="switchMode('threads')">Threads</button>
+    <button class="tab" onclick="switchMode('voice')">Голос</button>
   </div>
 
   <!-- Режим 1: По теме -->
@@ -854,6 +855,7 @@
       <option value="13">⚽ БОТ И ТОП МАТЧИ</option>
       <option value="14">🧰 ИНСТРУМЕНТЫ</option>
       <option value="15">😏 ВОСКРЕСНОЕ</option>
+      <option value="16">🎙 100 ГОЛОСОВ iGAMING</option>
     </select>
     </div>
 
@@ -867,6 +869,37 @@
     <div class="digest-meta" id="queue-meta" style="display:block;">Загружаю очередь…</div>
     <div id="queue-list"></div>
     <button class="action-btn" id="queue-refresh" onclick="loadQueue()" style="width:100%;margin-top:4px;">Обновить</button>
+  </div>
+
+  <!-- Голос: рубрика «100 голосов iGaming» -->
+  <div id="mode-voice" class="mode-panel">
+    <div id="voice-list-view">
+      <div class="digest-meta" id="voice-meta" style="display:block;">Загружаю голоса…</div>
+      <div id="voice-list"></div>
+      <button class="action-btn" onclick="voiceLoadList()" style="width:100%;margin-top:4px;">Обновить</button>
+    </div>
+    <div id="voice-card-view" style="display:none;">
+      <button class="action-btn" onclick="voiceBack()" style="margin-bottom:10px;">← К списку</button>
+      <div class="digest-title" id="voice-title" style="margin-bottom:10px;"></div>
+      <div class="tone-selector" id="voice-platform">
+        <button class="tone-btn selected" data-platform="telegram">Telegram</button>
+        <button class="tone-btn" data-platform="linkedin">LinkedIn</button>
+      </div>
+      <textarea id="voice-text" style="min-height:380px;"></textarea>
+      <div class="field-label">Риск узнавания</div>
+      <div class="digest-row" id="voice-risks" style="white-space:pre-wrap;"></div>
+      <div class="field-label">Сверх вопросов</div>
+      <div class="digest-row" id="voice-extra" style="white-space:pre-wrap;"></div>
+      <details style="margin:10px 0;"><summary style="cursor:pointer;">Сырая расшифровка</summary>
+        <div class="digest-row" id="voice-transcript" style="white-space:pre-wrap;margin-top:6px;"></div>
+      </details>
+      <div class="digest-actions" style="flex-wrap:wrap;">
+        <button class="action-btn" onclick="voiceCopy()">📋 Копировать</button>
+        <button class="action-btn" onclick="voiceSave(true)">💾 Сохранить</button>
+        <button class="action-btn" onclick="voiceSetStatus('на согласовании')">Статус: на согласовании</button>
+        <button class="action-btn primary tg" onclick="voicePublish()">В публикацию</button>
+      </div>
+    </div>
   </div>
 
   <!-- Threads: партия постов, очередь, автопубликация -->
@@ -1045,7 +1078,7 @@
 
     function switchMode(mode) {
       currentMode = mode;
-      const tabOrder = ['topic', 'comment', 'telegram', 'newsquote', 'digest', 'queue', 'threads'];
+      const tabOrder = ['topic', 'comment', 'telegram', 'newsquote', 'digest', 'queue', 'threads', 'voice'];
       document.querySelectorAll('.tab').forEach((t, i) => {
         t.classList.toggle('active', tabOrder[i] === mode);
       });
@@ -1055,6 +1088,7 @@
       hideCommentsResult();
       if (mode === 'queue') loadQueue();
       if (mode === 'threads') thLoadQueue();
+      if (mode === 'voice') voiceLoadList();
     }
 
     document.querySelectorAll('.tone-selector').forEach(selector => {
@@ -1425,7 +1459,7 @@
       '4': '#запуск_geo', '5': '#казино_спортсбук', '6': '#crm_retention',
       '7': '#метрики_pnl', '8': '#люди_роли', '9': '#разбор_релизов',
       '10': '#новости_изнутри', '11': '#из_практики', '12': '#ai_операции',
-      '13': '#бот_матчи', '14': '#инструменты', '15': '#воскресное'
+      '13': '#бот_матчи', '14': '#инструменты', '15': '#воскресное', '16': '#100_голосов'
     };
 
     // ===== ОБЛОЖКА: карточка в стиле игрового рейтинга =====
@@ -1815,6 +1849,7 @@
         setEditorStatus('');
         showPublishInfo(data);
         showToast('Опубликовано в канале');
+        voiceAfterPublish();
       } catch (err) {
         setEditorStatus('Ошибка публикации: ' + err.message, true);
       } finally {
@@ -2212,6 +2247,118 @@
         queueState.busy = false;
       }
       loadQueue();
+    }
+
+    // ===== ГОЛОС: рубрика «100 голосов iGaming» =====
+    // Голоса создаёт бот (пересланные голосовые) и хранит в Notion. Здесь: список, правка черновика и отправка
+    // Telegram-версии в обычный пайплайн публикации с рубрикой 16.
+    const voiceState = { cur: null, platform: 'telegram', busy: false, pending: null };
+    const voiceErr = e => e.message.replace(/ \(HTTP \d+\)$/, '');
+
+    async function voiceLoadList() {
+      const meta = document.getElementById('voice-meta');
+      const list = document.getElementById('voice-list');
+      document.getElementById('voice-list-view').style.display = '';
+      document.getElementById('voice-card-view').style.display = 'none';
+      meta.textContent = 'Загружаю голоса…';
+      try {
+        const data = await queueCall('/api/voices');
+        list.innerHTML = '';
+        const items = data.items || [];
+        meta.textContent = items.length ? '' : 'Голосов пока нет. Перешли боту голосовые героя.';
+        items.forEach(it => {
+          const card = document.createElement('div');
+          card.className = 'digest-card';
+          card.style.cursor = 'pointer';
+          const head = document.createElement('div');
+          head.className = 'digest-head';
+          const title = document.createElement('div');
+          title.className = 'digest-title';
+          const d = it.date ? new Date(it.date).toLocaleDateString('ru-RU') : '';
+          title.textContent = '🎙 Голос #' + it.number + ' · ' + it.role + ' · ' + it.status + (d ? ' · ' + d : '');
+          head.appendChild(title);
+          card.appendChild(head);
+          card.addEventListener('click', () => voiceOpen(it.id));
+          list.appendChild(card);
+        });
+      } catch (e) {
+        list.innerHTML = '';
+        meta.textContent = voiceErr(e);
+      }
+    }
+
+    async function voiceOpen(id) {
+      try {
+        const v = await queueCall('/api/voice?id=' + encodeURIComponent(id));
+        voiceState.cur = v;
+        voiceState.platform = 'telegram';
+        document.querySelectorAll('#voice-platform .tone-btn').forEach(b => b.classList.toggle('selected', b.dataset.platform === 'telegram'));
+        document.getElementById('voice-title').textContent = '🎙 Голос #' + v.number + ' · ' + v.role + ' · ' + v.status;
+        document.getElementById('voice-text').value = v.telegram;
+        document.getElementById('voice-risks').textContent = v.risks || 'Не найдено';
+        document.getElementById('voice-extra').textContent = v.extra || 'Нет';
+        document.getElementById('voice-transcript').textContent = v.transcript;
+        document.getElementById('voice-list-view').style.display = 'none';
+        document.getElementById('voice-card-view').style.display = '';
+      } catch (e) { showToast(voiceErr(e), true); }
+    }
+
+    function voiceBack() { voiceLoadList(); }
+
+    // Переключатель Telegram / LinkedIn: правки текущей версии остаются в черновике
+    function voiceStash() {
+      if (voiceState.cur) voiceState.cur[voiceState.platform] = document.getElementById('voice-text').value;
+    }
+    document.querySelectorAll('#voice-platform .tone-btn').forEach(b => b.addEventListener('click', () => {
+      if (!voiceState.cur) return;
+      voiceStash();
+      voiceState.platform = b.dataset.platform;
+      document.getElementById('voice-text').value = voiceState.cur[voiceState.platform];
+    }));
+
+    async function voiceSave(toast, extra) {
+      if (!voiceState.cur) return false;
+      voiceStash();
+      try {
+        await queueCall('/api/voice-update', { method: 'POST', body: JSON.stringify({ id: voiceState.cur.id, telegram: voiceState.cur.telegram, linkedin: voiceState.cur.linkedin, ...(extra || {}) }) });
+        if (toast) showToast('Сохранено');
+        return true;
+      } catch (e) { showToast(voiceErr(e), true); return false; }
+    }
+
+    async function voiceCopy() {
+      voiceStash();
+      await copyText(document.getElementById('voice-text').value);
+    }
+
+    async function voiceSetStatus(status) {
+      if (!(await voiceSave(false, { status }))) return;
+      voiceState.cur.status = status;
+      document.getElementById('voice-title').textContent = '🎙 Голос #' + voiceState.cur.number + ' · ' + voiceState.cur.role + ' · ' + status;
+      showToast('Статус: ' + status);
+    }
+
+    // Telegram-версия идёт в обычную цепочку: рубрика 16, акценты, хэштег #100_голосов, подпись, кнопка «Задать вопрос»
+    async function voicePublish() {
+      if (!(await voiceSave(false))) return;
+      const text = voiceState.cur.telegram.trim();
+      if (!text) { showToast('Telegram-версия пустая', true); return; }
+      if (/\[(ВСТУПЛЕНИЕ|ФИНАЛ)\]/.test(text) && !(await confirmAsk('В тексте остались пустые блоки [ВСТУПЛЕНИЕ] или [ФИНАЛ]. Всё равно отправить в публикацию?'))) return;
+      voiceState.pending = { id: voiceState.cur.id, input: text };
+      originMode = 'voice';
+      resetCover();
+      generateNewsQuote(text, '16');
+    }
+
+    // После успешной публикации именно этого текста голос получает статус «опубликован»
+    async function voiceAfterPublish() {
+      const p = voiceState.pending;
+      if (!p || lastInput !== p.input) return;
+      voiceState.pending = null;
+      try {
+        await queueCall('/api/voice-update', { method: 'POST', body: JSON.stringify({ id: p.id, status: 'опубликован' }) });
+        if (voiceState.cur && voiceState.cur.id === p.id) voiceState.cur.status = 'опубликован';
+      } catch (e) { showToast('Пост вышел, но статус голоса не обновился: ' + voiceErr(e), true); }
     }
 
     // ===== THREADS: партия постов, очередь, автопубликация =====

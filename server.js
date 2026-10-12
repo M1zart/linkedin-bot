@@ -783,6 +783,9 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // ── Голоса: список и карточки во вкладке «Голос» ──
+  if (voiceRoute(req, res)) return;
+
   // ── Threads: генерация, очередь, действия ──
   if (threadsRoute(req, res)) return;
 
@@ -3451,9 +3454,444 @@ async function statsTick() {
 }
 // ── конец блока отчета ──
 
+// ── «100 голосов iGaming»: голосовые героя -> расшифровка -> черновик поста ──────────────────────────
+// Бот принимает пересланные голосовые, Gemini расшифровывает, Claude раскладывает по вопросам из questions.json,
+// результат лежит в Notion-базе NOTION_VOICE_DS_ID и показывается во вкладке «Голос» Mini App.
+
+const NOTION_VOICE_DS_ID = (process.env.NOTION_VOICE_DS_ID || '').trim();
+const GEMINI_TRANSCRIBE_MODEL = process.env.GEMINI_TRANSCRIBE_MODEL || 'gemini-2.5-flash';
+const GEMINI_FILES_BASE = 'https://generativelanguage.googleapis.com';
+const VOICE_STATUSES = ['черновик', 'на согласовании', 'опубликован'];
+const VOICE_INLINE_MAX = 12 * 1024 * 1024; // больше: через Gemini Files API
+
+const voiceConfigured = () => !!(NOTION_API_KEY && NOTION_VOICE_DS_ID);
+
+function loadQuestions() {
+  const q = JSON.parse(fs.readFileSync(path.join(__dirname, 'questions.json'), 'utf8'));
+  if (!Array.isArray(q.common) || !q.roles) throw new Error('questions.json: нет common или roles');
+  return q;
+}
+
+// Роль -> { title, questions: [текст] }. Для other вопросы приходят от пользователя
+function voiceRole(key, otherQs) {
+  const q = loadQuestions();
+  if (key === 'other') return { title: (q.other && q.other.title) || 'Другое', questions: otherQs || [] };
+  const r = q.roles[key];
+  if (!r) throw new Error('Неизвестная роль: ' + key);
+  return { title: r.title, questions: r.questions };
+}
+
+// --- Notion ---
+
+const rtFull = text => ({ rich_text: toRichText(String(text || '')) });
+
+function pageToVoice(p) {
+  const pr = p.properties || {};
+  return {
+    id: p.id,
+    parentOk: !p.parent || p.parent.data_source_id === NOTION_VOICE_DS_ID,
+    name: fromRichText(pr.Name && pr.Name.title),
+    number: pr['Номер'] && pr['Номер'].number !== undefined ? pr['Номер'].number : null,
+    role: (pr['Роль'] && pr['Роль'].select && pr['Роль'].select.name) || '',
+    exp: fromRichText(pr['Стаж'] && pr['Стаж'].rich_text),
+    status: (pr['Статус'] && pr['Статус'].select && pr['Статус'].select.name) || 'черновик',
+    telegram: fromRichText(pr.Telegram && pr.Telegram.rich_text),
+    linkedin: fromRichText(pr.LinkedIn && pr.LinkedIn.rich_text),
+    risks: fromRichText(pr['Риски'] && pr['Риски'].rich_text),
+    transcript: fromRichText(pr['Транскрипт'] && pr['Транскрипт'].rich_text),
+    date: p.created_time || null
+  };
+}
+
+async function voiceNextNumber() {
+  const data = await notionReq('POST', `/v1/data_sources/${NOTION_VOICE_DS_ID}/query`, {
+    sorts: [{ property: 'Номер', direction: 'descending' }], page_size: 1
+  });
+  const top = (data.results || []).map(pageToVoice)[0];
+  return top && Number.isFinite(top.number) ? top.number + 1 : 1;
+}
+
+async function voiceCreate({ number, roleTitle, exp, telegram, linkedin, risks, transcript, extra }) {
+  const paragraphs = String(extra || '').split(/\n+/).map(s => s.trim()).filter(Boolean);
+  const children = paragraphs.length
+    ? [{ object: 'block', type: 'heading_3', heading_3: { rich_text: [{ type: 'text', text: { content: 'Сверх вопросов' } }] } },
+       ...paragraphs.map(t => ({ object: 'block', type: 'paragraph', paragraph: { rich_text: toRichText(t) } }))].slice(0, 100)
+    : [];
+  const page = await notionReq('POST', '/v1/pages', {
+    parent: { type: 'data_source_id', data_source_id: NOTION_VOICE_DS_ID },
+    properties: {
+      Name: { title: [{ type: 'text', text: { content: `Голос #${number}` } }] },
+      'Номер': { number },
+      'Роль': { select: { name: roleTitle } },
+      'Стаж': rtFull(exp),
+      'Статус': { select: { name: 'черновик' } },
+      Telegram: rtFull(telegram),
+      LinkedIn: rtFull(linkedin),
+      'Риски': rtFull(risks),
+      'Транскрипт': rtFull(transcript)
+    },
+    children
+  });
+  return pageToVoice(page);
+}
+
+async function voiceExtraOf(id) {
+  const data = await notionReq('GET', `/v1/blocks/${encodeURIComponent(id)}/children?page_size=100`);
+  return (data.results || [])
+    .filter(b => b.type === 'paragraph')
+    .map(b => fromRichText(b.paragraph && b.paragraph.rich_text))
+    .filter(Boolean).join('\n\n');
+}
+
+async function voiceGet(id) {
+  const v = pageToVoice(await notionReq('GET', `/v1/pages/${encodeURIComponent(id)}`));
+  if (!v.parentOk) throw new Error('Страница не из базы голосов');
+  return v;
+}
+
+// --- Gemini: расшифровка ---
+
+async function geminiUploadFile(buf, mime) {
+  const start = await fetch(`${GEMINI_FILES_BASE}/upload/v1beta/files`, {
+    method: 'POST',
+    headers: {
+      'x-goog-api-key': GEMINI_API_KEY,
+      'X-Goog-Upload-Protocol': 'resumable',
+      'X-Goog-Upload-Command': 'start',
+      'X-Goog-Upload-Header-Content-Length': String(buf.length),
+      'X-Goog-Upload-Header-Content-Type': mime,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({ file: { display_name: 'voice' } })
+  });
+  const uploadUrl = start.headers.get('x-goog-upload-url');
+  if (!start.ok || !uploadUrl) throw new Error(`Gemini Files: не удалось начать загрузку (HTTP ${start.status})`);
+  const up = await fetch(uploadUrl, {
+    method: 'POST',
+    headers: { 'X-Goog-Upload-Offset': '0', 'X-Goog-Upload-Command': 'upload, finalize' },
+    body: buf
+  });
+  const info = await up.json().catch(() => null);
+  if (!up.ok || !info || !info.file) throw new Error(`Gemini Files: загрузка не удалась (HTTP ${up.status})`);
+  let file = info.file;
+  for (let i = 0; i < 30 && file.state && file.state !== 'ACTIVE'; i++) {
+    if (file.state === 'FAILED') throw new Error('Gemini Files: файл не обработан');
+    await new Promise(r => setTimeout(r, 2000));
+    const r = await fetch(`${GEMINI_FILES_BASE}/v1beta/${file.name}`, { headers: { 'x-goog-api-key': GEMINI_API_KEY } });
+    file = (await r.json().catch(() => null)) || file;
+  }
+  return file;
+}
+
+async function geminiTranscribe(buf, mime) {
+  if (!GEMINI_API_KEY) throw new Error('GEMINI_API_KEY не задан в переменных Railway');
+  const m = /ogg|opus/i.test(mime) ? 'audio/ogg' : mime;
+  const part = buf.length <= VOICE_INLINE_MAX
+    ? { inline_data: { mime_type: m, data: buf.toString('base64') } }
+    : (f => ({ file_data: { mime_type: m, file_uri: f.uri } }))(await geminiUploadFile(buf, m));
+  const body = {
+    contents: [{ parts: [part, { text: 'Расшифруй это голосовое сообщение дословно, на языке оригинала (русский или украинский). Ничего не исправляй, не пересказывай и не добавляй. Верни только текст расшифровки, без пояснений и таймкодов.' }] }],
+    generationConfig: { temperature: 0 }
+  };
+  let last = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const r = await geminiPost(`${GEMINI_LEGACY_BASE}/${GEMINI_TRANSCRIBE_MODEL}:generateContent`, body);
+    if (r.resp.ok) {
+      const text = (((r.data || {}).candidates || [])[0] || {}).content;
+      const out = text && (text.parts || []).map(p => p.text || '').join('').trim();
+      if (out) return out;
+      last = 'пустой ответ';
+    } else {
+      last = `HTTP ${r.resp.status}: ${((r.data && r.data.error && r.data.error.message) || r.raw || '').slice(0, 200)}`;
+      if (r.resp.status < 429 && r.resp.status !== 408) break; // 4xx кроме 408/429: повтор не поможет
+    }
+    await new Promise(res => setTimeout(res, 2000 * (attempt + 1)));
+  }
+  throw new Error('Gemini не расшифровал голосовое: ' + last);
+}
+
+async function tgDownload(fileId) {
+  const f = await tgApi('getFile', { file_id: fileId });
+  if (!f.file_path) throw new Error('Telegram не отдал файл');
+  const resp = await fetch(`https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${f.file_path}`);
+  if (!resp.ok) throw new Error(`Не скачался файл (HTTP ${resp.status})`);
+  return Buffer.from(await resp.arrayBuffer());
+}
+
+// --- Claude: раскладка по вопросам ---
+
+const VOICE_SYSTEM_PROMPT = `Ты редактор рубрики «100 голосов iGaming». Тебе дают расшифровку голосовых ответов героя интервью и список вопросов. Твоя работа: разложить сказанное героем по вопросам ПРЯМОЙ РЕЧЬЮ.
+
+ЖЕСТКИЕ ПРАВИЛА:
+1. Ответ на каждый вопрос это речь героя от первого лица, как он сказал. Убери только слова-паразиты, «ээ», «ну», «как бы», повторы и оговорки. Слова и формулировки героя сохраняй. Можно склеивать куски одного ответа, которые герой произнес в разных местах.
+2. НИЧЕГО не дописывай, не пересказывай, не усиливай, не делай выводов, не придумывай связки. Каждая фраза в ответе должна быть в расшифровке. Если сомневаешься, оставь как у героя.
+3. Если на вопрос героя нет ответа в расшифровке, верни для него пустую строку.
+4. Интересное, что герой сказал вне вопросов, положи в "extra" (тоже прямой речью, те же правила очистки). Если такого нет, пустая строка.
+5. Речь на украинском переведи на русский максимально близко к тексту, без украшений, и поставь для этого ответа "translated": true.
+6. Без буквы «ё». Длинное тире как знак препинания не используй, дефис с пробелами тоже. Проценты записывай знаком % (не словом «процентов»).
+7. "risks": список всего, по чему героя могут узнать: названия компаний и брендов, точные цифры, имена людей, города и страны, уникальные истории. Для каждого: "what" (что именно) и "quote" (короткая цитата места из ответа). Если ничего нет, пустой список.
+
+Верни ТОЛЬКО JSON без пояснений и без markdown-ограждений, в формате:
+{"answers":[{"id":"<id вопроса>","text":"...","translated":false}],"extra":"...","risks":[{"what":"...","quote":"..."}]}
+В "answers" должны быть все вопросы из списка, в том же порядке, с теми же id.`;
+
+async function voiceStructure(questions, transcript) {
+  if (!ANTHROPIC_API_KEY) throw new Error('ANTHROPIC_API_KEY не задан');
+  const list = questions.map(q => `${q.id}: ${q.text}`).join('\n');
+  const resp = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' },
+    body: JSON.stringify({
+      model: MODEL, max_tokens: 8000, temperature: 0, system: VOICE_SYSTEM_PROMPT,
+      messages: [{ role: 'user', content: `ВОПРОСЫ:\n${list}\n\nРАСШИФРОВКА:\n${transcript}` }]
+    })
+  });
+  const data = await resp.json().catch(() => null);
+  if (!resp.ok) throw new Error('Claude: ' + ((data && data.error && data.error.message) || 'HTTP ' + resp.status));
+  if (data.stop_reason === 'max_tokens') throw new Error('Ответ Claude обрезан по длине: слишком много голосовых за раз');
+  const raw = ((data.content || [])[0] || {}).text || '';
+  const a = raw.indexOf('{'), b = raw.lastIndexOf('}');
+  let parsed;
+  try { parsed = JSON.parse(raw.slice(a, b + 1)); } catch { throw new Error('Claude вернул не-JSON, попробуй «Готово» ещё раз'); }
+  return parsed;
+}
+
+const voiceClean = t => noYo(String(t || '')).trim();
+
+// Сборка двух версий из ответов модели: формат поста задаёт код, а не модель
+function voiceAssemble({ number, roleTitle, exp, questions, commonCount, parsed }) {
+  const byId = Object.fromEntries((parsed.answers || []).map(a => [a.id, a]));
+  const head = `Голос #${number}: ${roleTitle}${exp ? ', ' + exp : ''}`;
+  const block = (q, i) => {
+    const a = byId[q.id] || {};
+    const text = voiceClean(a.text);
+    const body = text ? (a.translated ? `[ПЕРЕВОД]\n${text}` : text) : '[НЕТ ОТВЕТА]';
+    return `**${i + 1}. ${q.text}**\n${body}`;
+  };
+  const telegram = `${head}\n\n[ВСТУПЛЕНИЕ]\n\n${questions.map(block).join('\n\n')}\n\n[ФИНАЛ]`;
+  const linkedin = `${head}\n\n${questions.slice(0, commonCount).map(block).join('\n\n')}`.replace(/\*\*/g, '');
+  const risks = (parsed.risks || []).filter(r => r && r.what)
+    .map(r => `• ${voiceClean(r.what)}${r.quote ? `: «${voiceClean(r.quote)}»` : ''}`).join('\n');
+  return { telegram, linkedin, risks, extra: voiceClean(parsed.extra) };
+}
+
+// --- Сессия в чате с ботом ---
+
+const voiceSessions = new Map(); // userId -> сессия (в памяти: после перезапуска сервера открывается заново)
+
+const voiceKb = rows => ({ inline_keyboard: rows });
+const voiceCancelBtn = { text: 'Отмена', callback_data: 'vo:x' };
+const voiceDoneBtn = { text: 'Готово', callback_data: 'vo:go' };
+
+function voiceMediaOf(msg) {
+  if (msg.voice) return { fileId: msg.voice.file_id, mime: msg.voice.mime_type || 'audio/ogg', size: msg.voice.file_size || 0 };
+  if (msg.audio) return { fileId: msg.audio.file_id, mime: msg.audio.mime_type || 'audio/mpeg', size: msg.audio.file_size || 0 };
+  if (msg.document && /^audio\//.test(msg.document.mime_type || '')) return { fileId: msg.document.file_id, mime: msg.document.mime_type, size: msg.document.file_size || 0 };
+  return null;
+}
+
+const isVoiceMessage = msg => !!voiceMediaOf(msg);
+
+const voiceWord = n => (n % 10 === 1 && n % 100 !== 11) ? 'голосовое' : 'голосовых';
+
+async function voiceAnnounce(s) {
+  s.timer = null;
+  if (s.step === 'role') {
+    const q = loadQuestions();
+    const roleBtns = Object.entries(q.roles).map(([k, r]) => [{ text: r.title, callback_data: 'vo:r:' + k }]);
+    roleBtns.push([{ text: (q.other && q.other.title) || 'Другое', callback_data: 'vo:r:other' }]);
+    roleBtns.push([voiceCancelBtn]);
+    return botSend(s.chatId, `Принял ${s.voices.length} ${voiceWord(s.voices.length)}. Чей голос?`, { reply_markup: voiceKb(roleBtns) });
+  }
+  return botSend(s.chatId, `Добавил. Всего голосовых: ${s.voices.length}.`, { reply_markup: voiceKb([[voiceDoneBtn, voiceCancelBtn]]) });
+}
+
+async function voiceIntake(msg) {
+  const userId = String(msg.from.id);
+  let s = voiceSessions.get(userId);
+  if (s && s.busy) return botSend(msg.chat.id, 'Сейчас обрабатываю предыдущую пачку, подожди минуту.');
+  if (!voiceConfigured()) return botSend(msg.chat.id, 'Голоса не настроены: задай NOTION_VOICE_DS_ID (база «100 голосов iGaming») в переменных Railway.');
+  if (!s) {
+    s = { userId, chatId: msg.chat.id, voices: [], step: 'role', role: null, number: null, exp: '', otherQs: [], timer: null, busy: false };
+    voiceSessions.set(userId, s);
+  }
+  s.voices.push(voiceMediaOf(msg));
+  // Пересланная пачка приходит сообщениями подряд: один ответ на всю пачку
+  if (s.timer) clearTimeout(s.timer);
+  s.timer = setTimeout(() => voiceAnnounce(s).catch(e => console.error('voice announce:', scrubToken(e.message))), 1500);
+}
+
+async function voiceAskNumber(s) {
+  s.step = 'number';
+  let next = 1;
+  try { next = await voiceNextNumber(); } catch (e) { console.error('voice number:', scrubToken(e.message)); }
+  return botSend(s.chatId, `Номер голоса? Нажми кнопку или напиши число.`, {
+    reply_markup: voiceKb([[{ text: `Голос #${next}`, callback_data: 'vo:n:' + next }], [voiceCancelBtn]])
+  });
+}
+
+function voiceAskExp(s) {
+  s.step = 'exp';
+  return botSend(s.chatId, 'Стаж героя? Напиши текстом (например, «12 лет в индустрии») или пропусти.', {
+    reply_markup: voiceKb([[{ text: 'Пропустить', callback_data: 'vo:skip' }], [voiceCancelBtn]])
+  });
+}
+
+function voiceAskReady(s) {
+  s.step = 'ready';
+  const role = voiceRole(s.role, s.otherQs).title;
+  return botSend(s.chatId, `Голос #${s.number}: ${role}${s.exp ? ', ' + s.exp : ''}\nГолосовых: ${s.voices.length}. Можно досылать ещё. Нажми «Готово», когда всё.`, {
+    reply_markup: voiceKb([[voiceDoneBtn, voiceCancelBtn]])
+  });
+}
+
+// Текст в чате, пока открыта сессия: номер, стаж или вопросы для роли «Другое». true = сообщение использовано
+async function voiceText(msg) {
+  const s = voiceSessions.get(String(msg.from.id));
+  if (!s || s.busy) return false;
+  const text = String(msg.text || '').trim();
+  if (s.step === 'number') {
+    if (!/^\d{1,4}$/.test(text)) { await botSend(s.chatId, 'Нужно число, например 7.'); return true; }
+    s.number = Number(text);
+    await voiceAskExp(s);
+    return true;
+  }
+  if (s.step === 'exp') {
+    s.exp = text.slice(0, 80);
+    await voiceAskReady(s);
+    return true;
+  }
+  if (s.step === 'otherq') {
+    const qs = text.split('\n').map(x => x.replace(/^\s*\d+[.)]\s*/, '').trim()).filter(Boolean);
+    if (qs.length !== 2) { await botSend(s.chatId, 'Нужно ровно 2 вопроса, каждый с новой строки.'); return true; }
+    s.otherQs = qs;
+    await voiceAskNumber(s);
+    return true;
+  }
+  return false;
+}
+
+async function handleVoiceCallback(cb) {
+  const answer = (text) => tgApi('answerCallbackQuery', { callback_query_id: cb.id, text }).catch(() => {});
+  const userId = String(cb.from.id);
+  if (!TELEGRAM_ALLOWED_USER_IDS.includes(userId)) return answer('Нет доступа');
+  const s = voiceSessions.get(userId);
+  if (!s) return answer('Сессия голоса не открыта: перешли голосовые заново');
+  if (s.busy) return answer('Обрабатываю, подожди');
+  const parts = String(cb.data).split(':'); // vo:<kind>[:<arg>]
+  const kind = parts[1], arg = parts[2];
+  await answer();
+  if (kind === 'x') {
+    voiceSessions.delete(userId);
+    return botSend(s.chatId, 'Отменено, голосовые не сохранены.');
+  }
+  if (kind === 'r' && s.step === 'role') {
+    s.role = arg;
+    if (arg === 'other') {
+      s.step = 'otherq';
+      return botSend(s.chatId, 'Пришли 2 вопроса для этого героя одним сообщением, каждый с новой строки.', { reply_markup: voiceKb([[voiceCancelBtn]]) });
+    }
+    return voiceAskNumber(s);
+  }
+  if (kind === 'n' && s.step === 'number') { s.number = Number(arg); return voiceAskExp(s); }
+  if (kind === 'skip' && s.step === 'exp') { s.exp = ''; return voiceAskReady(s); }
+  if (kind === 'go') {
+    if (s.step !== 'ready') return botSend(s.chatId, 'Сначала выбери роль, номер и стаж.');
+    return voiceProcess(s);
+  }
+}
+
+async function voiceProcess(s) {
+  s.busy = true;
+  try {
+    await botSend(s.chatId, `Обрабатываю ${s.voices.length} ${voiceWord(s.voices.length)}, это займет пару минут…`);
+    const parts = [];
+    for (let i = 0; i < s.voices.length; i++) {
+      let buf;
+      try { buf = await tgDownload(s.voices[i].fileId); }
+      catch (e) { throw new Error(`Голосовое ${i + 1}: ${scrubToken(e.message)} (бот скачивает файлы до 20 МБ)`); }
+      const text = await geminiTranscribe(buf, s.voices[i].mime);
+      parts.push(`[Голосовое ${i + 1}]\n${text}`);
+    }
+    const transcript = parts.join('\n\n');
+    const role = voiceRole(s.role, s.otherQs);
+    const q = loadQuestions();
+    const questions = [
+      ...q.common.map((x, i) => ({ id: 'c' + (i + 1), text: typeof x === 'string' ? x : x.text })),
+      ...role.questions.map((x, i) => ({ id: 'r' + (i + 1), text: typeof x === 'string' ? x : x.text }))
+    ];
+    const parsed = await voiceStructure(questions, transcript);
+    const out = voiceAssemble({ number: s.number, roleTitle: role.title, exp: s.exp, questions, commonCount: q.common.length, parsed });
+    await voiceCreate({ number: s.number, roleTitle: role.title, exp: s.exp, ...out, transcript });
+    voiceSessions.delete(s.userId);
+    return botSend(s.chatId, `Голос #${s.number} готов, открой вкладку Голос.`);
+  } catch (e) {
+    s.busy = false;
+    console.error('voice process:', scrubToken(e.message));
+    return botSend(s.chatId, `Не получилось: ${scrubToken(e.message).slice(0, 400)}\n\nСессия сохранена, нажми «Готово» ещё раз.`, { reply_markup: voiceKb([[voiceDoneBtn, voiceCancelBtn]]) }).catch(() => {});
+  }
+}
+
+// --- Mini App: список и карточка голосов ---
+
+function voiceRoute(req, res) {
+  const url = req.url.split('?')[0];
+  const isList = req.method === 'GET' && url === '/api/voices';
+  const isGet = req.method === 'GET' && url === '/api/voice';
+  const isUpd = req.method === 'POST' && url === '/api/voice-update';
+  if (!isList && !isGet && !isUpd) return false;
+  const send = (status, obj) => { res.writeHead(status, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(obj)); };
+  const run = async (body) => {
+    try {
+      if (!voiceConfigured()) return send(503, { error: 'Голоса не настроены: задай NOTION_VOICE_DS_ID в переменных Railway' });
+      const auth = await authorizeUser(req);
+      if (!auth.ok) return send(auth.status, { error: auth.error });
+      if (isList) {
+        const data = await notionReq('POST', `/v1/data_sources/${NOTION_VOICE_DS_ID}/query`, {
+          sorts: [{ property: 'Номер', direction: 'descending' }], page_size: 100
+        });
+        const items = (data.results || []).map(pageToVoice).map(v => ({ id: v.id, number: v.number, role: v.role, status: v.status, date: v.date }));
+        return send(200, { items });
+      }
+      if (isGet) {
+        const id = new URL(req.url, 'http://localhost').searchParams.get('id') || '';
+        if (!/^[0-9a-f-]{32,40}$/i.test(id)) return send(400, { error: 'Некорректный id' });
+        let v;
+        try { v = await voiceGet(id); } catch { return send(404, { error: 'Голос не найден' }); }
+        v.extra = await voiceExtraOf(id).catch(() => '');
+        delete v.parentOk;
+        return send(200, v);
+      }
+      const { id, telegram, linkedin, status } = JSON.parse(body);
+      if (!/^[0-9a-f-]{32,40}$/i.test(String(id || ''))) return send(400, { error: 'Некорректный id' });
+      if (status !== undefined && !VOICE_STATUSES.includes(status)) return send(400, { error: 'Неизвестный статус' });
+      try { await voiceGet(id); } catch { return send(404, { error: 'Голос не найден' }); }
+      const properties = {};
+      if (typeof telegram === 'string') properties.Telegram = rtFull(telegram);
+      if (typeof linkedin === 'string') properties.LinkedIn = rtFull(linkedin);
+      if (status !== undefined) properties['Статус'] = { select: { name: status } };
+      if (!Object.keys(properties).length) return send(400, { error: 'Нечего сохранять' });
+      await notionReq('PATCH', `/v1/pages/${encodeURIComponent(id)}`, { properties });
+      return send(200, { ok: true });
+    } catch (err) {
+      console.error('voice route error:', scrubToken(err.message));
+      send(err.httpStatus || 500, { error: scrubToken(err.message) });
+    }
+  };
+  if (req.method === 'POST') {
+    let body = '';
+    req.on('data', chunk => { body += chunk; if (body.length > 2 * 1024 * 1024) req.destroy(); });
+    req.on('end', () => run(body));
+  } else {
+    run('');
+  }
+  return true;
+}
+
 async function handleBotUpdate(update) {
   if (update.chat_member) return handleChatMember(update.chat_member).catch(e => console.error('chat_member:', scrubToken(e.message)));
   if (update.callback_query) {
+    if (/^vo:/.test(String(update.callback_query.data || ''))) return handleVoiceCallback(update.callback_query).catch(e => console.error('voice cb:', scrubToken(e.message)));
     if (/^cx:\d+$/.test(String(update.callback_query.data || ''))) return handleCommentCallback(update.callback_query);
     if (/^(tp:\d+:\d+|tm:\d+)$/.test(String(update.callback_query.data || ''))) return handleThreadsReplyCallback(update.callback_query);
     return handleBotCallback(update.callback_query);
@@ -3468,6 +3906,8 @@ async function handleBotUpdate(update) {
   if (!TELEGRAM_ALLOWED_USER_IDS.includes(userId)) {
     return botSend(msg.chat.id, `Нет доступа. Твой Telegram ID: ${userId}`);
   }
+  if (isVoiceMessage(msg)) return voiceIntake(msg).catch(e => console.error('voice intake:', scrubToken(e.message)));
+  if (msg.text && !msg.text.startsWith('/') && voiceSessions.has(userId) && await voiceText(msg).catch(e => { console.error('voice text:', scrubToken(e.message)); return false; })) return;
   const cmd = String(msg.text || '').trim().split(/\s|@/)[0].toLowerCase();
   if (cmd === '/scheduled') {
     if (!scheduleConfigured()) return botSend(msg.chat.id, 'Расписание не настроено: нет NOTION_API_KEY.');
