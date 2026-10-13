@@ -2088,6 +2088,7 @@ function pageToRow(p) {
     threadsId: fromRichText(pr['Threads ID'] && pr['Threads ID'].rich_text),
     mod: fromRichText(pr['Модерация'] && pr['Модерация'].rich_text),
     draft: fromRichText(pr['Черновик'] && pr['Черновик'].rich_text),
+    src: fromRichText(pr['Источник'] && pr['Источник'].rich_text),
     views: pr['Просмотры'] && typeof pr['Просмотры'].number === 'number' ? pr['Просмотры'].number : null,
     likes: pr['Лайки'] && typeof pr['Лайки'].number === 'number' ? pr['Лайки'].number : null,
     replies: pr['Ответы'] && typeof pr['Ответы'].number === 'number' ? pr['Ответы'].number : null,
@@ -3012,7 +3013,7 @@ function apPromptExtra() {
 async function apEnsureProps() {
   if (apPropsOk) return true;
   try {
-    await notionReq('PATCH', `/v1/data_sources/${NOTION_SCHEDULE_DS_ID}`, { properties: { 'Модерация': { rich_text: {} }, 'Черновик': { rich_text: {} } } });
+    await notionReq('PATCH', `/v1/data_sources/${NOTION_SCHEDULE_DS_ID}`, { properties: { 'Модерация': { rich_text: {} }, 'Черновик': { rich_text: {} }, 'Источник': { rich_text: {} } } });
     apPropsOk = true;
   } catch (e) { console.error('autopilot: свойства Notion не созданы:', scrubToken(e.message)); }
   return apPropsOk;
@@ -3111,6 +3112,121 @@ async function apMakeBatch(format, recentRows) {
   } finally { apContext = ''; }
 }
 
+// ── Темы из постов Дмитрия: Content Engine в Notion (посты LinkedIn) и опубликованные посты Telegram ──
+// Каждый источник берется один раз (свойство «Источник» в базе расписания), мысль адаптируется для широкого читателя Threads.
+const AP_CE_DS = process.env.CONTENT_ENGINE_DS_ID || '14814719-85c5-4819-a07e-3d1b773d6bdb';
+let apCeWarned = false;
+const apNorm = t => String(t || '').toLowerCase().replace(/ё/g, 'е').replace(/\s+/g, ' ').replace(/[«»"“”„'’.,!?;:()\-–—]/g, '').trim();
+
+async function apPageText(pageId, limit = 6000) {
+  let out = '', cursor;
+  for (let i = 0; i < 3 && out.length < limit; i++) {
+    const data = await notionReq('GET', `/v1/blocks/${encodeURIComponent(pageId)}/children?page_size=100${cursor ? '&start_cursor=' + encodeURIComponent(cursor) : ''}`);
+    for (const b of data.results || []) {
+      const rt = b[b.type] && b[b.type].rich_text;
+      if (Array.isArray(rt)) { const t = fromRichText(rt).trim(); if (t) out += t + '\n'; }
+    }
+    if (!data.has_more) break;
+    cursor = data.next_cursor;
+  }
+  return out.slice(0, limit);
+}
+
+async function apUsedSources() {
+  const used = new Set();
+  let cursor;
+  for (let i = 0; i < 5; i++) {
+    const data = await notionReq('POST', `/v1/data_sources/${NOTION_SCHEDULE_DS_ID}/query`, { filter: { property: 'Источник', rich_text: { is_not_empty: true } }, page_size: 100, ...(cursor ? { start_cursor: cursor } : {}) });
+    for (const r of (data.results || []).map(pageToRow)) if (r.src) used.add(r.src.split('|')[0]);
+    if (!data.has_more) break;
+    cursor = data.next_cursor;
+  }
+  return used;
+}
+
+async function apSourcePool() {
+  const pool = [];
+  try {
+    const data = await notionReq('POST', `/v1/data_sources/${AP_CE_DS}/query`, { filter: { property: 'Status', select: { equals: 'Published' } }, sorts: [{ property: 'Publish Date', direction: 'descending' }], page_size: 100 });
+    for (const p of data.results || []) {
+      const pr = p.properties || {};
+      const title = fromRichText(pr.Post && pr.Post.title).trim();
+      if (!title) continue;
+      const hint = [fromRichText(pr.Hook && pr.Hook.rich_text), fromRichText(pr['Core Point'] && pr['Core Point'].rich_text)].map(x => x.trim()).filter(Boolean).join('\n');
+      pool.push({ key: 'ce:' + p.id, id: p.id, origin: 'LinkedIn', title, hint });
+    }
+  } catch (e) {
+    console.error('autopilot: Content Engine недоступен:', scrubToken(e.message));
+    if (!apCeWarned) {
+      apCeWarned = true;
+      for (const u of TELEGRAM_ALLOWED_USER_IDS) await botSend(Number(u), 'Автопилот не видит базу Content Engine в Notion. Открой ее для интеграции бота (меню базы «…» → Connections), иначе темы берутся только из постов Telegram.').catch(() => {});
+    }
+  }
+  try {
+    const data = await notionReq('POST', `/v1/data_sources/${NOTION_SCHEDULE_DS_ID}/query`, { filter: statusIs('published'), sorts: [{ property: 'Publish At', direction: 'descending' }], page_size: 100 });
+    for (const r of (data.results || []).map(pageToRow)) {
+      if (r.text && r.text.length > 200) pool.push({ key: 'tg:' + r.id, id: r.id, origin: 'Telegram', title: shortPreview(r.text, 80), text: r.text });
+    }
+  } catch (e) { console.error('autopilot: посты Telegram:', scrubToken(e.message)); }
+  return pool;
+}
+
+function apSourcePrompt(kind) {
+  const k = AP_KIND[kind];
+  return `Ты редактор Threads Дмитрия Скакунова: 18 лет в гемблинге, руководил спортбуком. Тебе дают несколько его собственных опубликованных постов из LinkedIn и Telegram. Они написаны для людей из индустрии. Аудитория Threads широкая: любой взрослый, кому интересны игры, ставки, деньги, риск, лидерство и мотивация.
+
+Задача: выбери ОДИН пост, в котором есть мысль для рубрики «${k.rubric}» (${THREADS_FORMATS[k.format] || ''}). Вытащи из него ОДНУ мысль и напиши пост для Threads, понятный человеку вне индустрии. Это не сокращение исходного поста, а одна его мысль, пересказанная для нового читателя с объяснением причины и арифметики там, где это нужно.
+
+Перед выбором ответь себе: что читатель Threads унесет отсюда нового или полезного? Если ответ сводится к общей мудрости или пословице, бери другой пост или другую мысль. Не повторяй мысли, которые уже есть в recent_posts, даже другими словами и с другим заходом. Если ни один пост не дает новой мысли для этой рубрики, верни status skip.
+
+Факты, цифры, случаи и личный опыт бери только из выбранного поста, ничего не добавляй и не усиливай. Личный опыт можно подавать от первого лица, только если он есть в посте. Обязательно приложи дословную цитату из поста (quote), на которой держится мысль.
+
+Формат: одна мысль. Threads формат короткий, пост должен помещаться целиком и читаться за несколько секунд, обычно 150-350 символов, до 450, но не короче, чем нужно для полной мысли. Первая строка цепляет сама. Русский язык, буква е без точек, без эмодзи, хэштегов, ссылок и доменов, без тире (только запятые и двоеточия), без конструкций «не X, а Y», без «Вот как», «Вот что», «Результат?», «Честно говоря», «В заключение», без слова «книга» в значении линии букмекера, без американского гемблинга (кроме prediction markets). Базовые термины индустрии не расшифровывай. Мотивация допустима только на конкретике, без «верь в себя» и «ты сможешь».${apPromptExtra()}
+
+Верни ТОЛЬКО JSON без Markdown: {"status":"ready|skip","source":номер поста,"thought":"мысль одной фразой","quote":"дословная цитата из поста","post_text":"текст поста","takeaway":"что читатель вынесет, одной фразой","reason":""}`;
+}
+
+async function apMakeFromSources(kind, recentRows) {
+  const pool = await apSourcePool();
+  if (!pool.length) return null;
+  const used = await apUsedSources().catch(() => new Set());
+  const fresh = pool.filter(x => !used.has(x.key));
+  if (!fresh.length) return null;
+  for (let i = fresh.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [fresh[i], fresh[j]] = [fresh[j], fresh[i]]; }
+  const cands = fresh.slice(0, 6);
+  for (const c of cands) if (!c.text) c.text = ((c.hint ? c.hint + '\n' : '') + await apPageText(c.id).catch(() => '')).trim();
+  const usable = cands.filter(c => c.text && c.text.length > 150);
+  if (!usable.length) return null;
+  const input = {
+    candidates: usable.map((c, i) => ({ n: i + 1, origin: c.origin, title: c.title, text: c.text.slice(0, 3500) })),
+    recent_posts: recentRows.slice(0, 30).map(r => shortPreview(r.text, 200))
+  };
+  const raw = await claudeCall(apSourcePrompt(kind), JSON.stringify(input), 3000);
+  const res = parseEditorJson(raw);
+  if (!res || res.status !== 'ready') { console.log('autopilot: из постов не получилось:', res && res.reason); return null; }
+  const src = usable[Number(res.source) - 1];
+  if (!src) return null;
+  const text = noYo(String(res.post_text || '').trim());
+  const why = [];
+  if (!text) why.push('пусто');
+  if (threadsLength(text) > THREADS_SAFE) why.push('длинно');
+  for (const [re, w] of THREADS_BAD) if (w !== 'выдуманный личный опыт' && re.test(text)) why.push(w);
+  if (findNegContrast(text).length) why.push('не X, а Y');
+  if (/[—–]/.test(text) || /\s-\s/.test(text)) why.push('тире');
+  if (US_GAMBLING.test(text) && !PRED_MARKET.test(text)) why.push('США');
+  const q = apNorm(res.quote);
+  if (!q || !apNorm(src.text).includes(q)) why.push('цитата не найдена в исходном посте');
+  const head = apNorm(text).slice(0, 60);
+  if (recentRows.some(r => apNorm(r.text).slice(0, 60) === head)) why.push('повтор');
+  if (why.length) { console.log('autopilot: черновик из поста отброшен:', why.join(', ')); return null; }
+  return {
+    text, type: AP_KIND[kind].type, goal: 'reach',
+    src: `${src.key}|${src.title}`.slice(0, 300),
+    sourceTitle: `${src.origin}: ${src.title}`,
+    takeaway: String(res.takeaway || '').trim().slice(0, 300)
+  };
+}
+
 async function apCreateDraft(text, iso, owner, rubric, meta) {
   const props = {
     Name: { title: [{ type: 'text', text: { content: '🧵 ' + (shortPreview(text, 70) || 'Threads') } }] },
@@ -3122,7 +3238,8 @@ async function apCreateDraft(text, iso, owner, rubric, meta) {
     ...(meta && meta.type ? { Type: { select: { name: meta.type } } } : {}),
     ...(meta && meta.goal ? { Goal: { select: { name: meta.goal } } } : {}),
     ...(meta && meta.company ? { Company: { rich_text: toRichText(meta.company) } } : {}),
-    ...(meta && meta.angle ? { Angle: { rich_text: toRichText(meta.angle) } } : {})
+    ...(meta && meta.angle ? { Angle: { rich_text: toRichText(meta.angle) } } : {}),
+    ...(meta && meta.src && apPropsOk ? { 'Источник': { rich_text: toRichText(meta.src) } } : {})
   };
   return pageToRow(await notionReq('POST', '/v1/pages', { parent: { type: 'data_source_id', data_source_id: NOTION_SCHEDULE_DS_ID }, properties: props }));
 }
@@ -3160,6 +3277,7 @@ async function apTick({ force = false } = {}) {
     const dayKey = ms => { const p = warsawParts(ms); return `${p.y}-${p.mo}-${p.d}`; };
     const busy = new Set(rows.filter(r => r.publishAt).map(r => dayKey(Date.parse(r.publishAt))));
     const recentRows = rows.slice().sort((a, b) => Date.parse(b.publishAt || 0) - Date.parse(a.publishAt || 0));
+    const histRows = [...recentRows, ...(await tRecent(30).catch(() => []))];
     const base = warsawParts(now);
     const [sh, sm] = AP_SLOT.split(':').map(Number);
     for (let off = 0; off < AP_DAYS; off++) {
@@ -3174,15 +3292,16 @@ async function apTick({ force = false } = {}) {
         made = await apMakeNews(recentRows).catch(e => { console.error('autopilot: новости', scrubToken(e.message)); return null; });
         if (!made) { kind = 'mechanics'; note = 'Подходящей новости не нашлось, вместо нее механика.'; }
       }
+      if (!made) made = await apMakeFromSources(kind, histRows).catch(e => { console.error('autopilot: темы из постов', scrubToken(e.message)); return null; });
       if (!made) {
-        const text = await apMakeBatch(AP_KIND[kind].format, recentRows).catch(e => { console.error('autopilot: генерация', scrubToken(e.message)); return null; });
-        if (text) made = { text, type: AP_KIND[kind].type, goal: 'reach' };
+        const text = await apMakeBatch(AP_KIND[kind].format, histRows).catch(e => { console.error('autopilot: генерация', scrubToken(e.message)); return null; });
+        if (text) { made = { text, type: AP_KIND[kind].type, goal: 'reach' }; note = (note ? note + '\n' : '') + 'В твоих постах свежей темы не нашлось, тема от бота.'; }
       }
       if (!made) { apState.lastNote = `на ${d}.${mo} черновик не получился`; continue; }
       const iso = new Date(ms).toISOString();
       const row = await apCreateDraft(made.text, iso, owner, AP_KIND[kind].rubric, made);
-      recentRows.unshift(row); busy.add(dayKey(ms)); created++;
-      const card = apCard(row, AP_KIND[kind].rubric, note);
+      recentRows.unshift(row); histRows.unshift(row); busy.add(dayKey(ms)); created++;
+      const card = apCard(row, AP_KIND[kind].rubric, [note, made.sourceTitle ? 'Тема из: ' + made.sourceTitle : '', made.takeaway ? 'Читатель вынесет: ' + made.takeaway : ''].filter(Boolean).join('\n'));
       for (const u of TELEGRAM_ALLOWED_USER_IDS) await botSend(Number(u), card.text, { reply_markup: card.reply_markup, disable_web_page_preview: true }).catch(e => console.error('autopilot: карточка', scrubToken(e.message)));
     }
     apState.lastError = null;
