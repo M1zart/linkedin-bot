@@ -2661,7 +2661,7 @@ function threadsRoute(req, res) {
           await schedUpdate(row.id, { publishAt: parsed.iso, status: TS.scheduled, error: '' });
           return send(200, { ok: true, local: formatWarsaw(parsed.iso) });
         }
-        if (row.status !== TS.scheduled && !(action === 'publish' && (row.status === TS.missed || row.status === TS.failed))) {
+        if (row.status !== TS.scheduled && !((action === 'publish' || action === 'cancel') && (row.status === TS.missed || row.status === TS.failed))) {
           return send(409, { error: `Пост уже не в очереди: ${row.status}` });
         }
         if (action === 'cancel') {
