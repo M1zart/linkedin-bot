@@ -3209,6 +3209,15 @@ async function apSmooth(text, srcText) {
   return out ? noYo(out.trim()).replace(/\s*[—–]\s*/g, ', ') : text;
 }
 
+async function apRepair(text, issues, srcText, linkDue) {
+  const limit = linkDue ? THREADS_MAX - 10 : THREADS_SAFE - 20;
+  const system = `Ты редактор постов для Threads. Исправь черновик, сохранив его мысль, факты и посыл. Ничего не добавляй сверх исходного поста автора. Что нужно исправить: ${issues.join('; ')}.
+Правила: не длиннее ${limit} символов вместе со ссылкой, если она есть; живая связная речь, полные предложения, без обрывков из одного-трех слов; без противопоставлений «не X, а Y», «это не X, это Y», «не потому что X, а потому что Y»: говори прямо, что есть, без того, чего нет; без тире (только запятые и двоеточия); буква е без точек; без эмодзи и хэштегов.${linkDue ? ` Если в черновике есть ссылка ${THREADS_INVITE_LINK}, оставь ее отдельной последней строкой, других ссылок нет.` : ' Без ссылок и без упоминания Telegram.'}
+Верни только исправленный текст поста.`;
+  const out = await claudeCall(system, `ИСХОДНЫЙ ПОСТ АВТОРА (для сверки фактов):\n${String(srcText || '').slice(0, 3000)}\n\nЧЕРНОВИК:\n${text}`, 1500);
+  return out ? noYo(out.trim()).replace(/\s*[—–]\s*/g, ', ').replace(/\s+-\s+/g, ', ') : null;
+}
+
 async function apMakeFromSources(kind, recentRows, linkDue = false) {
   const pool = await apSourcePool();
   if (!pool.length) return null;
@@ -3234,24 +3243,35 @@ async function apMakeFromSources(kind, recentRows, linkDue = false) {
   let text = noYo(String(res.post_text || '').trim()).replace(/\s*[—–]\s*/g, ', ').replace(/\s+-\s+/g, ', ');
   if (apChoppy(text)) text = await apSmooth(text, src.text);
   if (findNegContrast(text).length) text = noYo(await runNegContrastFix(text));
-  const why = [];
-  if (apChoppy(text)) why.push('рубленый стиль');
-  if (!text) why.push('пусто');
-  if (threadsLength(text) > THREADS_SAFE) why.push('длинно');
-  const urls = text.match(/https?:\/\/\S+/g) || [];
-  const body = text.split(THREADS_INVITE_LINK).join(' ');
-  if (!linkDue && (urls.length || AP_TG_MENTION.test(text))) why.push('ссылка или упоминание Telegram не по очереди');
-  if (linkDue && (urls.length > 1 || urls.some(u => u !== THREADS_INVITE_LINK))) why.push('чужая ссылка');
-  if (threadsLength(text) > THREADS_MAX) why.push('ссылка с текстом не влезает в лимит');
-  for (const [re, w] of THREADS_BAD) if (w !== 'выдуманный личный опыт' && re.test(body)) why.push(w);
-  if (findNegContrast(text).length) why.push('не X, а Y');
-  if (/[—–]/.test(text) || /\s-\s/.test(text)) why.push('тире');
-  if (US_GAMBLING.test(text) && !PRED_MARKET.test(text)) why.push('США');
+  const check = t => {
+    const why = [];
+    if (!t) why.push('пусто');
+    if (apChoppy(t)) why.push('рубленый стиль');
+    if (threadsLength(t) > (linkDue ? THREADS_MAX : THREADS_SAFE)) why.push('длинно');
+    const urls = t.match(/https?:\/\/\S+/g) || [];
+    const body = t.split(THREADS_INVITE_LINK).join(' ');
+    if (!linkDue && (urls.length || AP_TG_MENTION.test(t))) why.push('ссылка или упоминание Telegram не по очереди');
+    if (linkDue && (urls.length > 1 || urls.some(u => u !== THREADS_INVITE_LINK))) why.push('чужая ссылка');
+    for (const [re, w] of THREADS_BAD) if (w !== 'выдуманный личный опыт' && re.test(body)) why.push(w);
+    if (findNegContrast(t).length) why.push('конструкция «не X, а Y» или «это не X, это Y»');
+    if (/[—–]/.test(t) || /\s-\s/.test(t)) why.push('тире');
+    if (US_GAMBLING.test(t) && !PRED_MARKET.test(t)) why.push('США');
+    return why;
+  };
   const q = apNorm(res.quote);
-  if (!q || !apNorm(src.text).includes(q)) why.push('цитата не найдена в исходном посте');
+  if (!q || !apNorm(src.text).includes(q)) { console.log('autopilot: черновик из поста отброшен: цитата не найдена в исходном посте'); return null; }
   const head = apNorm(text).slice(0, 60);
-  if (recentRows.some(r => apNorm(r.text).slice(0, 60) === head)) why.push('повтор');
+  if (recentRows.some(r => apNorm(r.text).slice(0, 60) === head)) { console.log('autopilot: черновик из поста отброшен: повтор'); return null; }
+  // До двух попыток починить оформление: длину, противопоставления, рубленый стиль. Смысл и факты не трогаем
+  let why = check(text);
+  for (let attempt = 0; why.length && attempt < 2; attempt++) {
+    const fixed = await apRepair(text, why, src.text, linkDue);
+    if (!fixed) break;
+    text = fixed;
+    why = check(text);
+  }
   if (why.length) { console.log('autopilot: черновик из поста отброшен:', why.join(', ')); return null; }
+  const urls = text.match(/https?:\/\/\S+/g) || [];
   return {
     text, type: AP_KIND[kind].type, goal: urls.length ? 'telegram_bridge' : 'reach',
     src: `${src.key}|${src.title}`.slice(0, 300),
