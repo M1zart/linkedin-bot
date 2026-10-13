@@ -2086,6 +2086,8 @@ function pageToRow(p) {
     askButton: !!(pr['Кнопка вопроса'] && pr['Кнопка вопроса'].checkbox === true),
     rubric: (pr['Рубрика'] && pr['Рубрика'].select && pr['Рубрика'].select.name) || null,
     threadsId: fromRichText(pr['Threads ID'] && pr['Threads ID'].rich_text),
+    mod: fromRichText(pr['Модерация'] && pr['Модерация'].rich_text),
+    draft: fromRichText(pr['Черновик'] && pr['Черновик'].rich_text),
     views: pr['Просмотры'] && typeof pr['Просмотры'].number === 'number' ? pr['Просмотры'].number : null,
     likes: pr['Лайки'] && typeof pr['Лайки'].number === 'number' ? pr['Лайки'].number : null,
     replies: pr['Ответы'] && typeof pr['Ответы'].number === 'number' ? pr['Ответы'].number : null,
@@ -2261,6 +2263,10 @@ function startScheduling() {
     threadsReplyState.started = true;
     setTimeout(() => snapshot48Tick(), 40000);
     setInterval(() => snapshot48Tick(), 60 * 60 * 1000);
+    if (AP_ON()) {
+      setTimeout(() => apTick(), 60000);
+      setInterval(() => apTick(), 60 * 60 * 1000);
+    }
   }
   setTimeout(() => statsTick().catch(e => console.error('stats:', scrubToken(e.message))), 25000);
   setInterval(() => statsTick().catch(e => console.error('stats:', scrubToken(e.message))), 10 * 60 * 1000);
@@ -2491,6 +2497,7 @@ const THREADS_FORMATS = {
   humor: 'СУХОЙ САРКАЗМ про индустрию, риск и жизнь рядом со ставками: одна наблюдательная мысль в одну-три строки, без смайлов, без объяснения шутки. Серьезным тоном, как будто это обычное наблюдение.',
   decisions: 'РЕШЕНИЯ В УСЛОВИЯХ НЕОПРЕДЕЛЕННОСТИ: покер, шахматы, трейдинг линии, ставки на ожидание. Короткие тезисы про разницу между хорошим решением и хорошим результатом, про цену ошибки, про терпение. Без коучинга и без «ты сможешь».',
   question: 'ВОПРОС К АУДИТОРИИ: одна-две строки контекста и один конкретный вопрос, на который хочется ответить своим мнением (про ставки, риск, покер, спорт, деньги). Не опрос из двух вариантов.',
+  people: 'ЛЮДИ И ИНСТРУМЕНТЫ ИНДУСТРИИ: профессии рядом со ставками (трейдер, риск-менеджер, аналитик, саппорт, CRM), как устроена их работа и где она неочевидна, инструменты и автоматизация (ИИ, боты, дашборды, модели), что они реально меняют, а что нет. Только общеизвестная логика профессий и инструментов, без выдуманных историй, компаний и цифр.',
   mix: 'МИКС: примерно 40% механика денег и вероятности, 30% сухой сарказм, 20% решения в условиях неопределенности, 10% вопрос к аудитории'
 };
 
@@ -2509,7 +2516,7 @@ function threadsSystemPrompt(format) {
 - Минимум англицизмов: если есть нормальное русское слово, использовать его. Термины индустрии (GGR, маржа, прокрут) не расшифровывать.
 - Посты не повторяют друг друга ни темой, ни первой строкой, ни ритмом.
 
-ФОРМАТ ОТВЕТА: только тексты постов, между постами строка из трех решеток ### . Без нумерации, заголовков и пояснений.`;
+ФОРМАТ ОТВЕТА: только тексты постов, между постами строка из трех решеток ### . Без нумерации, заголовков и пояснений.${apPromptExtra()}`;
 }
 
 const THREADS_BAD = [
@@ -2725,6 +2732,8 @@ NEWS: факт, клиентский эффект, операторская оп
 Перед текстом внутренне оцени кандидата по шести критериям 0-2: interest, novelty, customer_face, business_mechanism, author_angle, evidence. Порог 8 из 12. Для NEWS и FEATURE evidence должна быть 2, для FEATURE customer_face минимум 1, для любого типа author_angle минимум 1. Сначала внутренне ответь на пять вопросов клиентского лица: что клиент увидит, какое действие станет проще, дороже или вероятнее, какого поведения хочет компания, на какой показатель это влияет, какой риск или ограничение. Выбери один главный конфликт. Если suggested_type не auto, используй его, если он не противоречит материалу.
 
 Статусы: ready (пройдены пороги, факты подтверждены, ссылка там где нужна, длина не больше 500, нет дубля и запрещенного), needs_input (не хватает источника, даты, числа, контекста или содержания Telegram-материала), skip (нет клиентского лица и механики, чистый пресс-релиз, факт не подтвердить, тема недавно выходила с тем же выводом, нужно выдумывать, не про iGaming, устарело, реклама букмекера). Для skip и needs_input post_text оставь пустым.
+
+${apPromptExtra()}
 
 Тебе приходит JSON с полями current_date, candidate (title, source_url, source_text, published_at, suggested_type), recent_posts, mix_last_20, telegram_asset. Верни ТОЛЬКО валидный JSON без Markdown:
 {"status":"ready|needs_input|skip","content_type":"news|feature|mechanic|opinion","goal":"reach|telegram_bridge","company":"","angle":"","customer_face":"","business_mechanism":"","source_url":"","source_quality":"primary|secondary|not_required|insufficient","suggested_topic":"","post_text":"","character_count":0,"score":{"interest":0,"novelty":0,"customer_face":0,"business_mechanism":0,"author_angle":0,"evidence":0,"total":0},"internal_fact_check":[{"claim":"","support":""}],"reason":""}`;
@@ -2963,6 +2972,311 @@ async function generateAngles(cand) {
 }
 // ── конец блока углов ──
 // ── конец блока Threads ──
+
+// ── Автопилот Threads: бот сам готовит черновики по сетке рубрик, владелец модерирует в Telegram ──
+// Включается THREADS_AUTOPILOT=on. Раз в час бот проверяет ближайшие THREADS_AUTOPILOT_DAYS дней (по умолчанию 3):
+// если на день нет ни одного поста, готовит черновик под рубрику этого дня и присылает карточку с кнопками.
+// Черновик лежит в Notion со статусом t_draft и не публикуется. Одобрил или поправил: он становится t_scheduled и уходит по расписанию.
+// Убрал: статус t_cancelled и причина. Причины и правки уходят обратно в промпты генерации (apPromptExtra).
+// Нужны свойства Notion «Модерация» и «Черновик» (текст): бот создает их сам при первом запуске.
+const AP_ON = () => process.env.THREADS_AUTOPILOT === 'on';
+const AP_DAYS = Math.min(14, Math.max(1, Number(process.env.THREADS_AUTOPILOT_DAYS) || 3));
+const AP_SLOT = /^\d{1,2}:\d{2}$/.test(process.env.THREADS_AUTOPILOT_SLOT || '') ? process.env.THREADS_AUTOPILOT_SLOT : '19:30';
+const AP_FEEDS = (process.env.THREADS_FEEDS || 'https://www.igamingbusiness.com/feed/,https://sbcnews.co.uk/feed/').split(',').map(s => s.trim()).filter(Boolean);
+const AP_DRAFT = 't_draft';
+// День недели (0 = воскресенье) -> тип черновика; сетка из стратегии: пн новость, вт механика, ср новость, чт люди и инструменты, пт новость, сб механика, вс сарказм
+const AP_GRID = { 1: 'news', 2: 'mechanics', 3: 'news', 4: 'people', 5: 'news', 6: 'mechanics', 0: 'sarcasm' };
+const AP_KIND = {
+  news: { rubric: 'Новость + оценка', type: 'news' },
+  mechanics: { rubric: 'Механика денег', type: 'mechanic', format: 'mechanics' },
+  people: { rubric: 'Люди и инструменты', type: 'opinion', format: 'people' },
+  sarcasm: { rubric: 'Сарказм и личное', type: 'opinion', format: 'humor' }
+};
+const AP_REASONS = ['Слишком общо', 'Пересказ без вывода', 'Выдумка', 'Скучно', 'Тон не мой', 'Тема не подходит'];
+
+let apRunning = false, apPropsOk = false, apContext = '';
+let apLearn = { at: 0, text: '' };
+const apTried = new Set();
+const apState = { lastRunAt: null, lastError: null, lastNote: '' };
+
+// Блок в промпты генераторов: что владелец убирал и как правил + недавние посты, чтобы не повторяться
+function apPromptExtra() {
+  const parts = [];
+  if (apLearn.text) parts.push(apLearn.text);
+  if (apContext) parts.push(apContext);
+  return parts.length ? '\n\n' + parts.join('\n\n') : '';
+}
+
+async function apEnsureProps() {
+  if (apPropsOk) return true;
+  try {
+    await notionReq('PATCH', `/v1/data_sources/${NOTION_SCHEDULE_DS_ID}`, { properties: { 'Модерация': { rich_text: {} }, 'Черновик': { rich_text: {} } } });
+    apPropsOk = true;
+  } catch (e) { console.error('autopilot: свойства Notion не созданы:', scrubToken(e.message)); }
+  return apPropsOk;
+}
+
+async function apModRows(limit, afterMs) {
+  const filter = { and: [{ property: 'Модерация', rich_text: { is_not_empty: true } }, ...(afterMs ? [{ property: 'Publish At', date: { on_or_after: new Date(afterMs).toISOString() } }] : [])] };
+  const data = await notionReq('POST', `/v1/data_sources/${NOTION_SCHEDULE_DS_ID}/query`, { filter, sorts: [{ property: 'Publish At', direction: 'descending' }], page_size: limit });
+  return (data.results || []).map(pageToRow);
+}
+
+async function apRefreshLearning() {
+  if (Date.now() - apLearn.at < 20 * 60 * 1000) return;
+  apLearn.at = Date.now();
+  try {
+    const rows = await apModRows(60);
+    const kills = rows.filter(r => /^kill:/.test(r.mod)).slice(0, 8);
+    const edits = rows.filter(r => r.mod === 'edit' && r.draft && r.draft !== r.text).slice(0, 5);
+    const out = [];
+    if (kills.length) out.push('ЧТО ВЛАДЕЛЕЦ УБРАЛ ИЗ ЧЕРНОВИКОВ (не пиши такое, причина указана):\n' + kills.map(r => `- [${r.mod.slice(5)}] ${shortPreview(r.text, 160)}`).join('\n'));
+    if (edits.length) out.push('КАК ВЛАДЕЛЕЦ ПРАВИТ ЧЕРНОВИКИ (было, стало). Бери разницу в подаче как правило:\n' + edits.map(r => `- БЫЛО: ${shortPreview(r.draft, 220)}\n  СТАЛО: ${shortPreview(r.text, 220)}`).join('\n'));
+    apLearn.text = out.join('\n\n');
+  } catch (e) { console.error('autopilot: обучение по правкам не собралось:', scrubToken(e.message)); }
+}
+
+// ── RSS ──
+const apDecode = s => String(s || '').replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1').replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#0?39;|&apos;/g, "'").replace(/&#8217;/g, '’').replace(/&#8211;/g, '-');
+const apStripTags = x => x.replace(/<(script|style)[\s\S]*?<\/\1>/gi, ' ').replace(/<[^>]+>/g, ' ');
+const apStrip = s => apStripTags(apDecode(apStripTags(String(s || '').replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1')))).replace(/\s+/g, ' ').trim();
+function apTag(block, name) {
+  const m = block.match(new RegExp(`<${name}(?:\\s[^>]*)?>([\\s\\S]*?)</${name}>`, 'i'));
+  return m ? m[1] : '';
+}
+async function apFetchFeed(url) {
+  const r = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0 (PostBot)' }, signal: AbortSignal.timeout(15000) });
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  const xml = await r.text();
+  const blocks = xml.split(/<item[\s>]|<entry[\s>]/i).slice(1);
+  return blocks.map(b => {
+    const link = apStrip(apTag(b, 'link')) || ((b.match(/<link[^>]+href="([^"]+)"/i) || [])[1] || '');
+    return {
+      title: apStrip(apTag(b, 'title')),
+      url: link.trim(),
+      published: apStrip(apTag(b, 'pubDate') || apTag(b, 'published') || apTag(b, 'updated')),
+      text: apStrip(apTag(b, 'content:encoded') || apTag(b, 'content') || apTag(b, 'description') || apTag(b, 'summary'))
+    };
+  }).filter(x => x.title && /^https?:\/\//.test(x.url));
+}
+async function apFetchArticle(url) {
+  try {
+    const r = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0 (PostBot)' }, signal: AbortSignal.timeout(15000) });
+    if (!r.ok) return '';
+    return apStrip(await r.text()).slice(0, 8000);
+  } catch { return ''; }
+}
+
+async function apNewsCandidates(used) {
+  const all = [];
+  for (const f of AP_FEEDS) {
+    try { all.push(...(await apFetchFeed(f))); }
+    catch (e) { console.error('autopilot: лента', f, scrubToken(e.message)); }
+  }
+  const seen = new Set();
+  return all
+    .map(x => ({ ...x, ts: Date.parse(x.published) || 0 }))
+    .filter(x => x.ts && Date.now() - x.ts < 72 * 3600 * 1000)
+    .filter(x => !used.has(x.url) && !apTried.has(x.url) && !seen.has(x.url) && seen.add(x.url))
+    .filter(x => !(US_GAMBLING.test(x.title + ' ' + x.text.slice(0, 600)) && !PRED_MARKET.test(x.title + ' ' + x.text)))
+    .sort((a, b) => b.ts - a.ts);
+}
+
+async function apMakeNews(recentRows) {
+  const used = new Set(recentRows.map(r => (r.text.match(/https?:\/\/\S+/) || [''])[0]).filter(Boolean));
+  const cands = await apNewsCandidates(used);
+  let tries = 0;
+  for (const c of cands) {
+    if (tries >= 4) break;
+    tries++;
+    apTried.add(c.url); if (apTried.size > 400) apTried.delete(apTried.values().next().value);
+    let src = c.text;
+    if (src.length < 500) { const full = await apFetchArticle(c.url); if (full.length > src.length) src = full; }
+    if (src.length < 200) continue;
+    try {
+      const { result } = await runEditor({ title: c.title, source_url: c.url, source_text: src, published_at: new Date(c.ts).toISOString(), suggested_type: 'news' }, {});
+      if (result && result.status === 'ready' && result.post_text) return { text: result.post_text, type: result.content_type || 'news', goal: 'reach', company: result.company || '', angle: result.angle || '' };
+    } catch (e) { console.error('autopilot: редактор новостей', scrubToken(e.message)); }
+  }
+  return null;
+}
+
+async function apMakeBatch(format, recentRows) {
+  apContext = recentRows.length ? 'НЕ ПОВТОРЯЙ темы и первые строки недавних постов:\n' + recentRows.slice(0, 12).map(r => '- ' + shortPreview(r.text, 90)).join('\n') : '';
+  try {
+    const b = await generateThreadsBatch(format, 1);
+    return b.posts[0] || null;
+  } finally { apContext = ''; }
+}
+
+async function apCreateDraft(text, iso, owner, rubric, meta) {
+  const props = {
+    Name: { title: [{ type: 'text', text: { content: '🧵 ' + (shortPreview(text, 70) || 'Threads') } }] },
+    Text: { rich_text: toRichText(text) },
+    'Publish At': { date: { start: iso } },
+    Status: { select: { name: AP_DRAFT } },
+    Owner: { number: owner },
+    'Рубрика': { select: { name: rubric } },
+    ...(meta && meta.type ? { Type: { select: { name: meta.type } } } : {}),
+    ...(meta && meta.goal ? { Goal: { select: { name: meta.goal } } } : {}),
+    ...(meta && meta.company ? { Company: { rich_text: toRichText(meta.company) } } : {}),
+    ...(meta && meta.angle ? { Angle: { rich_text: toRichText(meta.angle) } } : {})
+  };
+  return pageToRow(await notionReq('POST', '/v1/pages', { parent: { type: 'data_source_id', data_source_id: NOTION_SCHEDULE_DS_ID }, properties: props }));
+}
+
+const apShortId = id => String(id).replace(/-/g, '').slice(0, 8);
+
+function apCard(row, rubric, note) {
+  const text = `🧵 Черновик на ${formatWarsaw(row.publishAt)} · ${rubric}${note ? '\n' + note : ''}\n\n${row.text}\n\nОтветь на это сообщение (Reply) своим текстом, чтобы заменить черновик.\n#${apShortId(row.id)}`;
+  return {
+    text,
+    reply_markup: { inline_keyboard: [[{ text: '✅ Одобрить', callback_data: `ap:ok:${row.id}` }, { text: '🗑 Убрать', callback_data: `ap:no:${row.id}` }]] }
+  };
+}
+
+async function apTick({ force = false } = {}) {
+  if ((!AP_ON() && !force) || apRunning || !threadsConfigured() || !scheduleConfigured() || !TELEGRAM_BOT_TOKEN || !ANTHROPIC_API_KEY || !TELEGRAM_ALLOWED_USER_IDS.length) return null;
+  apRunning = true; apState.lastRunAt = new Date().toISOString();
+  let created = 0;
+  try {
+    await apEnsureProps();
+    await apRefreshLearning();
+    const now = Date.now();
+    const owner = Number(TELEGRAM_ALLOWED_USER_IDS[0]);
+    // Просроченные черновики: слот прошел, пока не одобрены. Снимаем, чтобы не висели
+    const drafts = await schedQuery(statusIs(AP_DRAFT), 50);
+    for (const d of drafts) {
+      if (d.publishAt && Date.parse(d.publishAt) < now) {
+        await notionReq('PATCH', `/v1/pages/${encodeURIComponent(d.id)}`, { properties: { Status: { select: { name: TS.cancelled } }, ...(apPropsOk ? { 'Модерация': { rich_text: toRichText('stale') } } : {}) } }).catch(() => {});
+        for (const u of TELEGRAM_ALLOWED_USER_IDS) await botSend(Number(u), `Черновик на ${formatWarsaw(d.publishAt)} не дождался модерации, снял.\n\n${shortPreview(d.text, 200)}`).catch(() => {});
+      }
+    }
+    // Что уже занимает дни: черновики, очередь, опубликованное за последние дни
+    const since = new Date(now - 4 * 24 * 3600 * 1000).toISOString();
+    const rows = await schedQuery({ and: [{ or: [statusIs(AP_DRAFT), statusIs(TS.scheduled), statusIs(TS.publishing), statusIs(TS.published)] }, { property: 'Publish At', date: { on_or_after: since } }] }, 100);
+    const dayKey = ms => { const p = warsawParts(ms); return `${p.y}-${p.mo}-${p.d}`; };
+    const busy = new Set(rows.filter(r => r.publishAt).map(r => dayKey(Date.parse(r.publishAt))));
+    const recentRows = rows.slice().sort((a, b) => Date.parse(b.publishAt || 0) - Date.parse(a.publishAt || 0));
+    const base = warsawParts(now);
+    const [sh, sm] = AP_SLOT.split(':').map(Number);
+    for (let off = 0; off < AP_DAYS; off++) {
+      const dt = new Date(Date.UTC(base.y, base.mo - 1, base.d + off));
+      const y = dt.getUTCFullYear(), mo = dt.getUTCMonth() + 1, d = dt.getUTCDate();
+      const ms = warsawToUtcMs(y, mo, d, sh, sm);
+      if (ms === null || ms < now + 30 * 60 * 1000) continue;
+      if (busy.has(dayKey(ms))) continue;
+      let kind = AP_GRID[dt.getUTCDay()], note = '';
+      let made = null;
+      if (kind === 'news') {
+        made = await apMakeNews(recentRows).catch(e => { console.error('autopilot: новости', scrubToken(e.message)); return null; });
+        if (!made) { kind = 'mechanics'; note = 'Подходящей новости не нашлось, вместо нее механика.'; }
+      }
+      if (!made) {
+        const text = await apMakeBatch(AP_KIND[kind].format, recentRows).catch(e => { console.error('autopilot: генерация', scrubToken(e.message)); return null; });
+        if (text) made = { text, type: AP_KIND[kind].type, goal: 'reach' };
+      }
+      if (!made) { apState.lastNote = `на ${d}.${mo} черновик не получился`; continue; }
+      const iso = new Date(ms).toISOString();
+      const row = await apCreateDraft(made.text, iso, owner, AP_KIND[kind].rubric, made);
+      recentRows.unshift(row); busy.add(dayKey(ms)); created++;
+      const card = apCard(row, AP_KIND[kind].rubric, note);
+      for (const u of TELEGRAM_ALLOWED_USER_IDS) await botSend(Number(u), card.text, { reply_markup: card.reply_markup, disable_web_page_preview: true }).catch(e => console.error('autopilot: карточка', scrubToken(e.message)));
+    }
+    apState.lastError = null;
+    return { created };
+  } catch (e) {
+    apState.lastError = scrubToken(e.message);
+    console.error('autopilot:', apState.lastError);
+    return { created, error: apState.lastError };
+  } finally { apRunning = false; }
+}
+
+async function apSetModeration(id, patch, mod) {
+  const properties = {};
+  if (patch.status) properties.Status = { select: { name: patch.status } };
+  if (patch.text !== undefined) {
+    properties.Text = { rich_text: toRichText(patch.text) };
+    properties.Name = { title: [{ type: 'text', text: { content: '🧵 ' + (shortPreview(patch.text, 70) || 'Threads') } }] };
+  }
+  if (patch.draft !== undefined && apPropsOk) properties['Черновик'] = { rich_text: toRichText(patch.draft) };
+  if (apPropsOk) properties['Модерация'] = { rich_text: toRichText(mod) };
+  await notionReq('PATCH', `/v1/pages/${encodeURIComponent(id)}`, { properties });
+}
+
+// Кнопки карточки: ap:ok:<id> одобрить, ap:no:<id> убрать (покажет причины), ap:r<N>:<id> причина N
+async function handleApCallback(cb) {
+  const answer = (text, alert = false) => tgApi('answerCallbackQuery', { callback_query_id: cb.id, text, show_alert: alert }).catch(() => {});
+  if (!TELEGRAM_ALLOWED_USER_IDS.includes(String(cb.from.id))) return answer('Нет доступа', true);
+  const m = String(cb.data).match(/^ap:(ok|no|bk|r(\d)):([0-9a-f-]{32,40})$/i);
+  if (!m) return answer('Непонятная кнопка', true);
+  const [, kind, ri, id] = m;
+  const chat = cb.message.chat.id, mid = cb.message.message_id;
+  const editText = (text, kb) => tgApi('editMessageText', { chat_id: chat, message_id: mid, text, ...(kb ? { reply_markup: kb } : { reply_markup: { inline_keyboard: [] } }), disable_web_page_preview: true });
+  let row;
+  try { row = await schedGet(id); } catch { return answer('Пост не найден', true); }
+  if (row.status !== AP_DRAFT) return answer(`Уже обработан: ${String(row.status || '').replace(/^t_/, '')}`, true);
+  await apEnsureProps();
+  if (kind === 'ok') {
+    if (row.publishAt && Date.parse(row.publishAt) < Date.now() + 60 * 1000) return answer('Слот уже прошел, черновик не опубликовать. Нажми /draft, бот подготовит новый.', true);
+    await apSetModeration(id, { status: TS.scheduled }, 'ok');
+    await answer('В очереди');
+    return editText(`✅ В очереди на ${formatWarsaw(row.publishAt)}\n\n${row.text}`);
+  }
+  if (kind === 'no') {
+    await answer('Выбери причину');
+    const kb = AP_REASONS.map((r, i) => [{ text: r, callback_data: `ap:r${i}:${id}` }]);
+    kb.push([{ text: '↩️ Назад', callback_data: `ap:bk:${id}` }]);
+    return tgApi('editMessageReplyMarkup', { chat_id: chat, message_id: mid, reply_markup: { inline_keyboard: kb } });
+  }
+  if (kind === 'bk') {
+    await answer('');
+    return tgApi('editMessageReplyMarkup', { chat_id: chat, message_id: mid, reply_markup: apCard(row, row.rubric || '').reply_markup });
+  }
+  const reason = AP_REASONS[Number(ri)];
+  if (!reason) return answer('Причина не найдена', true);
+  await apSetModeration(id, { status: TS.cancelled }, 'kill:' + reason);
+  await answer('Убрано');
+  await editText(`🗑 Убрано (${reason}): ${shortPreview(row.text, 160)}`);
+  apLearn.at = 0;
+  apTick({ force: AP_ON() }).catch(() => {});   // сразу готовим замену на освободившийся день
+}
+
+// Ответ (Reply) на карточку: текст владельца заменяет черновик и сразу идет в очередь
+async function apHandleEditReply(msg) {
+  const src = msg.reply_to_message && msg.reply_to_message.text;
+  const m = src && src.match(/#([0-9a-f]{8})\s*$/);
+  if (!m) return false;
+  const drafts = await schedQuery(statusIs(AP_DRAFT), 50);
+  const row = drafts.find(d => apShortId(d.id) === m[1]);
+  if (!row) { await botSend(msg.chat.id, 'Этот черновик уже обработан или снят.'); return true; }
+  const text = noYo(String(msg.text || '').trim());
+  const len = threadsLength(text);
+  if (!text) return true;
+  if (len > THREADS_MAX) { await botSend(msg.chat.id, `Текст длиннее лимита Threads: ${len} из ${THREADS_MAX}. Сократи и ответь на карточку еще раз.`); return true; }
+  if (row.publishAt && Date.parse(row.publishAt) < Date.now() + 60 * 1000) { await botSend(msg.chat.id, 'Слот уже прошел. Нажми /draft, бот подготовит новый.'); return true; }
+  await apEnsureProps();
+  await apSetModeration(row.id, { status: TS.scheduled, text, draft: row.text }, 'edit');
+  apLearn.at = 0;
+  await botSend(msg.chat.id, `✅ Твой текст в очереди на ${formatWarsaw(row.publishAt)}. Разницу с черновиком учту в следующих.`);
+  return true;
+}
+
+async function apModerationReport(days = 7) {
+  if (!scheduleConfigured()) return null;
+  const rows = await apModRows(100, Date.now() - days * 24 * 3600 * 1000);
+  if (!rows.length) return null;
+  const ok = rows.filter(r => r.mod === 'ok').length, edit = rows.filter(r => r.mod === 'edit').length;
+  const stale = rows.filter(r => r.mod === 'stale').length;
+  const kills = rows.filter(r => /^kill:/.test(r.mod));
+  const byReason = {};
+  kills.forEach(r => { const k = r.mod.slice(5); byReason[k] = (byReason[k] || 0) + 1; });
+  const lines = [`Модерация автопилота за ${days} дн.: одобрено без правок ${ok}, исправлено ${edit}, убрано ${kills.length}${stale ? `, не успел проверить ${stale}` : ''}.`];
+  const top = Object.entries(byReason).sort((a, b) => b[1] - a[1]);
+  if (top.length) lines.push('Чаще всего убираешь: ' + top.map(([k, n]) => `${k} (${n})`).join(', ') + '.');
+  return lines.join('\n');
+}
+// ── конец автопилота ──
 
 // ── Ответы на комментарии под постами канала ──
 // Бот должен быть админом в группе обсуждений (или у него выключен режим приватности). Он видит новый комментарий,
@@ -3466,6 +3780,8 @@ async function statsRun({ manual = false } = {}) {
     if (!manual && (wp => new Date(Date.UTC(wp.y, wp.mo - 1, wp.d)).getUTCDay())(warsawParts(Date.now())) === 1) {
       const rr = await buildRubricReport(7).catch(e => 'Сводка по рубрикам не собралась: ' + scrubToken(e.message).slice(0, 200));
       for (const u of TELEGRAM_ALLOWED_USER_IDS) await botSend(Number(u), rr, { disable_web_page_preview: true });
+      const mr = await apModerationReport(7).catch(() => null);
+      if (mr) for (const u of TELEGRAM_ALLOWED_USER_IDS) await botSend(Number(u), mr);
     }
     if (!manual) await statsCreateRow('📊 ' + rep.snapshot.date, 't_stats', JSON.stringify(rep.snapshot), new Date().toISOString());
     statsState.lastError = null;
@@ -4081,6 +4397,7 @@ async function handleBotUpdate(update) {
   if (update.chat_member) return handleChatMember(update.chat_member).catch(e => console.error('chat_member:', scrubToken(e.message)));
   if (update.callback_query) {
     if (/^vo:/.test(String(update.callback_query.data || ''))) return handleVoiceCallback(update.callback_query).catch(e => console.error('voice cb:', scrubToken(e.message)));
+    if (/^ap:/.test(String(update.callback_query.data || ''))) return handleApCallback(update.callback_query).catch(e => console.error('autopilot cb:', scrubToken(e.message)));
     if (/^cx:\d+$/.test(String(update.callback_query.data || ''))) return handleCommentCallback(update.callback_query);
     if (/^(tp:\d+:\d+|tm:\d+)$/.test(String(update.callback_query.data || ''))) return handleThreadsReplyCallback(update.callback_query);
     return handleBotCallback(update.callback_query);
@@ -4097,7 +4414,16 @@ async function handleBotUpdate(update) {
   }
   if (isVoiceMessage(msg)) return voiceIntake(msg).catch(e => console.error('voice intake:', scrubToken(e.message)));
   if (msg.text && !msg.text.startsWith('/') && voiceSessions.has(userId) && await voiceText(msg).catch(e => { console.error('voice text:', scrubToken(e.message)); return false; })) return;
+  if (msg.reply_to_message && msg.text && !msg.text.startsWith('/') && await apHandleEditReply(msg).catch(e => { console.error('autopilot reply:', scrubToken(e.message)); return false; })) return;
   const cmd = String(msg.text || '').trim().split(/\s|@/)[0].toLowerCase();
+  if (cmd === '/draft') {
+    if (!threadsConfigured()) return botSend(msg.chat.id, 'Threads не настроен: нет THREADS_ACCESS_TOKEN.');
+    await botSend(msg.chat.id, 'Готовлю черновики на ближайшие дни, карточки придут сюда.');
+    const r = await apTick({ force: true });
+    if (!r) return botSend(msg.chat.id, 'Уже готовлю или не хватает настроек.');
+    if (r.error) return botSend(msg.chat.id, 'Не получилось: ' + r.error.slice(0, 300));
+    return botSend(msg.chat.id, r.created ? `Готово, черновиков: ${r.created}.` : 'Все ближайшие дни уже закрыты постами.');
+  }
   if (cmd === '/scheduled') {
     if (!scheduleConfigured()) return botSend(msg.chat.id, 'Расписание не настроено: нет NOTION_API_KEY.');
     try {
@@ -4130,7 +4456,7 @@ async function handleBotUpdate(update) {
     } catch (e) { return botSend(msg.chat.id, 'Не получилось: ' + scrubToken(e.message).slice(0, 300)).catch(() => {}); }
   }
   if (cmd === '/start' || cmd === '/help') {
-    return botSend(msg.chat.id, 'Команды:\n/scheduled: запланированные посты, отмена и публикация сразу.\n/replies 24: найти ответы в Threads за последние 24 часа (число часов можно менять).\n/stats: отчет по Threads и каналу за вчера.\n/rubrics 7: сводка по рубрикам Threads за 7 дней (число дней можно менять).\n\nСоздавать и планировать посты нужно в приложении (кнопка меню).');
+    return botSend(msg.chat.id, 'Команды:\n/scheduled: запланированные посты, отмена и публикация сразу.\n/replies 24: найти ответы в Threads за последние 24 часа (число часов можно менять).\n/stats: отчет по Threads и каналу за вчера.\n/rubrics 7: сводка по рубрикам Threads за 7 дней (число дней можно менять).\n/draft: подготовить черновики Threads на ближайшие дни (автопилот).\n\nСоздавать и планировать посты нужно в приложении (кнопка меню).');
   }
 }
 
