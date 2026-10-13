@@ -2089,7 +2089,9 @@ function pageToRow(p) {
     views: pr['Просмотры'] && typeof pr['Просмотры'].number === 'number' ? pr['Просмотры'].number : null,
     likes: pr['Лайки'] && typeof pr['Лайки'].number === 'number' ? pr['Лайки'].number : null,
     replies: pr['Ответы'] && typeof pr['Ответы'].number === 'number' ? pr['Ответы'].number : null,
-    reposts: pr['Репосты'] && typeof pr['Репосты'].number === 'number' ? pr['Репосты'].number : null
+    reposts: pr['Репосты'] && typeof pr['Репосты'].number === 'number' ? pr['Репосты'].number : null,
+    views48: pr['Просмотры 48ч'] && typeof pr['Просмотры 48ч'].number === 'number' ? pr['Просмотры 48ч'].number : null,
+    react48: pr['Реакции 48ч'] && typeof pr['Реакции 48ч'].number === 'number' ? pr['Реакции 48ч'].number : null
   };
 }
 
@@ -2257,6 +2259,8 @@ function startScheduling() {
     setTimeout(() => threadsRepliesTick(), 15000);
     setInterval(() => threadsRepliesTick(), THREADS_REPLIES_EVERY_MS);
     threadsReplyState.started = true;
+    setTimeout(() => snapshot48Tick(), 40000);
+    setInterval(() => snapshot48Tick(), 60 * 60 * 1000);
   }
   setTimeout(() => statsTick().catch(e => console.error('stats:', scrubToken(e.message))), 25000);
   setInterval(() => statsTick().catch(e => console.error('stats:', scrubToken(e.message))), 10 * 60 * 1000);
@@ -2428,7 +2432,8 @@ async function runThreadsPost(row, { checkStale = true, notify = true } = {}) {
       return { status: 'failed', error: msg };
     }
     await schedUpdate(row.id, { status: TS.published, link: result.link }).catch(e => console.error('threads: статус published не записан:', scrubToken(e.message)));
-    notionReq('PATCH', `/v1/pages/${encodeURIComponent(row.id)}`, { properties: { 'Threads ID': { rich_text: toRichText(String(result.id)) } } })
+    // Фиксируем фактическое время выхода (при «опубликовать сейчас» оно отличается от планового): от него считаются 48 часов
+    notionReq('PATCH', `/v1/pages/${encodeURIComponent(row.id)}`, { properties: { 'Threads ID': { rich_text: toRichText(String(result.id)) }, 'Publish At': { date: { start: new Date().toISOString() } } } })
       .catch(e => console.error('threads: ID поста не записан:', scrubToken(e.message)));
     if (notify) await notifyOwner(row, `✅ Опубликовано в Threads${result.link ? '\n' + result.link : ''}\n\n${shortPreview(row.text)}`);
     return { status: 'published', link: result.link };
@@ -3487,6 +3492,7 @@ async function statsTick() {
 // ── Статистика по рубрикам ──
 // Раз в сутки (вместе с отчетом) бот обновляет у опубликованных за 30 дней постов просмотры, лайки, ответы, репосты.
 // Рубрику ставишь руками в Notion (поле «Рубрика»). /rubrics [дни] присылает сводку по рубрикам.
+const METRICS_WINDOW_DAYS = 14;   // старше двух недель цифры поста почти не меняются, их не трогаем
 const RUBRICS = ['Новость + оценка', 'Механика денег', 'Люди и инструменты', 'Сарказм и личное'];
 const RUBRIC_TARGET = { 'Новость + оценка': 40, 'Механика денег': 25, 'Люди и инструменты': 20, 'Сарказм и личное': 15 };
 const normText = t => String(t || '').replace(/\s+/g, ' ').trim().slice(0, 120);
@@ -3504,7 +3510,7 @@ async function publishedThreadsRows(fromMs) {
   return out;
 }
 
-async function refreshPostMetrics(days = 30) {
+async function refreshPostMetrics(days = METRICS_WINDOW_DAYS) {
   if (!threadsConfigured() || !scheduleConfigured()) return { updated: 0 };
   await fillMissingRubrics().catch(e => console.error('rubrics: досылка рубрик', scrubToken(e.message)));
   const rows = await publishedThreadsRows(Date.now() - days * 86400000);
@@ -3541,30 +3547,31 @@ async function refreshPostMetrics(days = 30) {
 
 async function buildRubricReport(days = 7) {
   const rows = await publishedThreadsRows(Date.now() - days * 86400000);
-  const lines = [`🗂 Рубрики Threads за ${days} дн.`, ''];
+  const lines = [`🗂 Рубрики Threads за ${days} дн.`, 'Сравнение по цифрам через 48 часов после выхода, у всех постов одинаковый возраст.', ''];
   if (!rows.length) { lines.push('Опубликованных через бота постов за период нет.'); return lines.join('\n'); }
   const groups = {};
+  let young = 0;
   for (const r of rows) {
     const k = r.rubric || 'Без рубрики';
-    const g = groups[k] || (groups[k] = { n: 0, withM: 0, views: 0, likes: 0, replies: 0, reposts: 0 });
+    const g = groups[k] || (groups[k] = { n: 0, snap: 0, views: 0, react: 0 });
     g.n++;
-    if (r.views != null) { g.withM++; g.views += r.views; g.likes += r.likes || 0; g.replies += r.replies || 0; g.reposts += r.reposts || 0; }
+    if (r.views48 != null) { g.snap++; g.views += r.views48; g.react += r.react48 || 0; }
+    else if (Date.now() - Date.parse(r.publishAt) < SNAP_H * 3600000) young++;
   }
   const total = rows.length;
   for (const k of [...RUBRICS, 'Без рубрики']) {
-    const g = groups[k]; if (!g) { if (RUBRICS.includes(k)) lines.push(`${k}: 0 постов (план ${RUBRIC_TARGET[k]}%)`, ''); continue; }
-    const share = Math.round(g.n * 100 / total);
-    lines.push(`${k}: ${g.n} пост. (${share}%${RUBRIC_TARGET[k] ? `, план ${RUBRIC_TARGET[k]}%` : ''})`);
-    if (g.withM) {
-      const avg = v => Math.round(v / g.withM);
-      const eng = g.views ? ((g.likes + g.replies + g.reposts) * 100 / g.views).toFixed(1) : '0';
-      lines.push(`  в среднем на пост: просмотры ${avg(g.views)}, лайки ${avg(g.likes)}, ответы ${avg(g.replies)}, репосты ${avg(g.reposts)}`);
-      lines.push(`  реакций на 100 просмотров: ${eng}`);
-    } else lines.push('  метрик пока нет');
+    const g = groups[k];
+    if (!g) { if (RUBRICS.includes(k)) lines.push(`${k}: 0 постов (план ${RUBRIC_TARGET[k]}%)`, ''); continue; }
+    lines.push(`${k}: ${g.n} пост. (${Math.round(g.n * 100 / total)}%${RUBRIC_TARGET[k] ? `, план ${RUBRIC_TARGET[k]}%` : ''})`);
+    if (g.snap) {
+      lines.push(`  за 48 ч в среднем: просмотры ${Math.round(g.views / g.snap)}, реакции ${Math.round(g.react / g.snap)}`);
+      lines.push(`  реакций на 100 просмотров: ${g.views ? (g.react * 100 / g.views).toFixed(1) : '0'}${g.snap < g.n ? ` (по ${g.snap} из ${g.n})` : ''}`);
+    } else lines.push('  снимка 48 ч пока нет');
     lines.push('');
   }
-  if (groups['Без рубрики']) lines.push('Посты без рубрики: проставь поле «Рубрика» в Notion, иначе они не попадут в сравнение.');
-  lines.push('Учитываются только посты, вышедшие через бота. Вручную опубликованные в приложении сюда не попадают.');
+  if (young) lines.push(`Моложе 48 часов, в сравнение пока не вошли: ${young}.`);
+  if (groups['Без рубрики']) lines.push('Посты без рубрики: проставь поле «Рубрика» в Notion.');
+  lines.push('Учитываются только посты, вышедшие через бота. Полные цифры по каждому посту лежат в Notion.');
   return lines.join('\n');
 }
 
@@ -3601,6 +3608,35 @@ async function fillMissingRubrics() {
   let n = 0;
   for (const r of (data.results || []).map(pageToRow)) { await autoRubric(r.id, r.text); n++; }
   return n;
+}
+
+// Снимок через 48 часов: раз в час ищем посты, которым от 48 до 72 часов и у которых снимка еще нет.
+// Окно до 72 часов страхует от перезапуска сервера; позже снимок не делаем, чтобы не сравнивать разный возраст.
+const SNAP_H = 48, SNAP_LATE_H = 72;
+let snapRunning = false;
+async function snapshot48Tick() {
+  if (snapRunning || !threadsConfigured() || !scheduleConfigured()) return;
+  snapRunning = true;
+  try {
+    const now = Date.now();
+    const data = await notionReq('POST', `/v1/data_sources/${NOTION_SCHEDULE_DS_ID}/query`, {
+      filter: { and: [statusIs(TS.published),
+        { property: 'Publish At', date: { on_or_before: new Date(now - SNAP_H * 3600000).toISOString() } },
+        { property: 'Publish At', date: { after: new Date(now - SNAP_LATE_H * 3600000).toISOString() } },
+        { property: 'Просмотры 48ч', number: { is_empty: true } }] }, page_size: 50
+    });
+    for (const r of (data.results || []).map(pageToRow)) {
+      if (!r.threadsId) continue;
+      try {
+        const ins = statsParseInsight(await threadsReq('GET', `/${r.threadsId}/insights`, { metric: 'views,likes,replies,reposts' }));
+        await notionReq('PATCH', `/v1/pages/${encodeURIComponent(r.id)}`, { properties: {
+          'Просмотры 48ч': { number: ins.views || 0 },
+          'Реакции 48ч': { number: (ins.likes || 0) + (ins.replies || 0) + (ins.reposts || 0) }
+        } });
+      } catch (e) { console.error('rubrics: снимок 48ч', r.id, scrubToken(e.message)); }
+    }
+  } catch (e) { console.error('rubrics: снимок 48ч', scrubToken(e.message)); }
+  finally { snapRunning = false; }
 }
 // ── конец блока рубрик ──
 
@@ -4089,7 +4125,7 @@ async function handleBotUpdate(update) {
     const days = Math.min(90, Math.max(1, Number((String(msg.text || '').match(/\d+/) || [7])[0]) || 7));
     try {
       await botSend(msg.chat.id, `Обновляю цифры постов и считаю рубрики за ${days} дн.…`);
-      await refreshPostMetrics(Math.max(days, 30));
+      await refreshPostMetrics();
       return botSend(msg.chat.id, await buildRubricReport(days), { disable_web_page_preview: true });
     } catch (e) { return botSend(msg.chat.id, 'Не получилось: ' + scrubToken(e.message).slice(0, 300)).catch(() => {}); }
   }
