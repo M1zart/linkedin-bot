@@ -2402,6 +2402,7 @@ async function tCreate(text, iso, owner, meta) {
       ...(meta && meta.angle ? { Angle: { rich_text: toRichText(meta.angle) } } : {})
     }
   });
+  autoRubric(page.id, text);   // не ждем: очередь не должна тормозить из-за классификации
   return pageToRow(page);
 }
 
@@ -3505,6 +3506,7 @@ async function publishedThreadsRows(fromMs) {
 
 async function refreshPostMetrics(days = 30) {
   if (!threadsConfigured() || !scheduleConfigured()) return { updated: 0 };
+  await fillMissingRubrics().catch(e => console.error('rubrics: досылка рубрик', scrubToken(e.message)));
   const rows = await publishedThreadsRows(Date.now() - days * 86400000);
   if (!rows.length) return { updated: 0 };
   // Для старых постов без сохраненного ID ищем пост в Threads по ссылке или по тексту
@@ -3564,6 +3566,41 @@ async function buildRubricReport(days = 7) {
   if (groups['Без рубрики']) lines.push('Посты без рубрики: проставь поле «Рубрика» в Notion, иначе они не попадут в сравнение.');
   lines.push('Учитываются только посты, вышедшие через бота. Вручную опубликованные в приложении сюда не попадают.');
   return lines.join('\n');
+}
+
+// Рубрику ставит модель по тексту поста; ручная правка в Notion имеет приоритет (бот не перезаписывает заполненное поле)
+async function classifyRubric(text) {
+  const system = `Ты раскладываешь посты Threads автора из индустрии ставок и iGaming по рубрикам. Рубрики:
+«Новость + оценка»: пост отталкивается от конкретного события, новости, отчета, решения регулятора или компании и дает оценку автора.
+«Механика денег»: пост объясняет, как устроены деньги, вероятности, маржа, коэффициенты, бонусы, лимиты, почему букмекер или игрок выигрывает и проигрывает, без привязки к свежей новости.
+«Люди и инструменты»: пост про людей и профессии индустрии, команды, работу внутри компании, а также про инструменты, сервисы, ИИ, ботов и автоматизацию.
+«Сарказм и личное»: ирония, наблюдение, шутка, личный момент или мнение автора о жизни и индустрии без разбора механики и без новости.
+Если подходят несколько, выбери ту, на которой держится главный вывод поста.
+Ответь ТОЛЬКО названием рубрики, ровно как в списке, без кавычек и пояснений.`;
+  const raw = await claudeCall(system, String(text || '').slice(0, 3000), 50);
+  if (!raw) return null;
+  const t = raw.replace(/[«»"']/g, '').trim().toLowerCase();
+  return RUBRICS.find(r => t.startsWith(r.toLowerCase())) || RUBRICS.find(r => t.includes(r.toLowerCase().split(' ')[0])) || null;
+}
+
+async function autoRubric(pageId, text) {
+  try {
+    if (!ANTHROPIC_API_KEY) return;
+    const rubric = await classifyRubric(text);
+    if (!rubric) return;
+    await notionReq('PATCH', `/v1/pages/${encodeURIComponent(pageId)}`, { properties: { 'Рубрика': { select: { name: rubric } } } });
+  } catch (e) { console.error('rubrics: автоклассификация', pageId, scrubToken(e.message)); }
+}
+
+// Посты, уже стоящие в очереди без рубрики (созданы до автоклассификации или классификация не прошла)
+async function fillMissingRubrics() {
+  if (!scheduleConfigured() || !ANTHROPIC_API_KEY) return 0;
+  const data = await notionReq('POST', `/v1/data_sources/${NOTION_SCHEDULE_DS_ID}/query`, {
+    filter: { and: [statusIs(TS.scheduled), { property: 'Рубрика', select: { is_empty: true } }] }, page_size: 50
+  });
+  let n = 0;
+  for (const r of (data.results || []).map(pageToRow)) { await autoRubric(r.id, r.text); n++; }
+  return n;
 }
 // ── конец блока рубрик ──
 
