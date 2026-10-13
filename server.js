@@ -2509,6 +2509,8 @@ function threadsSystemPrompt(format) {
 
 ГЛАВНАЯ ПРОВЕРКА ДЛЯ КАЖДОГО ПОСТА. Перед тем как написать пост, ответь себе: что именно читатель унесет отсюда нового или полезного? Это должна быть одна конкретная мысль, цифра, способ или неочевидное объяснение, а не афоризм и не общая мудрость. Если пост можно свести к пословице («решение остается за человеком», «терпение важнее скорости», «рынок не слепой»), он не годится: перепиши с конкретным примером, расчетом или неожиданным углом, либо выбери другую мысль. Темы: гейминг и ставки, лидерство, решения под давлением, мотивация, люди индустрии, инструменты и ИИ.
 
+КАК ПИСАТЬ. Живая связная речь, как будто ты рассказываешь это знакомому за столом. Полные предложения, которые вытекают одно из другого: ситуация, что произошло или как это устроено, почему это важно, и посыл в конце, ради которого читатель дочитал. Запрещен рубленый телеграфный стиль: никаких обрывков из одного-трех слов подряд («Взяли.», «7 из 8.», «Без опыта.»), никаких тезисов списком через точки. Короткая фраза допустима одна и только как акцент. Если это история, у нее есть начало, поворот и вывод, а не набор фактов.
+
 ТРЕБОВАНИЯ:
 - Одна мысль на пост. Помни, что Threads формат короткий, пост должен помещаться целиком в лимит платформы и читаться за несколько секунд. Длина до 400 символов, чаще 150-300, но не короче, чем нужно, чтобы мысль была полной и понятной. Первая строка цепляет сама, без вступлений.
 - Голос человека, который видел это изнутри индустрии, но без выдуманных историй: никаких «я видел», «у нас был случай», «в моей практике», «однажды». Только общеизвестная механика и логика, которые можно проверить.
@@ -3108,7 +3110,7 @@ async function apMakeBatch(format, recentRows) {
   apContext = recentRows.length ? 'НЕ ПОВТОРЯЙ темы и первые строки недавних постов:\n' + recentRows.slice(0, 12).map(r => '- ' + shortPreview(r.text, 90)).join('\n') : '';
   try {
     const b = await generateThreadsBatch(format, 1);
-    return b.posts[0] || null;
+    return b.posts.find(t => !AP_TG_MENTION.test(t)) || null;
   } finally { apContext = ''; }
 }
 
@@ -3116,6 +3118,7 @@ async function apMakeBatch(format, recentRows) {
 // Каждый источник берется один раз (свойство «Источник» в базе расписания), мысль адаптируется для широкого читателя Threads.
 const AP_CE_DS = process.env.CONTENT_ENGINE_DS_ID || '14814719-85c5-4819-a07e-3d1b773d6bdb';
 let apCeWarned = false;
+const AP_TG_MENTION = /телеграм|telegram|t\.me\/|в профил|ссылк[аеуи] в шапке/i;
 const apNorm = t => String(t || '').toLowerCase().replace(/ё/g, 'е').replace(/\s+/g, ' ').replace(/[«»"“”„'’.,!?;:()\-–—]/g, '').trim();
 
 async function apPageText(pageId, limit = 6000) {
@@ -3181,12 +3184,32 @@ function apSourcePrompt(kind) {
 
 Факты, цифры, случаи и личный опыт бери только из выбранного поста, ничего не добавляй и не усиливай. Личный опыт можно подавать от первого лица, только если он есть в посте. Обязательно приложи дословную цитату из поста (quote), на которой держится мысль.
 
-Формат: одна мысль. Threads формат короткий, пост должен помещаться целиком и читаться за несколько секунд, обычно 150-350 символов, до 450, но не короче, чем нужно для полной мысли. Первая строка цепляет сама. Русский язык, буква е без точек, без эмодзи, хэштегов, ссылок и доменов, без тире (только запятые и двоеточия), без конструкций «не X, а Y», без «Вот как», «Вот что», «Результат?», «Честно говоря», «В заключение», без слова «книга» в значении линии букмекера, без американского гемблинга (кроме prediction markets). Базовые термины индустрии не расшифровывай. Мотивация допустима только на конкретике, без «верь в себя» и «ты сможешь».${apPromptExtra()}
+КАК ПИСАТЬ. Живая связная речь, как будто ты рассказываешь это знакомому за столом. Полные предложения, которые вытекают одно из другого: ситуация, что произошло или как это устроено, почему это важно, и посыл в конце, ради которого читатель дочитал. Запрещен рубленый телеграфный стиль: никаких обрывков из одного-трех слов подряд («Взяли.», «7 из 8.», «Без опыта.»), никаких тезисов списком через точки. Короткая фраза допустима одна и только как акцент. Если это история, у нее есть начало, поворот и вывод, а не набор фактов.
+
+Формат: одна мысль с ясным посылом. Threads формат короткий, пост должен помещаться целиком, обычно 250-450 символов, но не короче, чем нужно, чтобы мысль была рассказана полностью. Первая строка цепляет сама. Русский язык, буква е без точек, без эмодзи, хэштегов, ссылок и доменов (кроме telegram_url по правилу ниже), без тире (только запятые и двоеточия), без конструкций «не X, а Y», без «Вот как», «Вот что», «Результат?», «Честно говоря», «В заключение», без слова «книга» в значении линии букмекера, без американского гемблинга (кроме prediction markets). Базовые термины индустрии не расшифровывай. Мотивация допустима только на конкретике, без «верь в себя» и «ты сможешь».
+
+ССЫЛКА НА TELEGRAM. Смотри поле direct_link_due во входных данных.
+Если direct_link_due=false, в post_text нет ссылки, упоминания Telegram и призыва открыть профиль.
+Если direct_link_due=true, можно добавить одну короткую фразу с конкретной причиной перейти в Telegram (что именно читатель там найдет по этой теме) и использовать только переданный telegram_url, отдельной последней строкой. Ссылка вместе с текстом должна помещаться в лимит ${THREADS_MAX} символов. Если конкретной причины нет, ссылку не добавляй.${apPromptExtra()}
 
 Верни ТОЛЬКО JSON без Markdown: {"status":"ready|skip","source":номер поста,"thought":"мысль одной фразой","quote":"дословная цитата из поста","post_text":"текст поста","takeaway":"что читатель вынесет, одной фразой","reason":""}`;
 }
 
-async function apMakeFromSources(kind, recentRows) {
+// Рубленый стиль: несколько предложений по 1-3 слова подряд читаются как телеграмма, а не как речь
+function apChoppy(t) {
+  const sents = String(t || '').split(/[.!?…]+/).map(x => x.trim()).filter(Boolean);
+  if (!sents.length) return false;
+  const words = sents.map(x => x.split(/\s+/).length);
+  const avg = words.reduce((a, b) => a + b, 0) / words.length;
+  return words.filter(n => n <= 3).length >= 2 || (sents.length >= 3 && avg < 9);
+}
+async function apSmooth(text, srcText) {
+  const system = `Ты редактор. Перепиши пост для Threads живой связной речью: полные предложения, которые вытекают одно из другого, с ясным посылом в конце. Убери рубленые обрывки из одного-трех слов. Сохрани все факты и смысл, ничего не добавляй сверх исходного поста автора. Русский, буква е без точек, без тире, без «не X, а Y», без эмодзи и хэштегов, до 450 символов. Верни только текст поста.`;
+  const out = await claudeCall(system, `ИСХОДНЫЙ ПОСТ АВТОРА (только для сверки фактов):\n${String(srcText || '').slice(0, 3000)}\n\nЧЕРНОВИК:\n${text}`, 1500);
+  return out ? noYo(out.trim()).replace(/\s*[—–]\s*/g, ', ') : text;
+}
+
+async function apMakeFromSources(kind, recentRows, linkDue = false) {
   const pool = await apSourcePool();
   if (!pool.length) return null;
   const used = await apUsedSources().catch(() => new Set());
@@ -3199,7 +3222,9 @@ async function apMakeFromSources(kind, recentRows) {
   if (!usable.length) return null;
   const input = {
     candidates: usable.map((c, i) => ({ n: i + 1, origin: c.origin, title: c.title, text: c.text.slice(0, 3500) })),
-    recent_posts: recentRows.slice(0, 30).map(r => shortPreview(r.text, 200))
+    recent_posts: recentRows.slice(0, 30).map(r => shortPreview(r.text, 200)),
+    direct_link_due: !!linkDue,
+    ...(linkDue ? { telegram_url: THREADS_INVITE_LINK } : {})
   };
   const raw = await claudeCall(apSourcePrompt(kind), JSON.stringify(input), 3000);
   const res = parseEditorJson(raw);
@@ -3207,11 +3232,18 @@ async function apMakeFromSources(kind, recentRows) {
   const src = usable[Number(res.source) - 1];
   if (!src) return null;
   let text = noYo(String(res.post_text || '').trim()).replace(/\s*[—–]\s*/g, ', ').replace(/\s+-\s+/g, ', ');
+  if (apChoppy(text)) text = await apSmooth(text, src.text);
   if (findNegContrast(text).length) text = noYo(await runNegContrastFix(text));
   const why = [];
+  if (apChoppy(text)) why.push('рубленый стиль');
   if (!text) why.push('пусто');
   if (threadsLength(text) > THREADS_SAFE) why.push('длинно');
-  for (const [re, w] of THREADS_BAD) if (w !== 'выдуманный личный опыт' && re.test(text)) why.push(w);
+  const urls = text.match(/https?:\/\/\S+/g) || [];
+  const body = text.split(THREADS_INVITE_LINK).join(' ');
+  if (!linkDue && (urls.length || AP_TG_MENTION.test(text))) why.push('ссылка или упоминание Telegram не по очереди');
+  if (linkDue && (urls.length > 1 || urls.some(u => u !== THREADS_INVITE_LINK))) why.push('чужая ссылка');
+  if (threadsLength(text) > THREADS_MAX) why.push('ссылка с текстом не влезает в лимит');
+  for (const [re, w] of THREADS_BAD) if (w !== 'выдуманный личный опыт' && re.test(body)) why.push(w);
   if (findNegContrast(text).length) why.push('не X, а Y');
   if (/[—–]/.test(text) || /\s-\s/.test(text)) why.push('тире');
   if (US_GAMBLING.test(text) && !PRED_MARKET.test(text)) why.push('США');
@@ -3221,7 +3253,7 @@ async function apMakeFromSources(kind, recentRows) {
   if (recentRows.some(r => apNorm(r.text).slice(0, 60) === head)) why.push('повтор');
   if (why.length) { console.log('autopilot: черновик из поста отброшен:', why.join(', ')); return null; }
   return {
-    text, type: AP_KIND[kind].type, goal: 'reach',
+    text, type: AP_KIND[kind].type, goal: urls.length ? 'telegram_bridge' : 'reach',
     src: `${src.key}|${src.title}`.slice(0, 300),
     sourceTitle: `${src.origin}: ${src.title}`,
     takeaway: String(res.takeaway || '').trim().slice(0, 300)
@@ -3293,7 +3325,9 @@ async function apTick({ force = false } = {}) {
         made = await apMakeNews(recentRows).catch(e => { console.error('autopilot: новости', scrubToken(e.message)); return null; });
         if (!made) { kind = 'mechanics'; note = 'Подходящей новости не нашлось, вместо нее механика.'; }
       }
-      if (!made) made = await apMakeFromSources(kind, histRows).catch(e => { console.error('autopilot: темы из постов', scrubToken(e.message)); return null; });
+      const lastSix = histRows.slice().sort((a, b) => Date.parse(b.publishAt || 0) - Date.parse(a.publishAt || 0)).slice(0, 6);
+      const linkDue = kind === 'mechanics' && !lastSix.some(r => /t\.me\//i.test(r.text || ''));
+      if (!made) made = await apMakeFromSources(kind, histRows, linkDue).catch(e => { console.error('autopilot: темы из постов', scrubToken(e.message)); return null; });
       if (!made) {
         const text = await apMakeBatch(AP_KIND[kind].format, histRows).catch(e => { console.error('autopilot: генерация', scrubToken(e.message)); return null; });
         if (text) { made = { text, type: AP_KIND[kind].type, goal: 'reach' }; note = (note ? note + '\n' : '') + 'В твоих постах свежей темы не нашлось, тема от бота.'; }
