@@ -3210,8 +3210,10 @@ async function apSmooth(text, srcText) {
 }
 
 async function apRepair(text, issues, srcText, linkDue) {
-  const limit = linkDue ? THREADS_MAX - 10 : THREADS_SAFE - 20;
-  const system = `Ты редактор постов для Threads. Исправь черновик, сохранив его мысль, факты и посыл. Ничего не добавляй сверх исходного поста автора. Пост от первого лица автора («я»), без его имени и третьего лица. Что нужно исправить: ${issues.join('; ')}.
+  const limit = THREADS_MAX - 40;
+  const len = threadsLength(text);
+  const lenNote = len > limit ? ` Сейчас в черновике ${len} символов, нужно не больше ${limit}: сократи примерно на ${len - limit + 20} символов, убрав второстепенные слова и детали, но сохранив историю и посыл.` : '';
+  const system = `Ты редактор постов для Threads. Исправь черновик, сохранив его мысль, факты и посыл. Ничего не добавляй сверх исходного поста автора. Пост от первого лица автора («я»), без его имени и третьего лица. Что нужно исправить: ${issues.join('; ')}.${lenNote}
 Правила: не длиннее ${limit} символов вместе со ссылкой, если она есть; живая связная речь, полные предложения, без обрывков из одного-трех слов; без противопоставлений «не X, а Y», «это не X, это Y», «не потому что X, а потому что Y»: говори прямо, что есть, без того, чего нет; без тире (только запятые и двоеточия); буква е без точек; без эмодзи и хэштегов.${linkDue ? ` Если в черновике есть ссылка ${THREADS_INVITE_LINK}, оставь ее отдельной последней строкой, других ссылок нет.` : ' Без ссылок и без упоминания Telegram.'}
 Верни только исправленный текст поста.`;
   const out = await claudeCall(system, `ИСХОДНЫЙ ПОСТ АВТОРА (для сверки фактов):\n${String(srcText || '').slice(0, 3000)}\n\nЧЕРНОВИК:\n${text}`, 1500);
@@ -3247,7 +3249,7 @@ async function apMakeFromSources(kind, recentRows, linkDue = false) {
     const why = [];
     if (!t) why.push('пусто');
     if (apChoppy(t)) why.push('рубленый стиль');
-    if (threadsLength(t) > (linkDue ? THREADS_MAX : THREADS_SAFE)) why.push('длинно');
+    if (threadsLength(t) > THREADS_MAX - 5) why.push('длинно');
     const urls = t.match(/https?:\/\/\S+/g) || [];
     const body = t.split(THREADS_INVITE_LINK).join(' ');
     if (!linkDue && (urls.length || AP_TG_MENTION.test(t))) why.push('ссылка или упоминание Telegram не по очереди');
@@ -3267,6 +3269,7 @@ async function apMakeFromSources(kind, recentRows, linkDue = false) {
   let why = check(text);
   for (let attempt = 0; why.length && attempt < 2; attempt++) {
     const fixed = await apRepair(text, why, src.text, linkDue);
+    console.log('autopilot: правка черновика', attempt + 1, why.join(', '), '→', fixed ? threadsLength(fixed) + ' симв.' : 'нет ответа');
     if (!fixed) break;
     text = fixed;
     why = check(text);
@@ -3348,7 +3351,7 @@ async function apTick({ force = false } = {}) {
       }
       const lastSix = histRows.slice().sort((a, b) => Date.parse(b.publishAt || 0) - Date.parse(a.publishAt || 0)).slice(0, 6);
       const linkDue = kind === 'mechanics' && !lastSix.some(r => /t\.me\//i.test(r.text || ''));
-      if (!made) made = await apMakeFromSources(kind, histRows, linkDue).catch(e => { console.error('autopilot: темы из постов', scrubToken(e.message)); return null; });
+      for (let tryN = 0; !made && tryN < 2; tryN++) made = await apMakeFromSources(kind, histRows, linkDue).catch(e => { console.error('autopilot: темы из постов', scrubToken(e.message)); return null; });
       if (!made) {
         const text = await apMakeBatch(AP_KIND[kind].format, histRows).catch(e => { console.error('autopilot: генерация', scrubToken(e.message)); return null; });
         if (text) { made = { text, type: AP_KIND[kind].type, goal: 'reach' }; note = (note ? note + '\n' : '') + 'В твоих постах свежей темы не нашлось, тема от бота.'; }
