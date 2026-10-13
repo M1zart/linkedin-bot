@@ -2083,7 +2083,13 @@ function pageToRow(p) {
     angle: fromRichText(pr.Angle && pr.Angle.rich_text),
     goal: (pr.Goal && pr.Goal.select && pr.Goal.select.name) || null,
     // Старые посты без свойства «Кнопка вопроса» читаются как false
-    askButton: !!(pr['Кнопка вопроса'] && pr['Кнопка вопроса'].checkbox === true)
+    askButton: !!(pr['Кнопка вопроса'] && pr['Кнопка вопроса'].checkbox === true),
+    rubric: (pr['Рубрика'] && pr['Рубрика'].select && pr['Рубрика'].select.name) || null,
+    threadsId: fromRichText(pr['Threads ID'] && pr['Threads ID'].rich_text),
+    views: pr['Просмотры'] && typeof pr['Просмотры'].number === 'number' ? pr['Просмотры'].number : null,
+    likes: pr['Лайки'] && typeof pr['Лайки'].number === 'number' ? pr['Лайки'].number : null,
+    replies: pr['Ответы'] && typeof pr['Ответы'].number === 'number' ? pr['Ответы'].number : null,
+    reposts: pr['Репосты'] && typeof pr['Репосты'].number === 'number' ? pr['Репосты'].number : null
   };
 }
 
@@ -2231,7 +2237,7 @@ async function setupTelegramBot() {
     return;
   }
   await tgApi('setWebhook', { url: desired, secret_token: webhookSecret(), allowed_updates: ['message', 'callback_query', 'chat_member'] });
-  await tgApi('setMyCommands', { commands: [{ command: 'scheduled', description: 'Запланированные посты' }] });
+  await tgApi('setMyCommands', { commands: [{ command: 'scheduled', description: 'Запланированные посты' }, { command: 'rubrics', description: 'Сводка по рубрикам Threads' }] });
   webhookState.status = 'active';
 }
 
@@ -2421,6 +2427,8 @@ async function runThreadsPost(row, { checkStale = true, notify = true } = {}) {
       return { status: 'failed', error: msg };
     }
     await schedUpdate(row.id, { status: TS.published, link: result.link }).catch(e => console.error('threads: статус published не записан:', scrubToken(e.message)));
+    notionReq('PATCH', `/v1/pages/${encodeURIComponent(row.id)}`, { properties: { 'Threads ID': { rich_text: toRichText(String(result.id)) } } })
+      .catch(e => console.error('threads: ID поста не записан:', scrubToken(e.message)));
     if (notify) await notifyOwner(row, `✅ Опубликовано в Threads${result.link ? '\n' + result.link : ''}\n\n${shortPreview(row.text)}`);
     return { status: 'published', link: result.link };
   } finally {
@@ -3446,8 +3454,13 @@ async function statsRun({ manual = false } = {}) {
   if (statsState.running) return null;
   statsState.running = true; statsState.lastRunAt = new Date().toISOString();
   try {
+    await refreshPostMetrics().catch(e => console.error('rubrics refresh:', scrubToken(e.message)));
     const rep = await buildStatsReport();
     for (const u of TELEGRAM_ALLOWED_USER_IDS) await botSend(Number(u), rep.text, { disable_web_page_preview: true });
+    if (!manual && (wp => new Date(Date.UTC(wp.y, wp.mo - 1, wp.d)).getUTCDay())(warsawParts(Date.now())) === 1) {
+      const rr = await buildRubricReport(7).catch(e => 'Сводка по рубрикам не собралась: ' + scrubToken(e.message).slice(0, 200));
+      for (const u of TELEGRAM_ALLOWED_USER_IDS) await botSend(Number(u), rr, { disable_web_page_preview: true });
+    }
     if (!manual) await statsCreateRow('📊 ' + rep.snapshot.date, 't_stats', JSON.stringify(rep.snapshot), new Date().toISOString());
     statsState.lastError = null;
     return rep;
@@ -3469,6 +3482,90 @@ async function statsTick() {
   await statsRun();
 }
 // ── конец блока отчета ──
+
+// ── Статистика по рубрикам ──
+// Раз в сутки (вместе с отчетом) бот обновляет у опубликованных за 30 дней постов просмотры, лайки, ответы, репосты.
+// Рубрику ставишь руками в Notion (поле «Рубрика»). /rubrics [дни] присылает сводку по рубрикам.
+const RUBRICS = ['Новость + оценка', 'Механика денег', 'Люди и инструменты', 'Сарказм и личное'];
+const RUBRIC_TARGET = { 'Новость + оценка': 40, 'Механика денег': 25, 'Люди и инструменты': 20, 'Сарказм и личное': 15 };
+const normText = t => String(t || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+
+async function publishedThreadsRows(fromMs) {
+  const out = []; let cursor;
+  for (let i = 0; i < 5; i++) {
+    const data = await notionReq('POST', `/v1/data_sources/${NOTION_SCHEDULE_DS_ID}/query`, {
+      filter: { and: [statusIs(TS.published), { property: 'Publish At', date: { on_or_after: new Date(fromMs).toISOString() } }] },
+      sorts: [{ property: 'Publish At', direction: 'descending' }], page_size: 100, ...(cursor ? { start_cursor: cursor } : {})
+    });
+    out.push(...(data.results || []).map(pageToRow));
+    if (!data.has_more) break; cursor = data.next_cursor;
+  }
+  return out;
+}
+
+async function refreshPostMetrics(days = 30) {
+  if (!threadsConfigured() || !scheduleConfigured()) return { updated: 0 };
+  const rows = await publishedThreadsRows(Date.now() - days * 86400000);
+  if (!rows.length) return { updated: 0 };
+  // Для старых постов без сохраненного ID ищем пост в Threads по ссылке или по тексту
+  let feed = null;
+  if (rows.some(r => !r.threadsId)) {
+    const uid = await threadsUserId();
+    feed = ((await threadsReq('GET', `/${uid}/threads`, { fields: 'id,text,permalink,timestamp', limit: '100' })).data || []);
+  }
+  let updated = 0, failed = 0;
+  for (const r of rows) {
+    let id = r.threadsId;
+    if (!id && feed) {
+      const hit = feed.find(x => (r.link && x.permalink === r.link) || (normText(x.text) && normText(x.text) === normText(r.text)));
+      if (hit) id = hit.id;
+    }
+    if (!id) continue;
+    try {
+      const ins = statsParseInsight(await threadsReq('GET', `/${id}/insights`, { metric: 'views,likes,replies,reposts' }));
+      const props = {
+        'Просмотры': { number: ins.views || 0 }, 'Лайки': { number: ins.likes || 0 },
+        'Ответы': { number: ins.replies || 0 }, 'Репосты': { number: ins.reposts || 0 },
+        'Метрики обновлены': { date: { start: new Date().toISOString() } }
+      };
+      if (!r.threadsId) props['Threads ID'] = { rich_text: toRichText(String(id)) };
+      await notionReq('PATCH', `/v1/pages/${encodeURIComponent(r.id)}`, { properties: props });
+      updated++;
+    } catch (e) { failed++; console.error('rubrics: метрики поста', r.id, scrubToken(e.message)); }
+    await tSleep(300);
+  }
+  return { updated, failed };
+}
+
+async function buildRubricReport(days = 7) {
+  const rows = await publishedThreadsRows(Date.now() - days * 86400000);
+  const lines = [`🗂 Рубрики Threads за ${days} дн.`, ''];
+  if (!rows.length) { lines.push('Опубликованных через бота постов за период нет.'); return lines.join('\n'); }
+  const groups = {};
+  for (const r of rows) {
+    const k = r.rubric || 'Без рубрики';
+    const g = groups[k] || (groups[k] = { n: 0, withM: 0, views: 0, likes: 0, replies: 0, reposts: 0 });
+    g.n++;
+    if (r.views != null) { g.withM++; g.views += r.views; g.likes += r.likes || 0; g.replies += r.replies || 0; g.reposts += r.reposts || 0; }
+  }
+  const total = rows.length;
+  for (const k of [...RUBRICS, 'Без рубрики']) {
+    const g = groups[k]; if (!g) { if (RUBRICS.includes(k)) lines.push(`${k}: 0 постов (план ${RUBRIC_TARGET[k]}%)`, ''); continue; }
+    const share = Math.round(g.n * 100 / total);
+    lines.push(`${k}: ${g.n} пост. (${share}%${RUBRIC_TARGET[k] ? `, план ${RUBRIC_TARGET[k]}%` : ''})`);
+    if (g.withM) {
+      const avg = v => Math.round(v / g.withM);
+      const eng = g.views ? ((g.likes + g.replies + g.reposts) * 100 / g.views).toFixed(1) : '0';
+      lines.push(`  в среднем на пост: просмотры ${avg(g.views)}, лайки ${avg(g.likes)}, ответы ${avg(g.replies)}, репосты ${avg(g.reposts)}`);
+      lines.push(`  реакций на 100 просмотров: ${eng}`);
+    } else lines.push('  метрик пока нет');
+    lines.push('');
+  }
+  if (groups['Без рубрики']) lines.push('Посты без рубрики: проставь поле «Рубрика» в Notion, иначе они не попадут в сравнение.');
+  lines.push('Учитываются только посты, вышедшие через бота. Вручную опубликованные в приложении сюда не попадают.');
+  return lines.join('\n');
+}
+// ── конец блока рубрик ──
 
 // ── «100 голосов iGaming»: голосовые героя -> расшифровка -> черновик поста ──────────────────────────
 // Бот принимает пересланные голосовые, Gemini расшифровывает, Claude раскладывает по вопросам из questions.json,
@@ -3951,8 +4048,16 @@ async function handleBotUpdate(update) {
     try { const r = await statsRun({ manual: true }); if (!r) return botSend(msg.chat.id, 'Отчет уже собирается, подожди минуту.'); return; }
     catch (e) { return botSend(msg.chat.id, 'Не получилось собрать отчет: ' + scrubToken(e.message).slice(0, 300)).catch(() => {}); }
   }
+  if (cmd === '/rubrics') {
+    const days = Math.min(90, Math.max(1, Number((String(msg.text || '').match(/\d+/) || [7])[0]) || 7));
+    try {
+      await botSend(msg.chat.id, `Обновляю цифры постов и считаю рубрики за ${days} дн.…`);
+      await refreshPostMetrics(Math.max(days, 30));
+      return botSend(msg.chat.id, await buildRubricReport(days), { disable_web_page_preview: true });
+    } catch (e) { return botSend(msg.chat.id, 'Не получилось: ' + scrubToken(e.message).slice(0, 300)).catch(() => {}); }
+  }
   if (cmd === '/start' || cmd === '/help') {
-    return botSend(msg.chat.id, 'Команды:\n/scheduled: запланированные посты, отмена и публикация сразу.\n/replies 24: найти ответы в Threads за последние 24 часа (число часов можно менять).\n/stats: отчет по Threads и каналу за вчера.\n\nСоздавать и планировать посты нужно в приложении (кнопка меню).');
+    return botSend(msg.chat.id, 'Команды:\n/scheduled: запланированные посты, отмена и публикация сразу.\n/replies 24: найти ответы в Threads за последние 24 часа (число часов можно менять).\n/stats: отчет по Threads и каналу за вчера.\n/rubrics 7: сводка по рубрикам Threads за 7 дней (число дней можно менять).\n\nСоздавать и планировать посты нужно в приложении (кнопка меню).');
   }
 }
 
