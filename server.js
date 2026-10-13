@@ -3182,7 +3182,7 @@ function apSourcePrompt(kind) {
 
 Перед выбором ответь себе: что читатель Threads унесет отсюда нового или полезного? Если ответ сводится к общей мудрости или пословице, бери другой пост или другую мысль. Не повторяй мысли, которые уже есть в recent_posts, даже другими словами и с другим заходом. Если ни один пост не дает новой мысли для этой рубрики, верни status skip.
 
-Факты, цифры, случаи и личный опыт бери только из выбранного поста, ничего не добавляй и не усиливай. Личный опыт можно подавать от первого лица, только если он есть в посте. Обязательно приложи дословную цитату из поста (quote), на которой держится мысль.
+Факты, цифры, случаи и личный опыт бери только из выбранного поста, ничего не добавляй и не усиливай. Пост всегда пишется от первого лица самого Дмитрия: «я», «мы с командой». Никогда не упоминай его в третьем лице, по имени или фамилии и не пересказывай его как героя. Личный опыт подавай от первого лица, только если он есть в посте. Обязательно приложи дословную цитату из поста (quote), на которой держится мысль.
 
 КАК ПИСАТЬ. Живая связная речь, как будто ты рассказываешь это знакомому за столом. Полные предложения, которые вытекают одно из другого: ситуация, что произошло или как это устроено, почему это важно, и посыл в конце, ради которого читатель дочитал. Запрещен рубленый телеграфный стиль: никаких обрывков из одного-трех слов подряд («Взяли.», «7 из 8.», «Без опыта.»), никаких тезисов списком через точки. Короткая фраза допустима одна и только как акцент. Если это история, у нее есть начало, поворот и вывод, а не набор фактов.
 
@@ -3211,7 +3211,7 @@ async function apSmooth(text, srcText) {
 
 async function apRepair(text, issues, srcText, linkDue) {
   const limit = linkDue ? THREADS_MAX - 10 : THREADS_SAFE - 20;
-  const system = `Ты редактор постов для Threads. Исправь черновик, сохранив его мысль, факты и посыл. Ничего не добавляй сверх исходного поста автора. Что нужно исправить: ${issues.join('; ')}.
+  const system = `Ты редактор постов для Threads. Исправь черновик, сохранив его мысль, факты и посыл. Ничего не добавляй сверх исходного поста автора. Пост от первого лица автора («я»), без его имени и третьего лица. Что нужно исправить: ${issues.join('; ')}.
 Правила: не длиннее ${limit} символов вместе со ссылкой, если она есть; живая связная речь, полные предложения, без обрывков из одного-трех слов; без противопоставлений «не X, а Y», «это не X, это Y», «не потому что X, а потому что Y»: говори прямо, что есть, без того, чего нет; без тире (только запятые и двоеточия); буква е без точек; без эмодзи и хэштегов.${linkDue ? ` Если в черновике есть ссылка ${THREADS_INVITE_LINK}, оставь ее отдельной последней строкой, других ссылок нет.` : ' Без ссылок и без упоминания Telegram.'}
 Верни только исправленный текст поста.`;
   const out = await claudeCall(system, `ИСХОДНЫЙ ПОСТ АВТОРА (для сверки фактов):\n${String(srcText || '').slice(0, 3000)}\n\nЧЕРНОВИК:\n${text}`, 1500);
@@ -3256,6 +3256,7 @@ async function apMakeFromSources(kind, recentRows, linkDue = false) {
     if (findNegContrast(t).length) why.push('конструкция «не X, а Y» или «это не X, это Y»');
     if (/[—–]/.test(t) || /\s-\s/.test(t)) why.push('тире');
     if (US_GAMBLING.test(t) && !PRED_MARKET.test(t)) why.push('США');
+    if (/Дмитри|Скакунов|Dmitry|Skakunov/i.test(t)) why.push('пост в третьем лице о Дмитрии: перепиши от первого лица «я»');
     return why;
   };
   const q = apNorm(res.quote);
@@ -3300,10 +3301,10 @@ async function apCreateDraft(text, iso, owner, rubric, meta) {
 const apShortId = id => String(id).replace(/-/g, '').slice(0, 8);
 
 function apCard(row, rubric, note) {
-  const text = `🧵 Черновик на ${formatWarsaw(row.publishAt)} · ${rubric}${note ? '\n' + note : ''}\n\n${row.text}\n\nОтветь на это сообщение (Reply) своим текстом, чтобы заменить черновик.\n#${apShortId(row.id)}`;
+  const text = `🧵 Черновик на ${formatWarsaw(row.publishAt)} · ${rubric}${note ? '\n' + note : ''}\n\n${row.text}\n\n#${apShortId(row.id)}`;
   return {
     text,
-    reply_markup: { inline_keyboard: [[{ text: '✅ Одобрить', callback_data: `ap:ok:${row.id}` }, { text: '🗑 Убрать', callback_data: `ap:no:${row.id}` }]] }
+    reply_markup: { inline_keyboard: [[{ text: '✅ Одобрить', callback_data: `ap:ok:${row.id}` }, { text: '✏️ Править', callback_data: `ap:ed:${row.id}` }, { text: '🗑 Убрать', callback_data: `ap:no:${row.id}` }]] }
   };
 }
 
@@ -3384,7 +3385,7 @@ async function apSetModeration(id, patch, mod) {
 async function handleApCallback(cb) {
   const answer = (text, alert = false) => tgApi('answerCallbackQuery', { callback_query_id: cb.id, text, show_alert: alert }).catch(() => {});
   if (!TELEGRAM_ALLOWED_USER_IDS.includes(String(cb.from.id))) return answer('Нет доступа', true);
-  const m = String(cb.data).match(/^ap:(ok|no|bk|r(\d)):([0-9a-f-]{32,40})$/i);
+  const m = String(cb.data).match(/^ap:(ok|no|bk|ed|r(\d)):([0-9a-f-]{32,40})$/i);
   if (!m) return answer('Непонятная кнопка', true);
   const [, kind, ri, id] = m;
   const chat = cb.message.chat.id, mid = cb.message.message_id;
@@ -3398,6 +3399,10 @@ async function handleApCallback(cb) {
     await apSetModeration(id, { status: TS.scheduled }, 'ok');
     await answer('В очереди');
     return editText(`✅ В очереди на ${formatWarsaw(row.publishAt)}\n\n${row.text}`);
+  }
+  if (kind === 'ed') {
+    await answer('Пришли новый текст');
+    return botSend(chat, `Пришли свой текст поста ответом на это сообщение, он заменит черновик на ${formatWarsaw(row.publishAt)} и сразу встанет в очередь.\n#${apShortId(row.id)}`, { reply_markup: { force_reply: true, input_field_placeholder: 'Текст поста для Threads' } });
   }
   if (kind === 'no') {
     await answer('Выбери причину');
