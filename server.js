@@ -2346,6 +2346,7 @@ const THREADS_API = 'https://graph.threads.net/v1.0';
 const THREADS_MAX = 500;
 const THREADS_SAFE = 470;                 // генерируем с запасом: эмодзи в лимите считаются по байтам
 const TS = { scheduled: 't_scheduled', publishing: 't_publishing', published: 't_published', failed: 't_failed', missed: 't_missed', cancelled: 't_cancelled' };
+const TH_PICK_TIMES = ['12:30', '15:30', '19:30'];
 const THREADS_SLOTS = ['12:30', '19:30'];  // время Варшавы для автоподстановки
 let threadsUserIdCache = process.env.THREADS_USER_ID || '';
 const tSleep = ms => new Promise(r => setTimeout(r, ms));
@@ -2663,7 +2664,9 @@ function threadsRoute(req, res) {
           if (!text) throw httpError(400, `Пост ${i + 1}: пустой текст`);
           const len = threadsLength(text);
           if (len > THREADS_MAX) throw httpError(400, `Пост ${i + 1}: ${len} символов, лимит ${THREADS_MAX}`);
-          const parsed = parseWarsawDateTime(it.when);
+          const auto = !String(it.when || '').trim();
+          const slot = TH_PICK_TIMES.includes(String(it.slot || '')) ? String(it.slot) : '12:30';
+          const parsed = auto ? { ok: true, iso: '' } : parseWarsawDateTime(it.when);
           if (!parsed.ok) throw httpError(400, `Пост ${i + 1}: ${parsed.error}`);
           const mt = it.meta && typeof it.meta === 'object' ? it.meta : null;
           const meta = mt ? {
@@ -2672,8 +2675,30 @@ function threadsRoute(req, res) {
             company: String(mt.company || '').slice(0, 100),
             angle: String(mt.angle || '').slice(0, 300)
           } : null;
-          return { text, iso: parsed.iso, meta };
+          return { text, iso: parsed.iso, meta, auto, slot };
         });
+        if (prepared.some(p => p.auto)) {
+          // Без даты: ближайший день, где в очереди еще нет ни одного поста, на выбранное время
+          const rows = await schedQuery({ and: [{ property: 'Status', select: { equals: TS.scheduled } }, { property: 'Owner', number: { equals: Number(auth.userId) } }] }, 100);
+          const busyDays = new Set();
+          const dayKey = ms => { const w = warsawParts(ms); return `${w.y}-${w.mo}-${w.d}`; };
+          rows.forEach(r => { if (r.publishAt) busyDays.add(dayKey(Date.parse(r.publishAt))); });
+          prepared.forEach(p => { if (!p.auto && p.iso) busyDays.add(dayKey(Date.parse(p.iso))); });
+          const base = warsawParts(Date.now());
+          for (const p of prepared) {
+            if (!p.auto) continue;
+            const [h, mi] = p.slot.split(':').map(Number);
+            for (let off = 0; off < 400; off++) {
+              const dt = new Date(Date.UTC(base.y, base.mo - 1, base.d + off));
+              const y = dt.getUTCFullYear(), mo = dt.getUTCMonth() + 1, d = dt.getUTCDate();
+              const ms = warsawToUtcMs(y, mo, d, h, mi);
+              if (ms === null || ms < Date.now() + 10 * 60 * 1000) continue;
+              if (busyDays.has(`${y}-${mo}-${d}`)) continue;
+              p.iso = new Date(ms).toISOString(); busyDays.add(`${y}-${mo}-${d}`); break;
+            }
+            if (!p.iso) throw httpError(409, 'Не нашел свободный день в ближайший год');
+          }
+        }
         for (const p of prepared) await tCreate(p.text, p.iso, Number(auth.userId), p.meta);
         return send(200, { ok: true, count: prepared.length });
       }

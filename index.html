@@ -2380,6 +2380,37 @@
       return m ? `${m[3]}.${m[2]}.${m[1]} ${m[4]}:${m[5]}` : '';
     }
 
+    // Выбор времени для Threads: дата (без минут) и три пресета времени. Минуты всегда :00 или :30.
+    // Пустая дата значит «ближайший свободный день»: его подберет сервер на выбранное время (по умолчанию 12:30).
+    const TH_TIMES = ['12:30', '15:30', '19:30'];
+    function thPicker(initial, onChange) {
+      const m = /^\s*(\d{1,2})\.(\d{1,2})\.(\d{4})\s+(\d{1,2}):(\d{2})\s*$/.exec(initial || '');
+      const st = { date: m ? `${m[3]}-${m[2].padStart(2, '0')}-${m[1].padStart(2, '0')}` : '', time: m ? `${m[4].padStart(2, '0')}:${m[5]}` : '12:30' };
+      const el = document.createElement('div');
+      el.style.cssText = 'display:flex;flex-wrap:wrap;gap:6px;align-items:center;flex:1';
+      const date = document.createElement('input'); date.type = 'date'; date.value = st.date;
+      try { const t = new Date(Date.now()); date.min = new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/Warsaw' }).format(t); } catch (e) { /* без ограничения */ }
+      const hint = document.createElement('div'); hint.className = 'digest-row'; hint.style.cssText = 'flex-basis:100%;margin:0';
+      const chips = TH_TIMES.map(t => {
+        const b = document.createElement('button'); b.type = 'button'; b.className = 'action-btn'; b.textContent = t;
+        b.addEventListener('click', () => { st.time = t; paint(); if (onChange) onChange(); });
+        return b;
+      });
+      function paint() {
+        chips.forEach(b => { const on = b.textContent === st.time; b.style.outline = on ? '2px solid #2AABEE' : ''; b.style.fontWeight = on ? '700' : ''; });
+        hint.textContent = st.date ? '' : 'Дата не выбрана: бот возьмет ближайший свободный день на ' + st.time;
+      }
+      date.addEventListener('input', () => { st.date = date.value; paint(); if (onChange) onChange(); });
+      el.appendChild(date); chips.forEach(b => el.appendChild(b)); el.appendChild(hint); paint();
+      return {
+        el,
+        get() {
+          const d = /^(\d{4})-(\d{2})-(\d{2})$/.exec(st.date);
+          return { when: d ? `${d[3]}.${d[2]}.${d[1]} ${st.time}` : '', slot: st.time };
+        }
+      };
+    }
+
     async function thGenerate() {
       if (thState.busy) return;
       thState.busy = true;
@@ -2415,10 +2446,8 @@
         upd();
         const row = document.createElement('div');
         row.className = 'digest-actions';
-        const when = document.createElement('input');
-        when.type = 'datetime-local'; when.value = thToInput(it.when);
-        when.addEventListener('input', () => { it.when = thFromInput(when.value); });
-        when.style.flex = '1';
+        const pk = thPicker(it.when, () => { it.when = pk.get().when; });
+        const when = pk.el;
         const del = document.createElement('button');
         del.className = 'action-btn'; del.textContent = 'Убрать';
         del.addEventListener('click', () => { thState.items.splice(idx, 1); thRenderBatch(); });
@@ -2494,17 +2523,17 @@
         const actions = document.createElement('div');
         actions.className = 'digest-actions';
         const when = document.createElement('input');
-        when.type = 'datetime-local'; when.style.flex = '1';
+        const pk = thPicker('');
         const mv = document.createElement('button');
         mv.className = 'action-btn'; mv.textContent = 'Перенести';
-        mv.addEventListener('click', () => thAction(it.id, 'reschedule', mv, thFromInput(when.value)));
+        mv.addEventListener('click', () => thAction(it.id, 'reschedule', mv, pk.get().when));
         const now = document.createElement('button');
         now.className = 'action-btn primary tg'; now.textContent = it.status === 'scheduled' ? 'Опубликовать сейчас' : 'Опубликовать снова';
         now.addEventListener('click', () => thAction(it.id, 'publish', now));
         const cancel = document.createElement('button');
         cancel.className = 'action-btn'; cancel.textContent = 'Отменить';
         cancel.addEventListener('click', () => thAction(it.id, 'cancel', cancel));
-        actions.appendChild(when); actions.appendChild(mv);
+        actions.appendChild(pk.el); actions.appendChild(mv);
         card.appendChild(actions);
         const actions2 = document.createElement('div');
         actions2.className = 'digest-actions';
@@ -2629,16 +2658,15 @@
         const counter = document.createElement('div'); counter.className = 'digest-row';
         const upd = () => { const n = thLen(ta.value); counter.textContent = n + ' из ' + TH_MAX; counter.style.color = n > TH_MAX ? 'var(--red)' : ''; ta.style.height = 'auto'; ta.style.height = Math.max(180, ta.scrollHeight + 4) + 'px'; };
         ta.addEventListener('input', upd); card.appendChild(ta); card.appendChild(counter); setTimeout(upd, 0); upd();
-        const when = document.createElement('input'); when.type = 'datetime-local'; when.value = thToInput(p.when || '');
+        const pk = thPicker(''); const when = pk.el;
         const q = document.createElement('button'); q.className = 'generate-btn tg-btn'; q.textContent = 'Поставить в очередь';
         q.addEventListener('click', async () => {
           if (thState.busy) return;
           if (thLen(ta.value) > TH_MAX) { showToast('Длиннее ' + TH_MAX + ' символов', true); return; }
-          const w = thFromInput(when.value);
-          if (!w) { showToast('Выбери время', true); return; }
+          const w = pk.get();
           thState.busy = true; q.disabled = true; q.textContent = 'Ставлю…';
           try {
-            await queueCall('/api/threads-schedule', { method: 'POST', body: JSON.stringify({ items: [{ text: ta.value, when: w, meta: { type: data.personal ? 'personal' : 'news', goal: 'reach', angle: p.angle || '' } }] }) });
+            await queueCall('/api/threads-schedule', { method: 'POST', body: JSON.stringify({ items: [{ text: ta.value, when: w.when, slot: w.slot, meta: { type: data.personal ? 'personal' : 'news', goal: 'reach', angle: p.angle || '' } }] }) });
             showToast('В очереди'); card.remove();
           } catch (e) { showToast(thErr(e), true); q.disabled = false; q.textContent = 'Поставить в очередь'; }
           finally { thState.busy = false; }
@@ -2676,18 +2704,16 @@
         setTimeout(upd, 0); upd();
       }
       if (ta && r.status === 'ready') {
-        const when = document.createElement('input');
-        when.type = 'datetime-local'; when.value = thToInput(data.slot || '');
+        const pk = thPicker(''); const when = pk.el;
         const q = document.createElement('button');
         q.className = 'generate-btn tg-btn'; q.textContent = 'Поставить в очередь';
         q.addEventListener('click', async () => {
           if (thState.busy) return;
           if (thLen(ta.value) > TH_MAX) { showToast('Длиннее ' + TH_MAX + ' символов', true); return; }
-          const w = thFromInput(when.value);
-          if (!w) { showToast('Выбери время', true); return; }
+          const w = pk.get();
           thState.busy = true; q.disabled = true; q.textContent = 'Ставлю…';
           try {
-            await queueCall('/api/threads-schedule', { method: 'POST', body: JSON.stringify({ items: [{ text: ta.value, when: w, meta: { type: r.content_type, goal: r.goal || 'reach', company: r.company || '', angle: r.angle || '' } }] }) });
+            await queueCall('/api/threads-schedule', { method: 'POST', body: JSON.stringify({ items: [{ text: ta.value, when: w.when, slot: w.slot, meta: { type: r.content_type, goal: r.goal || 'reach', company: r.company || '', angle: r.angle || '' } }] }) });
             showToast('В очереди');
             box.innerHTML = '';
           } catch (e) { showToast(thErr(e), true); q.disabled = false; q.textContent = 'Поставить в очередь'; }
