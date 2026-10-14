@@ -2973,7 +2973,14 @@ async function generateAngles(cand) {
   const maxBody = personal ? 480 : THREADS_MAX - (hasUrl ? threadsLength(urlSrc) + 1 : 0) - 10;
   if (maxBody < 150) throw httpError(400, 'Ссылка слишком длинная, на текст остается меньше 150 символов');
   if (personal && srcText.trim().length < 80) throw httpError(400, 'Для личных постов вставь свой материал подробнее: что произошло и что ты почувствовал. Придумывать за тебя бот не будет.');
-  const parsed = await claudeJson(personal ? personalVariantsPrompt() : anglesSystemPrompt(maxBody, hasUrl), JSON.stringify({ title, source_url: hasUrl ? urlSrc : '', source_text: srcText }), 5000);
+  const sysP = personal ? personalVariantsPrompt() : anglesSystemPrompt(maxBody, hasUrl);
+  const userP = JSON.stringify({ title, source_url: hasUrl ? urlSrc : '', source_text: srcText });
+  let parsed = await claudeJson(sysP, userP, 5000);
+  const goodCnt = r => (r && Array.isArray(r.posts) ? r.posts : []).filter(x => String((x && x.text) || '').trim().length >= 60).length;
+  if (goodCnt(parsed) < 3) {
+    const again = await claudeJson(sysP + '\n\nВАЖНО: в прошлый раз часть постов пришла пустой или заглушкой. В каждом элементе posts в поле text должен быть полный самостоятельный текст поста минимум 150 символов. Ссылки на другие варианты и фразы вроде «то же самое» запрещены.', userP, 5000);
+    if (goodCnt(again) > goodCnt(parsed)) parsed = again;
+  }
   if (!parsed || !Array.isArray(parsed.posts)) throw httpError(502, 'Модель вернула не JSON, попробуй еще раз');
   const norm = t => String(t || '').toLowerCase().replace(/ё/g, 'е').replace(/[\s ]+/g, ' ').replace(/[«»"“”„'’.,!?;:()\-–—]/g, '').trim();
   const nsrc = norm(srcText);
@@ -2983,6 +2990,8 @@ async function generateAngles(cand) {
     const angle = String((it && it.angle) || '').trim().slice(0, 60);
     const why = [];
     if (!body) why.push('пусто');
+    else if (body.length < 60) why.push('слишком коротко');
+    if (posts.some(x => norm(x.text) === norm(body))) why.push('дубль');
     if (threadsLength(body) > maxBody) why.push('длинно');
     for (const [re, w] of EDITOR_BAD) { if (personal && w === 'выдуманный личный опыт') continue; if (re.test(body)) { why.push('шаблонная фраза'); break; } }
     if (findNegContrast(body).length) why.push('не X, а Y');
