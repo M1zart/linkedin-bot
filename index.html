@@ -2456,6 +2456,7 @@
       for (let h = 0; h < 24; h++) hSel.add(new Option(String(h).padStart(2, '0'), String(h).padStart(2, '0')));
       ['00', '15', '30', '45'].forEach(m => mSel.add(new Option(m, m)));
       const tChips = ['12:30', '15:30', '19:30'].map(t => { const b = document.createElement('button'); b.type = 'button'; b.className = 'tone-btn'; b.textContent = t; b.addEventListener('click', () => setTime(t)); return b; });
+      hSel.style.cssText = mSel.style.cssText = 'width:76px;flex:0 0 76px';
       const colon = document.createElement('span'); colon.textContent = ':';
       timeBox.appendChild(hSel); timeBox.appendChild(colon); timeBox.appendChild(mSel); tChips.forEach(b => timeBox.appendChild(b));
       function setTime(t) { time.value = t; const d = (input.value || '').slice(0, 10); compose(/^\d{4}-/.test(d) ? d : '', t); sync(); }
