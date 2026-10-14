@@ -2,7 +2,6 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const { AsyncLocalStorage } = require('async_hooks');
 
 const PORT = process.env.PORT || 3000;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
@@ -801,26 +800,11 @@ const server = http.createServer(async (req, res) => {
   }
 
   // ── Голоса: список и карточки во вкладке «Голос» ──
+  if (voiceApiRoute(req, res)) return;
   if (voiceRoute(req, res)) return;
 
   // ── Threads: генерация, очередь, действия ──
   if (threadsRoute(req, res)) return;
-
-  // ── Вебхук бота голосов ──
-  if (req.method === 'POST' && req.url === '/api/voice-webhook') {
-    let body = '';
-    req.on('data', chunk => { body += chunk; if (body.length > 1024 * 1024) req.destroy(); });
-    req.on('end', () => {
-      const given = String(req.headers['x-telegram-bot-api-secret-token'] || '');
-      if (!VOICE_BOT_TOKEN || !safeEqual(given, voiceWebhookSecret())) { res.writeHead(403); res.end('forbidden'); return; }
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end('{"ok":true}');
-      let update;
-      try { update = JSON.parse(body); } catch { return; }
-      tgCtx.run({ token: VOICE_BOT_TOKEN }, () => handleVoiceBotUpdate(update)).catch(e => console.error('voice bot update error:', scrubToken(e.message)));
-    });
-    return;
-  }
 
   // ── Вебхук бота: команда /scheduled и кнопки «Отменить» / «Опубликовать сейчас» ──
   if (req.method === 'POST' && req.url === '/api/telegram-webhook') {
@@ -852,8 +836,7 @@ const server = http.createServer(async (req, res) => {
       intervalMs: SCHEDULER_INTERVAL_MS,
       staleMinutes: SCHEDULE_STALE_MS / 60000,
       scheduler: schedulerState,
-      webhook: { ...webhookState },
-      voiceBot: { ...voiceBotState }
+      webhook: { ...webhookState }
     };
     try {
       if (NOTION_API_KEY) {
@@ -1824,8 +1807,6 @@ function httpError(status, message) {
 function scrubToken(msg) {
   const s = String(msg);
   let r = TELEGRAM_BOT_TOKEN ? s.split(TELEGRAM_BOT_TOKEN).join('***') : s;
-  const vt = process.env.VOICE_BOT_TOKEN && process.env.VOICE_BOT_TOKEN.trim();
-  if (vt) r = r.split(vt).join('***');
   const tt = process.env.THREADS_ACCESS_TOKEN;
   return tt ? r.split(tt).join('***') : r;
 }
@@ -1840,12 +1821,8 @@ function friendlyTelegramError(msg) {
   return 'Telegram: ' + m;
 }
 
-// Второй бот (голоса): внутри tgCtx.run({ token }) все вызовы Telegram идут с его токеном
-const tgCtx = new AsyncLocalStorage();
-const tgToken = () => (tgCtx.getStore() || {}).token || TELEGRAM_BOT_TOKEN;
-
 async function tgApi(method, payload, isForm = false) {
-  const url = `https://api.telegram.org/bot${tgToken()}/${method}`;
+  const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/${method}`;
   const resp = await fetch(url, isForm
     ? { method: 'POST', body: payload }
     : { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
@@ -2240,10 +2217,6 @@ async function recoverStuckPublishing() {
 
 // --- Бот: вебхук, /scheduled, кнопки ---
 
-const VOICE_BOT_TOKEN = (process.env.VOICE_BOT_TOKEN || '').trim() || undefined;
-const voiceWebhookSecret = () => crypto.createHmac('sha256', VOICE_BOT_TOKEN).update('voicebot-webhook').digest('hex');
-const voiceBotState = { status: VOICE_BOT_TOKEN ? 'not-started' : 'off', username: null, error: null };
-
 const webhookState = { status: 'not-started', desired: null, foreignUrl: null, error: null };
 
 function webhookSecret() {
@@ -2281,34 +2254,6 @@ async function setupTelegramBot() {
   webhookState.status = 'active';
 }
 
-// Отдельный бот для «100 голосов»: принимает голосовые и ведет сессию. Пишет в ту же Notion-базу, вкладка «Голос» в Mini App не меняется
-async function setupVoiceBot() {
-  if (!VOICE_BOT_TOKEN) return;
-  const base = publicBaseUrl();
-  if (!base) { voiceBotState.status = 'no-public-url'; return; }
-  await tgCtx.run({ token: VOICE_BOT_TOKEN }, async () => {
-    const me = await tgApi('getMe', {});
-    voiceBotState.username = '@' + me.username;
-    await tgApi('setWebhook', { url: base + '/api/voice-webhook', secret_token: voiceWebhookSecret(), allowed_updates: ['message', 'callback_query'] });
-    await tgApi('setMyCommands', { commands: [{ command: 'help', description: 'Как прислать голосовые' }] });
-  });
-  voiceBotState.status = 'active';
-}
-
-async function handleVoiceBotUpdate(update) {
-  if (update.callback_query) {
-    if (/^vo:/.test(String(update.callback_query.data || ''))) return handleVoiceCallback(update.callback_query).catch(e => console.error('voice cb:', scrubToken(e.message)));
-    return;
-  }
-  const msg = update.message;
-  if (!msg || !msg.from || !msg.chat || msg.chat.type !== 'private') return;
-  const userId = String(msg.from.id);
-  if (!TELEGRAM_ALLOWED_USER_IDS.includes(userId)) return botSend(msg.chat.id, `Нет доступа. Твой Telegram ID: ${userId}`);
-  if (isVoiceMessage(msg)) return voiceIntake(msg).catch(e => console.error('voice intake:', scrubToken(e.message)));
-  if (msg.text && !msg.text.startsWith('/') && voiceSessions.has(userId) && await voiceText(msg).catch(e => { console.error('voice text:', scrubToken(e.message)); return false; })) return;
-  return botSend(msg.chat.id, 'Это бот рубрики «100 голосов iGaming». Перешли сюда голосовые героя: я спрошу роль, номер голоса и стаж, потом нажми «Готово». Черновик появится в приложении, вкладка «Голос».');
-}
-
 function startScheduling() {
   if (!scheduleConfigured() || !TELEGRAM_BOT_TOKEN) {
     console.log('Планирование выключено: нужны NOTION_API_KEY и TELEGRAM_BOT_TOKEN');
@@ -2334,7 +2279,6 @@ function startScheduling() {
   }
   setTimeout(() => statsTick().catch(e => console.error('stats:', scrubToken(e.message))), 25000);
   setInterval(() => statsTick().catch(e => console.error('stats:', scrubToken(e.message))), 10 * 60 * 1000);
-  setupVoiceBot().catch(e => { voiceBotState.status = 'error'; voiceBotState.error = scrubToken(e.message); console.error('настройка бота голосов:', voiceBotState.error); });
   setupTelegramBot().catch(e => { webhookState.status = 'error'; webhookState.error = scrubToken(e.message); console.error('настройка бота:', webhookState.error); });
 }
 
@@ -4372,7 +4316,7 @@ async function geminiTranscribe(buf, mime) {
 async function tgDownload(fileId) {
   const f = await tgApi('getFile', { file_id: fileId });
   if (!f.file_path) throw new Error('Telegram не отдал файл');
-  const resp = await fetch(`https://api.telegram.org/file/bot${tgToken()}/${f.file_path}`);
+  const resp = await fetch(`https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${f.file_path}`);
   if (!resp.ok) throw new Error(`Не скачался файл (HTTP ${resp.status})`);
   return Buffer.from(await resp.arrayBuffer());
 }
@@ -4532,7 +4476,7 @@ async function voiceText(msg) {
   }
   if (s.step === 'otherq') {
     const qs = text.split('\n').map(x => x.replace(/^\s*\d+[.)]\s*/, '').trim()).filter(Boolean);
-    if (qs.length !== 2) { await botSend(s.chatId, 'Нужно ровно 2 вопроса, каждый с новой строки.'); return true; }
+    if (qs.length !== 3) { await botSend(s.chatId, 'Нужно ровно 3 вопроса, каждый с новой строки.'); return true; }
     s.otherQs = qs;
     await voiceAskNumber(s);
     return true;
@@ -4558,7 +4502,7 @@ async function handleVoiceCallback(cb) {
     s.role = arg;
     if (arg === 'other') {
       s.step = 'otherq';
-      return botSend(s.chatId, 'Пришли 2 вопроса для этого героя одним сообщением, каждый с новой строки.', { reply_markup: voiceKb([[voiceCancelBtn]]) });
+      return botSend(s.chatId, 'Пришли 3 вопроса для этого героя одним сообщением, каждый с новой строки.', { reply_markup: voiceKb([[voiceCancelBtn]]) });
     }
     return voiceAskNumber(s);
   }
@@ -4568,6 +4512,19 @@ async function handleVoiceCallback(cb) {
     if (s.step !== 'ready') return botSend(s.chatId, 'Сначала выбери роль, номер и стаж.');
     return voiceProcess(s);
   }
+}
+
+// Расшифровка уже готова: раскладываем по вопросам роли и пишем в Notion. Вызывается и из бота, и из API (TTS-бот)
+async function voiceSubmit({ role: roleKey, otherQs, number, exp, transcript }) {
+  const role = voiceRole(roleKey, otherQs);
+  const q = loadQuestions();
+  const questions = [
+    ...q.common.map((x, i) => ({ id: 'c' + (i + 1), text: typeof x === 'string' ? x : x.text })),
+    ...role.questions.map((x, i, arr) => ({ id: 'r' + (i + 1), text: typeof x === 'string' ? x : x.text, replaceable: i === arr.length - 1 }))
+  ];
+  const parsed = await voiceStructure(questions, transcript);
+  const out = voiceAssemble({ number, roleTitle: role.title, exp, questions, commonCount: q.common.length, parsed });
+  await voiceCreate({ number, roleTitle: role.title, exp, ...out, transcript });
 }
 
 async function voiceProcess(s) {
@@ -4583,15 +4540,7 @@ async function voiceProcess(s) {
       parts.push(`[Голосовое ${i + 1}]\n${text}`);
     }
     const transcript = parts.join('\n\n');
-    const role = voiceRole(s.role, s.otherQs);
-    const q = loadQuestions();
-    const questions = [
-      ...q.common.map((x, i) => ({ id: 'c' + (i + 1), text: typeof x === 'string' ? x : x.text })),
-      ...role.questions.map((x, i, arr) => ({ id: 'r' + (i + 1), text: typeof x === 'string' ? x : x.text, replaceable: i === arr.length - 1 }))
-    ];
-    const parsed = await voiceStructure(questions, transcript);
-    const out = voiceAssemble({ number: s.number, roleTitle: role.title, exp: s.exp, questions, commonCount: q.common.length, parsed });
-    await voiceCreate({ number: s.number, roleTitle: role.title, exp: s.exp, ...out, transcript });
+    await voiceSubmit({ role: s.role, otherQs: s.otherQs, number: s.number, exp: s.exp, transcript });
     voiceSessions.delete(s.userId);
     return botSend(s.chatId, `Голос #${s.number} готов, открой вкладку Голос.`);
   } catch (e) {
@@ -4602,6 +4551,50 @@ async function voiceProcess(s) {
 }
 
 // --- Mini App: список и карточка голосов ---
+
+// Закрытый API для TTS-бота (он принимает голосовые и расшифровывает их). Доступ по VOICE_API_SECRET
+const VOICE_API_SECRET = (process.env.VOICE_API_SECRET || '').trim();
+
+function voiceApiRoute(req, res) {
+  const url = req.url.split('?')[0];
+  if (!url.startsWith('/api/voice-api/')) return false;
+  const send = (status, obj) => { res.writeHead(status, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(obj)); };
+  const auth = String(req.headers.authorization || '');
+  if (!VOICE_API_SECRET || !safeEqual(auth, 'Bearer ' + VOICE_API_SECRET)) { send(403, { ok: false, error: 'forbidden' }); return true; }
+  if (!voiceConfigured()) { send(500, { ok: false, error: 'Голоса не настроены: нет NOTION_VOICE_DS_ID' }); return true; }
+  const run = async (body) => {
+    try {
+      if (req.method === 'GET' && url === '/api/voice-api/info') {
+        const q = loadQuestions();
+        let next = 1;
+        try { next = await voiceNextNumber(); } catch (e) { console.error('voice number:', scrubToken(e.message)); }
+        return send(200, {
+          ok: true, next,
+          roles: Object.entries(q.roles).map(([key, r]) => ({ key, title: r.title })),
+          other: (q.other && q.other.title) || 'Другое',
+          roleQuestions: (q.roles.head_of_sportsbook || Object.values(q.roles)[0]).questions.length
+        });
+      }
+      if (req.method === 'POST' && url === '/api/voice-api/submit') {
+        const d = JSON.parse(body || '{}');
+        const number = Number(d.number);
+        if (!d.role || !Number.isInteger(number) || number < 1 || !String(d.transcript || '').trim()) return send(400, { ok: false, error: 'нужны role, number, transcript' });
+        await voiceSubmit({ role: d.role, otherQs: Array.isArray(d.otherQs) ? d.otherQs.map(String) : [], number, exp: String(d.exp || '').slice(0, 80), transcript: String(d.transcript) });
+        return send(200, { ok: true, number });
+      }
+      return send(404, { ok: false, error: 'not found' });
+    } catch (e) {
+      console.error('voice api:', scrubToken(e.message));
+      return send(500, { ok: false, error: scrubToken(e.message).slice(0, 400) });
+    }
+  };
+  if (req.method === 'POST') {
+    let body = '';
+    req.on('data', chunk => { body += chunk; if (body.length > 3 * 1024 * 1024) req.destroy(); });
+    req.on('end', () => run(body));
+  } else run('');
+  return true;
+}
 
 function voiceRoute(req, res) {
   const url = req.url.split('?')[0];
@@ -4676,8 +4669,8 @@ async function handleBotUpdate(update) {
   if (!TELEGRAM_ALLOWED_USER_IDS.includes(userId)) {
     return botSend(msg.chat.id, `Нет доступа. Твой Telegram ID: ${userId}`);
   }
-  if (isVoiceMessage(msg) && VOICE_BOT_TOKEN) {
-    return botSend(msg.chat.id, 'Голосовые для «100 голосов» теперь принимает отдельный бот' + (voiceBotState.username ? ' ' + voiceBotState.username : '') + '. Перешли их туда.');
+  if (isVoiceMessage(msg) && VOICE_API_SECRET) {
+    return botSend(msg.chat.id, 'Голосовые для «100 голосов» теперь принимает бот озвучки. Перешли их туда.');
   }
   if (isVoiceMessage(msg)) return voiceIntake(msg).catch(e => console.error('voice intake:', scrubToken(e.message)));
   if (msg.text && !msg.text.startsWith('/') && voiceSessions.has(userId) && await voiceText(msg).catch(e => { console.error('voice text:', scrubToken(e.message)); return false; })) return;
