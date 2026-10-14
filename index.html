@@ -2384,24 +2384,24 @@
     const calBusy = { at: 0, days: {} };
     async function calLoadBusy(force) {
       if (!force && Date.now() - calBusy.at < 8000) return calBusy.days;
-      try { const d = await queueCall('/api/busy-days'); calBusy.days = d.days || {}; calBusy.at = Date.now(); } catch (e) { /* без отметок */ }
+      try { const d = await queueCall('/api/threads-busy-days'); calBusy.days = d.days || {}; calBusy.at = Date.now(); } catch (e) { /* без отметок */ }
       return calBusy.days;
     }
     function calWidget(onPick, getSelected) {
       const MONTHS = ['Январь', 'Февраль', 'Март', 'Апрель', 'Май', 'Июнь', 'Июль', 'Август', 'Сентябрь', 'Октябрь', 'Ноябрь', 'Декабрь'];
       const today = new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/Warsaw' }).format(new Date());
       const el = document.createElement('div');
-      el.style.cssText = 'display:none;flex-basis:100%;border:1px solid rgba(128,128,128,.35);border-radius:10px;padding:8px;box-sizing:border-box;margin:4px 0';
+      el.style.cssText = 'display:none;flex-basis:100%;width:100%;max-width:100%;border:1px solid rgba(128,128,128,.35);border-radius:10px;padding:8px;box-sizing:border-box;margin:4px 0;overflow:hidden';
       let ym = { y: +today.slice(0, 4), m: +today.slice(5, 7) };
       function render() {
         el.innerHTML = '';
         const sel = (getSelected && getSelected()) || '';
         const head = document.createElement('div'); head.style.cssText = 'display:flex;justify-content:space-between;align-items:center;margin-bottom:6px';
-        const nav = (t, d) => { const b = document.createElement('button'); b.type = 'button'; b.className = 'action-btn'; b.textContent = t; b.addEventListener('click', () => { ym.m += d; if (ym.m < 1) { ym.m = 12; ym.y--; } if (ym.m > 12) { ym.m = 1; ym.y++; } render(); }); return b; };
+        const nav = (t, d) => { const b = document.createElement('button'); b.type = 'button'; b.className = 'action-btn'; b.style.cssText = 'width:44px;min-width:0;padding:6px 0;flex:0 0 auto'; b.textContent = t; b.addEventListener('click', () => { ym.m += d; if (ym.m < 1) { ym.m = 12; ym.y--; } if (ym.m > 12) { ym.m = 1; ym.y++; } render(); }); return b; };
         const title = document.createElement('div'); title.style.fontWeight = '600'; title.textContent = MONTHS[ym.m - 1] + ' ' + ym.y;
         head.appendChild(nav('‹', -1)); head.appendChild(title); head.appendChild(nav('›', 1));
         el.appendChild(head);
-        const grid = document.createElement('div'); grid.style.cssText = 'display:grid;grid-template-columns:repeat(7,1fr);gap:3px;text-align:center';
+        const grid = document.createElement('div'); grid.style.cssText = 'display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:3px;text-align:center';
         ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс'].forEach(w => { const c = document.createElement('div'); c.style.cssText = 'font-size:11px;opacity:.6'; c.textContent = w; grid.appendChild(c); });
         const first = new Date(Date.UTC(ym.y, ym.m - 1, 1));
         const lead = (first.getUTCDay() + 6) % 7;
@@ -2449,7 +2449,18 @@
       input.style.display = 'none';
       const row = document.createElement('div'); row.style.cssText = 'display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:4px 0';
       const dateBtn = document.createElement('button'); dateBtn.type = 'button'; dateBtn.className = 'tone-btn'; dateBtn.style.flex = '1';
-      const time = document.createElement('input'); time.type = 'time'; time.step = 60; time.style.cssText = 'flex:0 0 120px';
+      // Время: три пресета и выбор часа и минут (минуты только 00, 15, 30, 45), чтобы не крутить 60 значений
+      const timeBox = document.createElement('div'); timeBox.style.cssText = 'display:flex;flex-wrap:wrap;gap:6px;align-items:center;flex-basis:100%';
+      const time = { value: '' };
+      const hSel = document.createElement('select'), mSel = document.createElement('select');
+      for (let h = 0; h < 24; h++) hSel.add(new Option(String(h).padStart(2, '0'), String(h).padStart(2, '0')));
+      ['00', '15', '30', '45'].forEach(m => mSel.add(new Option(m, m)));
+      const tChips = ['12:30', '15:30', '19:30'].map(t => { const b = document.createElement('button'); b.type = 'button'; b.className = 'tone-btn'; b.textContent = t; b.addEventListener('click', () => setTime(t)); return b; });
+      const colon = document.createElement('span'); colon.textContent = ':';
+      timeBox.appendChild(hSel); timeBox.appendChild(colon); timeBox.appendChild(mSel); tChips.forEach(b => timeBox.appendChild(b));
+      function setTime(t) { time.value = t; const d = (input.value || '').slice(0, 10); compose(/^\d{4}-/.test(d) ? d : '', t); sync(); }
+      hSel.addEventListener('change', () => setTime(hSel.value + ':' + mSel.value));
+      mSel.addEventListener('change', () => setTime(hSel.value + ':' + mSel.value));
       const todayStr = () => new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/Warsaw' }).format(new Date());
       const compose = (d, t) => { input.value = (d || todayStr()) + 'T' + (t || '12:30'); input.dispatchEvent(new Event('input', { bubbles: true })); input.dispatchEvent(new Event('change', { bubbles: true })); };
       const cal = calWidget(d => { compose(d, time.value); sync(); cal.hide(); }, () => (input.value || '').slice(0, 10));
@@ -2457,11 +2468,17 @@
         const v = input.value || '';
         const d = v.slice(0, 10), t = v.slice(11, 16);
         dateBtn.textContent = /^\d{4}-\d{2}-\d{2}$/.test(d) ? 'Дата: ' + d.slice(8, 10) + '.' + d.slice(5, 7) + '.' + d.slice(0, 4) + ' (календарь)' : 'Выбрать дату (календарь)';
-        if (document.activeElement !== time) time.value = t;
+        if (/^\d{2}:\d{2}$/.test(t)) {
+          time.value = t;
+          if (document.activeElement !== hSel) hSel.value = t.slice(0, 2);
+          const mm = t.slice(3, 5);
+          if (![...mSel.options].some(o => o.value === mm)) mSel.add(new Option(mm, mm));
+          if (document.activeElement !== mSel) mSel.value = mm;
+          tChips.forEach(b => { b.style.outline = b.textContent === t ? '2px solid #2AABEE' : ''; });
+        }
       }
-      time.addEventListener('change', () => { const d = (input.value || '').slice(0, 10); if (time.value) compose(/^\d{4}-/.test(d) ? d : '', time.value); });
       dateBtn.addEventListener('click', () => cal.toggle());
-      row.appendChild(dateBtn); row.appendChild(time);
+      row.appendChild(dateBtn); row.appendChild(timeBox);
       input.insertAdjacentElement('afterend', row); row.insertAdjacentElement('afterend', cal.el);
       sync(); setInterval(sync, 400);
     }
