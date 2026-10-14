@@ -2380,6 +2380,83 @@
       return m ? `${m[3]}.${m[2]}.${m[1]} ${m[4]}:${m[5]}` : '';
     }
 
+    // Календарь с отметками: у дней, где уже есть посты, стоят точки (синяя Telegram, оранжевая Threads)
+    const calBusy = { at: 0, days: {} };
+    async function calLoadBusy(force) {
+      if (!force && Date.now() - calBusy.at < 8000) return calBusy.days;
+      try { const d = await queueCall('/api/busy-days'); calBusy.days = d.days || {}; calBusy.at = Date.now(); } catch (e) { /* без отметок */ }
+      return calBusy.days;
+    }
+    function calWidget(onPick, getSelected) {
+      const MONTHS = ['Январь', 'Февраль', 'Март', 'Апрель', 'Май', 'Июнь', 'Июль', 'Август', 'Сентябрь', 'Октябрь', 'Ноябрь', 'Декабрь'];
+      const today = new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/Warsaw' }).format(new Date());
+      const el = document.createElement('div');
+      el.style.cssText = 'display:none;flex-basis:100%;border:1px solid rgba(128,128,128,.35);border-radius:10px;padding:8px;box-sizing:border-box;margin:4px 0';
+      let ym = { y: +today.slice(0, 4), m: +today.slice(5, 7) };
+      function render() {
+        el.innerHTML = '';
+        const sel = (getSelected && getSelected()) || '';
+        const head = document.createElement('div'); head.style.cssText = 'display:flex;justify-content:space-between;align-items:center;margin-bottom:6px';
+        const nav = (t, d) => { const b = document.createElement('button'); b.type = 'button'; b.className = 'action-btn'; b.textContent = t; b.addEventListener('click', () => { ym.m += d; if (ym.m < 1) { ym.m = 12; ym.y--; } if (ym.m > 12) { ym.m = 1; ym.y++; } render(); }); return b; };
+        const title = document.createElement('div'); title.style.fontWeight = '600'; title.textContent = MONTHS[ym.m - 1] + ' ' + ym.y;
+        head.appendChild(nav('‹', -1)); head.appendChild(title); head.appendChild(nav('›', 1));
+        el.appendChild(head);
+        const grid = document.createElement('div'); grid.style.cssText = 'display:grid;grid-template-columns:repeat(7,1fr);gap:3px;text-align:center';
+        ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс'].forEach(w => { const c = document.createElement('div'); c.style.cssText = 'font-size:11px;opacity:.6'; c.textContent = w; grid.appendChild(c); });
+        const first = new Date(Date.UTC(ym.y, ym.m - 1, 1));
+        const lead = (first.getUTCDay() + 6) % 7;
+        const dim = new Date(Date.UTC(ym.y, ym.m, 0)).getUTCDate();
+        for (let i = 0; i < lead; i++) grid.appendChild(document.createElement('div'));
+        for (let d = 1; d <= dim; d++) {
+          const key = `${ym.y}-${String(ym.m).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+          const b = document.createElement('button'); b.type = 'button';
+          const info = calBusy.days[key] || {};
+          const past = key < today;
+          b.style.cssText = 'padding:6px 0 4px;border-radius:8px;border:1px solid ' + (key === today ? '#2AABEE' : 'transparent') + ';background:' + (key === sel ? '#2AABEE' : 'transparent') + ';color:inherit;font:inherit;cursor:pointer;opacity:' + (past ? '.3' : '1');
+          b.disabled = past;
+          const num = document.createElement('div'); num.textContent = d; if (key === sel) num.style.color = '#fff';
+          const dots = document.createElement('div'); dots.style.cssText = 'height:6px;display:flex;justify-content:center;gap:3px;margin-top:2px';
+          if (info.tg) { const x = document.createElement('span'); x.style.cssText = 'width:5px;height:5px;border-radius:50%;background:#2AABEE;outline:' + (key === sel ? '1px solid #fff' : 'none'); dots.appendChild(x); }
+          if (info.th) { const x = document.createElement('span'); x.style.cssText = 'width:5px;height:5px;border-radius:50%;background:#F5A623;outline:' + (key === sel ? '1px solid #fff' : 'none'); dots.appendChild(x); }
+          b.appendChild(num); b.appendChild(dots);
+          const tip = []; if (info.tg) tip.push('Telegram: ' + info.tg); if (info.th) tip.push('Threads: ' + info.th); if (tip.length) b.title = tip.join(', ');
+          b.addEventListener('click', () => onPick(key));
+          grid.appendChild(b);
+        }
+        el.appendChild(grid);
+        const leg = document.createElement('div'); leg.style.cssText = 'font-size:11px;opacity:.7;margin-top:6px';
+        leg.textContent = 'Синяя точка: пост в Telegram. Оранжевая: пост в Threads. Без точки: день свободен.';
+        el.appendChild(leg);
+      }
+      return {
+        el,
+        async show() {
+          const sel = (getSelected && getSelected()) || '';
+          if (/^\d{4}-\d{2}/.test(sel)) ym = { y: +sel.slice(0, 4), m: +sel.slice(5, 7) };
+          el.style.display = 'block'; render();
+          await calLoadBusy(true); render();
+        },
+        hide() { el.style.display = 'none'; },
+        toggle() { if (el.style.display === 'none') this.show(); else this.hide(); }
+      };
+    }
+    // Календарь под готовым полем даты и времени (окно планирования и экран переноса в Telegram-очереди)
+    function attachCalendar(inputId) {
+      const input = document.getElementById(inputId);
+      if (!input || input.dataset.cal) return;
+      input.dataset.cal = '1';
+      const btn = document.createElement('button'); btn.type = 'button'; btn.className = 'tone-btn'; btn.textContent = 'Календарь: что занято'; btn.style.margin = '6px 0';
+      const cal = calWidget(d => {
+        const cur = /T(\d{2}:\d{2})/.exec(input.value || '');
+        input.value = d + 'T' + (cur ? cur[1] : '12:30');
+        input.dispatchEvent(new Event('input', { bubbles: true })); input.dispatchEvent(new Event('change', { bubbles: true }));
+        cal.hide();
+      }, () => (input.value || '').slice(0, 10));
+      btn.addEventListener('click', () => cal.toggle());
+      input.insertAdjacentElement('afterend', btn); btn.insertAdjacentElement('afterend', cal.el);
+    }
+    ['schedule-when', 'reschedule-when'].forEach(id => attachCalendar(id));
+
     // Выбор времени для Threads: дата (без минут) и три пресета времени. Минуты всегда :00 или :30.
     // Пустая дата значит «ближайший свободный день»: его подберет сервер на выбранное время (по умолчанию 12:30).
     const TH_TIMES = ['12:30', '15:30', '19:30'];
@@ -2388,8 +2465,11 @@
       const st = { date: m ? `${m[3]}-${m[2].padStart(2, '0')}-${m[1].padStart(2, '0')}` : '', time: m ? `${m[4].padStart(2, '0')}:${m[5]}` : '12:30' };
       const el = document.createElement('div');
       el.style.cssText = 'display:flex;flex-wrap:wrap;gap:6px;align-items:center;flex:1';
-      const date = document.createElement('input'); date.type = 'date'; date.value = st.date;
-      try { const t = new Date(Date.now()); date.min = new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/Warsaw' }).format(t); } catch (e) { /* без ограничения */ }
+      const date = document.createElement('button'); date.type = 'button'; date.className = 'action-btn';
+      const dateText = () => { date.textContent = st.date ? st.date.slice(8, 10) + '.' + st.date.slice(5, 7) + '.' + st.date.slice(0, 4) : 'Выбрать дату'; };
+      const cal = calWidget(d => { st.date = d; dateText(); cal.hide(); paint(); if (onChange) onChange(); }, () => st.date);
+      date.addEventListener('click', () => cal.toggle());
+      dateText();
       const hint = document.createElement('div'); hint.className = 'digest-row'; hint.style.cssText = 'flex-basis:100%;margin:0';
       const chips = TH_TIMES.map(t => {
         const b = document.createElement('button'); b.type = 'button'; b.className = 'action-btn'; b.textContent = t;
@@ -2400,8 +2480,7 @@
         chips.forEach(b => { const on = b.textContent === st.time; b.style.outline = on ? '2px solid #2AABEE' : ''; b.style.fontWeight = on ? '700' : ''; });
         hint.textContent = st.date ? '' : 'Дата не выбрана: бот возьмет ближайший свободный день на ' + st.time;
       }
-      date.addEventListener('input', () => { st.date = date.value; paint(); if (onChange) onChange(); });
-      el.appendChild(date); chips.forEach(b => el.appendChild(b)); el.appendChild(hint); paint();
+      el.appendChild(date); chips.forEach(b => el.appendChild(b)); el.appendChild(cal.el); el.appendChild(hint); paint();
       return {
         el,
         get() {

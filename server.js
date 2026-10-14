@@ -2617,6 +2617,16 @@ function threadsRoute(req, res) {
         return send(400, { error: 'Неизвестное действие' });
       }
 
+      if (req.method === 'GET' && url === '/api/busy-days') {
+        // Дни (Варшава), где уже есть запланированные посты: tg — очередь Telegram, th — очередь Threads
+        const days = {};
+        const mark = (rows, k) => rows.forEach(r => { if (!r.publishAt) return; const w = warsawParts(Date.parse(r.publishAt)); const key = `${w.y}-${String(w.mo).padStart(2, '0')}-${String(w.d).padStart(2, '0')}`; (days[key] = days[key] || {})[k] = ((days[key] || {})[k] || 0) + 1; });
+        const own = { property: 'Owner', number: { equals: Number(auth.userId) } };
+        mark(await schedQuery({ and: [statusIs('scheduled'), own] }, 100), 'tg');
+        mark(await schedQuery({ and: [{ property: 'Status', select: { equals: TS.scheduled } }, own] }, 100), 'th');
+        return send(200, { days });
+      }
+
       if (req.method === 'GET' && url === '/api/threads-queue') {
         const rows = await schedQuery({ and: [
           { property: 'Owner', number: { equals: Number(auth.userId) } },
