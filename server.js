@@ -2760,6 +2760,18 @@ async function tRecent(limit = 20) {
   return (data.results || []).map(pageToRow);
 }
 
+// Вызов модели с ответом в JSON: при неразборчивом или обрезанном ответе одна повторная попытка с явным требованием формата
+async function claudeJson(system, user, maxTokens = 4000) {
+  for (let i = 0; i < 2; i++) {
+    const sys = i ? system + '\n\nВАЖНО: прошлый ответ не разобрался как JSON. Верни строго валидный JSON без Markdown и без текста вокруг. Внутри текстовых значений не используй прямые двойные кавычки, только «елочки». Переносы строк внутри значений пиши как \\n.' : system;
+    const raw = await claudeCall(sys, user, i ? Math.round(maxTokens * 1.5) : maxTokens);
+    const parsed = parseEditorJson(raw);
+    if (parsed) return parsed;
+    console.log('json: попытка', i + 1, raw ? 'ответ не разобрался, длина ' + raw.length : 'пустой ответ или обрезан по лимиту токенов');
+  }
+  return null;
+}
+
 function parseEditorJson(raw) {
   const m = String(raw || '').replace(/^```(?:json)?\s*|\s*```$/g, '').match(/\{[\s\S]*\}/);
   if (!m) return null;
@@ -2961,8 +2973,7 @@ async function generateAngles(cand) {
   const maxBody = personal ? 480 : THREADS_MAX - (hasUrl ? threadsLength(urlSrc) + 1 : 0) - 10;
   if (maxBody < 150) throw httpError(400, 'Ссылка слишком длинная, на текст остается меньше 150 символов');
   if (personal && srcText.trim().length < 80) throw httpError(400, 'Для личных постов вставь свой материал подробнее: что произошло и что ты почувствовал. Придумывать за тебя бот не будет.');
-  const raw = await claudeCall(personal ? personalVariantsPrompt() : anglesSystemPrompt(maxBody, hasUrl), JSON.stringify({ title, source_url: hasUrl ? urlSrc : '', source_text: srcText }), 4000);
-  const parsed = parseEditorJson(raw);
+  const parsed = await claudeJson(personal ? personalVariantsPrompt() : anglesSystemPrompt(maxBody, hasUrl), JSON.stringify({ title, source_url: hasUrl ? urlSrc : '', source_text: srcText }), 5000);
   if (!parsed || !Array.isArray(parsed.posts)) throw httpError(502, 'Модель вернула не JSON, попробуй еще раз');
   const norm = t => String(t || '').toLowerCase().replace(/ё/g, 'е').replace(/[\s ]+/g, ' ').replace(/[«»"“”„'’.,!?;:()\-–—]/g, '').trim();
   const nsrc = norm(srcText);
@@ -3245,8 +3256,7 @@ async function apMakeFromSources(kind, recentRows, linkDue = false) {
     direct_link_due: !!linkDue,
     ...(linkDue ? { telegram_url: THREADS_INVITE_LINK } : {})
   };
-  const raw = await claudeCall(apSourcePrompt(kind), JSON.stringify(input), 3000);
-  const res = parseEditorJson(raw);
+  const res = await claudeJson(apSourcePrompt(kind), JSON.stringify(input), 3000);
   if (!res || res.status !== 'ready') { console.log('autopilot: из постов не получилось:', res && res.reason); return null; }
   const src = usable[Number(res.source) - 1];
   if (!src) return null;
