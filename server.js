@@ -3810,11 +3810,13 @@ async function handleThreadsReplyCallback(cb) {
 }
 // ── конец блока ответов в Threads ──
 
-// ── Ежедневный отчет: Threads, канал, переходы из Threads в канал ──
-// Раз в сутки (после STATS_HOUR_WARSAW, по умолчанию 9:00 Варшавы) бот присылает владельцу статистику за вчера.
+// ── Еженедельный отчет: Threads, канал, переходы из Threads в канал ──
+// Раз в сутки (после STATS_HOUR_WARSAW, по умолчанию 9:00 Варшавы) бот обновляет цифры и пишет снимок, отчет за 7 дней присылает по понедельникам.
 // Хранение в Notion: строки со статусом t_stats (снимок чисел на утро) и t_join (каждый вход в канал по пригласительной ссылке).
 // Нужно: у токена Threads право threads_manage_insights; бот админ канала (для числа подписчиков и событий входа).
 const STATS_HOUR = Number(process.env.STATS_HOUR_WARSAW) || 9;
+const STATS_REPORT_DAYS = 7;
+const STATS_WEEKDAY = process.env.STATS_WEEKDAY !== undefined && process.env.STATS_WEEKDAY !== '' ? Number(process.env.STATS_WEEKDAY) : 1;   // 0 воскресенье, 1 понедельник
 const THREADS_INVITE_LINK = process.env.THREADS_INVITE_LINK || 'https://t.me/+WLghGJmGwXI3NmYy';
 const statsState = { running: false, lastRunAt: null, lastError: null, joinsSeen: 0 };
 
@@ -3902,15 +3904,17 @@ async function statsThreads(fromMs, toMs) {
   return res;
 }
 
-async function buildStatsReport() {
+// Отчет за последние days полных дней (по умолчанию неделя). Снимки t_stats бот пишет каждый день, отправляет отчет раз в неделю.
+async function buildStatsReport(days = STATS_REPORT_DAYS) {
   const nowMs = Date.now(), np = warsawParts(nowMs);
   const todayStart = warsawToUtcMs(np.y, np.mo, np.d, 0, 0);
-  const yStart = warsawToUtcMs(np.y, np.mo, np.d - 1, 0, 0);
+  const sd = new Date(Date.UTC(np.y, np.mo - 1, np.d - days));       // нормализуем переход через начало месяца
+  const yStart = warsawToUtcMs(sd.getUTCFullYear(), sd.getUTCMonth() + 1, sd.getUTCDate(), 0, 0);   // начало периода
   const dd = ms => { const p = warsawParts(ms + 3 * 3600 * 1000); return `${String(p.d).padStart(2, '0')}.${String(p.mo).padStart(2, '0')}`; };
-  const lines = [`📊 Отчет за ${dd(yStart)}`, ''];
+  const lines = [days === 1 ? `📊 Отчет за ${dd(yStart)}` : `📊 Отчет за неделю ${dd(yStart)}–${dd(todayStart - 86400000)}`, ''];
 
-  // Прошлый снимок для дельты
-  const prevRows = await statsQuery('t_stats', [{ property: 'Publish At', date: { before: new Date(todayStart).toISOString() } }], 'descending', 1);
+  // Снимок на начало периода для дельты (утренний снимок первого дня периода или раньше)
+  const prevRows = await statsQuery('t_stats', [{ property: 'Publish At', date: { before: new Date(yStart + 86400000).toISOString() } }], 'descending', 1);
   let prev = null; try { prev = prevRows[0] ? JSON.parse(prevRows[0].text) : null; } catch { prev = null; }
   const delta = (cur, old) => (cur == null || old == null) ? '' : ` (${cur - old >= 0 ? '+' : ''}${cur - old})`;
 
@@ -3929,7 +3933,7 @@ async function buildStatsReport() {
       lines.push(`Ответов от бота в Threads: сам ${auto}, ты кнопкой ${rr.length - auto}`);
     }
     if (th.followers != null) { lines.push(`Подписчиков в Threads: ${th.followers}${delta(th.followers, prev && prev.thFollowers)}`); snapshot.thFollowers = th.followers; }
-    if (th.best) lines.push(`Лучший пост дня (его цифры за все время): «${String(th.best.post.text || '').replace(/\s+/g, ' ').slice(0, 80)}», просмотров ${th.best.ins.views || 0}, лайков ${th.best.ins.likes || 0}, ответов ${th.best.ins.replies || 0}`);
+    if (th.best) lines.push(`Лучший пост ${days === 1 ? 'дня' : 'недели'} (его цифры за все время): «${String(th.best.post.text || '').replace(/\s+/g, ' ').slice(0, 80)}», просмотров ${th.best.ins.views || 0}, лайков ${th.best.ins.likes || 0}, ответов ${th.best.ins.replies || 0}`);
   } else if (th.needPerm) {
     lines.push('Threads', 'Нет доступа к статистике. В приложении Meta добавь право threads_manage_insights, сгенерируй токен заново и обнови THREADS_ACCESS_TOKEN в Railway.');
   } else {
@@ -3960,8 +3964,10 @@ async function statsRun({ manual = false } = {}) {
   try {
     await refreshPostMetrics().catch(e => console.error('rubrics refresh:', scrubToken(e.message)));
     const rep = await buildStatsReport();
-    for (const u of TELEGRAM_ALLOWED_USER_IDS) await botSend(Number(u), rep.text, { disable_web_page_preview: true });
-    if (!manual && (wp => new Date(Date.UTC(wp.y, wp.mo - 1, wp.d)).getUTCDay())(warsawParts(Date.now())) === 1) {
+    // Каждый день бот только обновляет цифры и пишет снимок; сообщения уходят раз в неделю (STATS_WEEKDAY, по умолчанию понедельник) или по запросу
+    const reportDay = (wp => new Date(Date.UTC(wp.y, wp.mo - 1, wp.d)).getUTCDay())(warsawParts(Date.now())) === STATS_WEEKDAY;
+    if (manual || reportDay) for (const u of TELEGRAM_ALLOWED_USER_IDS) await botSend(Number(u), rep.text, { disable_web_page_preview: true });
+    if (!manual && reportDay) {
       const rr = await buildRubricReport(7).catch(e => 'Сводка по рубрикам не собралась: ' + scrubToken(e.message).slice(0, 200));
       for (const u of TELEGRAM_ALLOWED_USER_IDS) await botSend(Number(u), rr, { disable_web_page_preview: true });
       const mr = await apModerationReport(7).catch(() => null);
@@ -4640,7 +4646,7 @@ async function handleBotUpdate(update) {
     } catch (e) { return botSend(msg.chat.id, 'Не получилось: ' + scrubToken(e.message).slice(0, 300)).catch(() => {}); }
   }
   if (cmd === '/start' || cmd === '/help') {
-    return botSend(msg.chat.id, 'Команды:\n/scheduled: запланированные посты, отмена и публикация сразу.\n/replies 24: найти ответы в Threads за последние 24 часа (число часов можно менять).\n/stats: отчет по Threads и каналу за вчера.\n/rubrics 7: сводка по рубрикам Threads за 7 дней (число дней можно менять).\n/draft: подготовить черновики Threads на ближайшие дни (автопилот).\n\nСоздавать и планировать посты нужно в приложении (кнопка меню).');
+    return botSend(msg.chat.id, 'Команды:\n/scheduled: запланированные посты, отмена и публикация сразу.\n/replies 24: найти ответы в Threads за последние 24 часа (число часов можно менять).\n/stats: отчет по Threads и каналу за последние 7 дней (сам приходит по понедельникам).\n/rubrics 7: сводка по рубрикам Threads за 7 дней (число дней можно менять).\n/draft: подготовить черновики Threads на ближайшие дни (автопилот).\n\nСоздавать и планировать посты нужно в приложении (кнопка меню).');
   }
 }
 
