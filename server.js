@@ -4334,10 +4334,10 @@ const VOICE_SYSTEM_PROMPT = `Ты редактор рубрики «100 голо
 6. Без буквы «ё». Длинное тире как знак препинания не используй, дефис с пробелами тоже. Проценты записывай знаком % (не словом «процентов»).
 7. "risks": список всего, по чему героя могут узнать: названия компаний и брендов, точные цифры, имена людей, города и страны, уникальные истории. Для каждого: "what" (что именно) и "quote" (короткая цитата места из ответа). Если ничего нет, пустой список.
 8. Вопрос с пометкой [МОЖНО ЗАМЕНИТЬ] герой имел право заменить своим. Если вместо ответа на него герой явно говорит на другую тему, которую выбрал сам, положи этот рассказ в ответ на этот вопрос, а в "custom_question" запиши короткий вопрос, на который он на самом деле отвечает (одно предложение, без ё). Если герой ответил на исходный вопрос или ничего не заменял, "custom_question" пустая строка.
-9. "best": id самого сильного ответа среди вопросов с id на r (не c). Сильный это конкретный случай из личного опыта, неочевидная мысль, детали, которых нет в общих словах. Выбирай только из непустых ответов. Если все ответы на r пустые, пустая строка.
+9. "best": список из трех id самых сильных непустых ответов среди ВСЕХ вопросов (и общих c, и ролевых r), от самого сильного к менее сильному. Сильный это конкретный случай из личного опыта, неочевидная мысль, детали, которых нет в общих словах. Слабый это общие фразы и повтор мысли из другого ответа. Если два ответа повторяют один и тот же тезис, возьми только один из них. Если непустых ответов меньше трех, верни сколько есть.
 
 Верни ТОЛЬКО JSON без пояснений и без markdown-ограждений, в формате:
-{"answers":[{"id":"<id вопроса>","text":"...","translated":false}],"custom_question":"...","best":"<id>","extra":"...","risks":[{"what":"...","quote":"..."}]}
+{"answers":[{"id":"<id вопроса>","text":"...","translated":false}],"custom_question":"...","best":["<id>","<id>","<id>"],"extra":"...","risks":[{"what":"...","quote":"..."}]}
 В "answers" должны быть все вопросы из списка, в том же порядке, с теми же id.`;
 
 async function voiceStructure(questions, transcript) {
@@ -4364,7 +4364,7 @@ async function voiceStructure(questions, transcript) {
 const voiceClean = t => noYo(String(t || '')).trim();
 
 // Сборка двух версий из ответов модели: формат поста задаёт код, а не модель
-// Telegram: все вопросы. LinkedIn: общие вопросы плюс самый сильный ответ из блока по роли.
+// Telegram: все вопросы. LinkedIn: три самых сильных ответа.
 // Последний вопрос роли герой может заменить своим: тогда в посте стоит его вопрос.
 function voiceAssemble({ number, roleTitle, exp, questions, commonCount, parsed }) {
   const byId = Object.fromEntries((parsed.answers || []).map(a => [a.id, a]));
@@ -4378,9 +4378,11 @@ function voiceAssemble({ number, roleTitle, exp, questions, commonCount, parsed 
     const body = text ? (a.translated ? `[ПЕРЕВОД]\n${text}` : text) : '[НЕТ ОТВЕТА]';
     return `**${i + 1}. ${q.text}**\n${body}`;
   };
-  const roleQs = qs.slice(commonCount);
-  const best = roleQs.find(q => q.id === parsed.best && has(q)) || roleQs.find(has);
-  const liQs = [...qs.slice(0, commonCount), ...(best ? [best] : [])];
+  // LinkedIn: три самых сильных ответа из всех пяти, в порядке вопросов. Выбор делает модель, при сбое берем первые непустые
+  const wanted = Array.isArray(parsed.best) ? parsed.best : (parsed.best ? [parsed.best] : []);
+  const picked = new Set(wanted.filter(id => qs.some(q => q.id === id && has(q))).slice(0, 3));
+  for (const q of qs) { if (picked.size >= 3) break; if (has(q)) picked.add(q.id); }
+  const liQs = qs.filter(q => picked.has(q.id));
   const telegram = `${head}\n\n[ВСТУПЛЕНИЕ]\n\n${qs.map(block).join('\n\n')}\n\n[ФИНАЛ]`;
   const linkedin = `${head}\n\n${liQs.map(block).join('\n\n')}`.replace(/\*\*/g, '');
   const risks = (parsed.risks || []).filter(r => r && r.what)
