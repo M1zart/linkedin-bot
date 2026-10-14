@@ -4325,14 +4325,16 @@ const VOICE_SYSTEM_PROMPT = `Ты редактор рубрики «100 голо
 5. Речь на украинском переведи на русский максимально близко к тексту, без украшений, и поставь для этого ответа "translated": true.
 6. Без буквы «ё». Длинное тире как знак препинания не используй, дефис с пробелами тоже. Проценты записывай знаком % (не словом «процентов»).
 7. "risks": список всего, по чему героя могут узнать: названия компаний и брендов, точные цифры, имена людей, города и страны, уникальные истории. Для каждого: "what" (что именно) и "quote" (короткая цитата места из ответа). Если ничего нет, пустой список.
+8. Вопрос с пометкой [МОЖНО ЗАМЕНИТЬ] герой имел право заменить своим. Если вместо ответа на него герой явно говорит на другую тему, которую выбрал сам, положи этот рассказ в ответ на этот вопрос, а в "custom_question" запиши короткий вопрос, на который он на самом деле отвечает (одно предложение, без ё). Если герой ответил на исходный вопрос или ничего не заменял, "custom_question" пустая строка.
+9. "best": id самого сильного ответа среди вопросов с id на r (не c). Сильный это конкретный случай из личного опыта, неочевидная мысль, детали, которых нет в общих словах. Выбирай только из непустых ответов. Если все ответы на r пустые, пустая строка.
 
 Верни ТОЛЬКО JSON без пояснений и без markdown-ограждений, в формате:
-{"answers":[{"id":"<id вопроса>","text":"...","translated":false}],"extra":"...","risks":[{"what":"...","quote":"..."}]}
+{"answers":[{"id":"<id вопроса>","text":"...","translated":false}],"custom_question":"...","best":"<id>","extra":"...","risks":[{"what":"...","quote":"..."}]}
 В "answers" должны быть все вопросы из списка, в том же порядке, с теми же id.`;
 
 async function voiceStructure(questions, transcript) {
   if (!ANTHROPIC_API_KEY) throw new Error('ANTHROPIC_API_KEY не задан');
-  const list = questions.map(q => `${q.id}: ${q.text}`).join('\n');
+  const list = questions.map(q => `${q.id}: ${q.text}${q.replaceable ? ' [МОЖНО ЗАМЕНИТЬ]' : ''}`).join('\n');
   const resp = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' },
@@ -4354,17 +4356,25 @@ async function voiceStructure(questions, transcript) {
 const voiceClean = t => noYo(String(t || '')).trim();
 
 // Сборка двух версий из ответов модели: формат поста задаёт код, а не модель
+// Telegram: все вопросы. LinkedIn: общие вопросы плюс самый сильный ответ из блока по роли.
+// Последний вопрос роли герой может заменить своим: тогда в посте стоит его вопрос.
 function voiceAssemble({ number, roleTitle, exp, questions, commonCount, parsed }) {
   const byId = Object.fromEntries((parsed.answers || []).map(a => [a.id, a]));
+  const custom = voiceClean(parsed.custom_question);
+  const qs = questions.map(q => (q.replaceable && custom ? { ...q, text: custom } : q));
   const head = `Голос #${number}: ${roleTitle}${exp ? ', ' + exp : ''}`;
+  const has = q => !!voiceClean((byId[q.id] || {}).text);
   const block = (q, i) => {
     const a = byId[q.id] || {};
     const text = voiceClean(a.text);
     const body = text ? (a.translated ? `[ПЕРЕВОД]\n${text}` : text) : '[НЕТ ОТВЕТА]';
     return `**${i + 1}. ${q.text}**\n${body}`;
   };
-  const telegram = `${head}\n\n[ВСТУПЛЕНИЕ]\n\n${questions.map(block).join('\n\n')}\n\n[ФИНАЛ]`;
-  const linkedin = `${head}\n\n${questions.slice(0, commonCount).map(block).join('\n\n')}`.replace(/\*\*/g, '');
+  const roleQs = qs.slice(commonCount);
+  const best = roleQs.find(q => q.id === parsed.best && has(q)) || roleQs.find(has);
+  const liQs = [...qs.slice(0, commonCount), ...(best ? [best] : [])];
+  const telegram = `${head}\n\n[ВСТУПЛЕНИЕ]\n\n${qs.map(block).join('\n\n')}\n\n[ФИНАЛ]`;
+  const linkedin = `${head}\n\n${liQs.map(block).join('\n\n')}`.replace(/\*\*/g, '');
   const risks = (parsed.risks || []).filter(r => r && r.what)
     .map(r => `• ${voiceClean(r.what)}${r.quote ? `: «${voiceClean(r.quote)}»` : ''}`).join('\n');
   return { telegram, linkedin, risks, extra: voiceClean(parsed.extra) };
@@ -4513,7 +4523,7 @@ async function voiceProcess(s) {
     const q = loadQuestions();
     const questions = [
       ...q.common.map((x, i) => ({ id: 'c' + (i + 1), text: typeof x === 'string' ? x : x.text })),
-      ...role.questions.map((x, i) => ({ id: 'r' + (i + 1), text: typeof x === 'string' ? x : x.text }))
+      ...role.questions.map((x, i, arr) => ({ id: 'r' + (i + 1), text: typeof x === 'string' ? x : x.text, replaceable: i === arr.length - 1 }))
     ];
     const parsed = await voiceStructure(questions, transcript);
     const out = voiceAssemble({ number: s.number, roleTitle: role.title, exp: s.exp, questions, commonCount: q.common.length, parsed });
