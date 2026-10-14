@@ -2056,6 +2056,12 @@
           return;
         }
         current.textContent = `Сейчас запланировано: ${data.local} (Варшава)`;
+        if (data.publishAt) {
+          // Показываем текущую дату и время поста, а не «через час»: так видно, что стоит сейчас, и можно просто закрыть окно
+          const inp = document.getElementById('reschedule-when');
+          inp.value = wallToInput(warsawWall(Date.parse(data.publishAt)));
+          updatePickerPreview('reschedule-when', 'reschedule-preview');
+        }
         submit.disabled = false;
       } catch (e) {
         post.textContent = '';
@@ -2440,37 +2446,48 @@
         toggle() { if (el.style.display === 'none') this.show(); else this.hide(); }
       };
     }
-    // Окна планирования и переноса Telegram-очереди: родное поле даты и времени прячем, вместо него наш календарь с отметками и поле времени.
-    // Само поле остается хранилищем значения, поэтому остальной код (пресеты, проверки, отправка) работает как раньше.
+    // Окна планирования и переноса Telegram-очереди: родное поле даты и времени прячем, вместо него две кнопки,
+    // «Дата» открывает календарь с отметками, «Время» открывает выбор времени. Скрытое поле остается хранилищем значения,
+    // поэтому остальной код (пресеты, проверки, отправка) работает как раньше.
     function attachCalendar(inputId) {
       const input = document.getElementById(inputId);
       if (!input || input.dataset.cal) return;
       input.dataset.cal = '1';
       input.style.display = 'none';
-      const row = document.createElement('div'); row.style.cssText = 'display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:4px 0';
+      const wrap = document.createElement('div'); wrap.style.cssText = 'margin:4px 0';
+      const row = document.createElement('div'); row.style.cssText = 'display:flex;gap:8px';
       const dateBtn = document.createElement('button'); dateBtn.type = 'button'; dateBtn.className = 'tone-btn'; dateBtn.style.flex = '1';
-      // Время: три пресета и выбор часа и минут (минуты только 00, 15, 30, 45), чтобы не крутить 60 значений
-      const timeBox = document.createElement('div'); timeBox.style.cssText = 'display:flex;flex-wrap:wrap;gap:6px;align-items:center;flex-basis:100%';
-      const time = { value: '' };
+      const timeBtn = document.createElement('button'); timeBtn.type = 'button'; timeBtn.className = 'tone-btn'; timeBtn.style.flex = '1';
+      const todayStr = () => new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/Warsaw' }).format(new Date());
+      const compose = (d, t) => { input.value = (d || todayStr()) + 'T' + (t || '12:30'); input.dispatchEvent(new Event('input', { bubbles: true })); input.dispatchEvent(new Event('change', { bubbles: true })); };
+      const curDate = () => { const d = (input.value || '').slice(0, 10); return /^\d{4}-\d{2}-\d{2}$/.test(d) ? d : ''; };
+      const curTime = () => { const t = (input.value || '').slice(11, 16); return /^\d{2}:\d{2}$/.test(t) ? t : ''; };
+      const mkClose = onClick => { const b = document.createElement('button'); b.type = 'button'; b.className = 'tone-btn'; b.textContent = 'Свернуть'; b.style.marginTop = '6px'; b.addEventListener('click', onClick); return b; };
+
+      const cal = calWidget(d => { compose(d, curTime()); sync(); cal.hide(); }, curDate);
+      cal.el.appendChild(mkClose(() => cal.hide()));
+
+      const timeBox = document.createElement('div');
+      timeBox.style.cssText = 'display:none;border:1px solid rgba(128,128,128,.35);border-radius:10px;padding:8px;box-sizing:border-box;margin:4px 0';
+      const selRow = document.createElement('div'); selRow.style.cssText = 'display:flex;gap:6px;align-items:center;margin-bottom:8px';
       const hSel = document.createElement('select'), mSel = document.createElement('select');
       for (let h = 0; h < 24; h++) hSel.add(new Option(String(h).padStart(2, '0'), String(h).padStart(2, '0')));
       ['00', '15', '30', '45'].forEach(m => mSel.add(new Option(m, m)));
-      const tChips = ['12:30', '15:30', '19:30'].map(t => { const b = document.createElement('button'); b.type = 'button'; b.className = 'tone-btn'; b.textContent = t; b.addEventListener('click', () => setTime(t)); return b; });
       hSel.style.cssText = mSel.style.cssText = 'width:76px;flex:0 0 76px';
       const colon = document.createElement('span'); colon.textContent = ':';
-      timeBox.appendChild(hSel); timeBox.appendChild(colon); timeBox.appendChild(mSel); tChips.forEach(b => timeBox.appendChild(b));
-      function setTime(t) { time.value = t; const d = (input.value || '').slice(0, 10); compose(/^\d{4}-/.test(d) ? d : '', t); sync(); }
+      selRow.appendChild(hSel); selRow.appendChild(colon); selRow.appendChild(mSel);
+      const chipRow = document.createElement('div'); chipRow.style.cssText = 'display:flex;flex-wrap:nowrap;gap:6px';
+      const tChips = ['12:30', '15:30', '19:30'].map(t => { const b = document.createElement('button'); b.type = 'button'; b.className = 'tone-btn'; b.textContent = t; b.style.cssText = 'flex:1;min-width:0;white-space:nowrap'; b.addEventListener('click', () => { setTime(t); timeBox.style.display = 'none'; }); chipRow.appendChild(b); return b; });
+      timeBox.appendChild(selRow); timeBox.appendChild(chipRow); timeBox.appendChild(mkClose(() => { timeBox.style.display = 'none'; }));
+      function setTime(t) { compose(curDate(), t); sync(); }
       hSel.addEventListener('change', () => setTime(hSel.value + ':' + mSel.value));
       mSel.addEventListener('change', () => setTime(hSel.value + ':' + mSel.value));
-      const todayStr = () => new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/Warsaw' }).format(new Date());
-      const compose = (d, t) => { input.value = (d || todayStr()) + 'T' + (t || '12:30'); input.dispatchEvent(new Event('input', { bubbles: true })); input.dispatchEvent(new Event('change', { bubbles: true })); };
-      const cal = calWidget(d => { compose(d, time.value); sync(); cal.hide(); }, () => (input.value || '').slice(0, 10));
+
       function sync() {
-        const v = input.value || '';
-        const d = v.slice(0, 10), t = v.slice(11, 16);
-        dateBtn.textContent = /^\d{4}-\d{2}-\d{2}$/.test(d) ? 'Дата: ' + d.slice(8, 10) + '.' + d.slice(5, 7) + '.' + d.slice(0, 4) + ' (календарь)' : 'Выбрать дату (календарь)';
-        if (/^\d{2}:\d{2}$/.test(t)) {
-          time.value = t;
+        const d = curDate(), t = curTime();
+        dateBtn.textContent = d ? 'Дата: ' + d.slice(8, 10) + '.' + d.slice(5, 7) + '.' + d.slice(0, 4) : 'Выбрать дату';
+        timeBtn.textContent = t ? 'Время: ' + t : 'Выбрать время';
+        if (t) {
           if (document.activeElement !== hSel) hSel.value = t.slice(0, 2);
           const mm = t.slice(3, 5);
           if (![...mSel.options].some(o => o.value === mm)) mSel.add(new Option(mm, mm));
@@ -2478,9 +2495,11 @@
           tChips.forEach(b => { b.style.outline = b.textContent === t ? '2px solid #2AABEE' : ''; });
         }
       }
-      dateBtn.addEventListener('click', () => cal.toggle());
-      row.appendChild(dateBtn); row.appendChild(timeBox);
-      input.insertAdjacentElement('afterend', row); row.insertAdjacentElement('afterend', cal.el);
+      dateBtn.addEventListener('click', () => { timeBox.style.display = 'none'; cal.toggle(); });
+      timeBtn.addEventListener('click', () => { cal.hide(); timeBox.style.display = timeBox.style.display === 'none' ? 'block' : 'none'; });
+      row.appendChild(dateBtn); row.appendChild(timeBtn);
+      wrap.appendChild(row); wrap.appendChild(cal.el); wrap.appendChild(timeBox);
+      input.insertAdjacentElement('afterend', wrap);
       sync(); setInterval(sync, 400);
     }
     ['schedule-when', 'reschedule-when'].forEach(id => attachCalendar(id));
