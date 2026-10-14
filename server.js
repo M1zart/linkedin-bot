@@ -667,12 +667,12 @@ const server = http.createServer(async (req, res) => {
         if (!scheduleConfigured()) return send(503, { error: 'Расписание не настроено: нужен NOTION_API_KEY в переменных Railway' });
         const auth = await authorizeUser(req);
         if (!auth.ok) return send(auth.status, { error: auth.error });
-        const { text, when, askButton } = JSON.parse(body);
+        const { text, when, askButton, imageDataUrl } = JSON.parse(body);
         assertPostText(text);
         const parsed = parseWarsawDateTime(when);
         if (!parsed.ok) return send(400, { error: parsed.error });
-        const row = await schedCreate(text, parsed.iso, Number(auth.userId), askButton === true);
-        send(200, { ok: true, id: row.id, publishAt: parsed.iso, local: formatWarsaw(parsed.iso) });
+        const row = await schedCreate(text, parsed.iso, Number(auth.userId), askButton === true, imageDataUrl || null);
+        send(200, { ok: true, id: row.id, publishAt: parsed.iso, local: formatWarsaw(parsed.iso), withImage: !!imageDataUrl });
       } catch (err) {
         console.error('schedule error:', scrubToken(err.message));
         send(err.httpStatus || 500, { error: scrubToken(err.message) });
@@ -750,7 +750,7 @@ const server = http.createServer(async (req, res) => {
       const cutoff = Date.now() - 14 * 24 * 3600 * 1000;
       const items = rows
         .filter(r => r.status === 'scheduled' || (r.publishAt && Date.parse(r.publishAt) >= cutoff))
-        .map(r => ({ id: r.id, text: r.text, status: r.status, publishAt: r.publishAt, local: r.publishAt ? formatWarsaw(r.publishAt) : '', error: r.error || '', askButton: r.askButton }));
+        .map(r => ({ id: r.id, text: r.text, status: r.status, publishAt: r.publishAt, local: r.publishAt ? formatWarsaw(r.publishAt) : '', error: r.error || '', askButton: r.askButton, hasImage: !!r.imageUrl }));
       send(200, { items });
     } catch (err) {
       console.error('scheduled-list error:', scrubToken(err.message));
@@ -2085,6 +2085,7 @@ function pageToRow(p) {
     goal: (pr.Goal && pr.Goal.select && pr.Goal.select.name) || null,
     // Старые посты без свойства «Кнопка вопроса» читаются как false
     askButton: !!(pr['Кнопка вопроса'] && pr['Кнопка вопроса'].checkbox === true),
+    imageUrl: (() => { const f = pr['Картинка'] && pr['Картинка'].files && pr['Картинка'].files[0]; return f ? ((f.file && f.file.url) || (f.external && f.external.url) || null) : null; })(),
     rubric: (pr['Рубрика'] && pr['Рубрика'].select && pr['Рубрика'].select.name) || null,
     threadsId: fromRichText(pr['Threads ID'] && pr['Threads ID'].rich_text),
     mod: fromRichText(pr['Модерация'] && pr['Модерация'].rich_text),
@@ -2108,7 +2109,36 @@ async function schedQuery(filter, pageSize = 50) {
   return (data.results || []).map(pageToRow);
 }
 
-async function schedCreate(text, iso, owner, askButton = false) {
+// Картинка к запланированному посту хранится в Notion (свойство «Картинка», файл): на диске Railway файлы не переживают перезапуск
+let schedImgPropOk = false;
+async function schedEnsureImageProp() {
+  if (schedImgPropOk) return;
+  await notionReq('PATCH', `/v1/data_sources/${NOTION_SCHEDULE_DS_ID}`, { properties: { 'Картинка': { files: {} } } });
+  schedImgPropOk = true;
+}
+function parseImageDataUrl(dataUrl) {
+  const m = /^data:image\/(png|jpeg);base64,([A-Za-z0-9+/=]+)$/.exec(String(dataUrl || ''));
+  if (!m) throw httpError(400, 'Картинка должна быть PNG или JPEG');
+  const buf = Buffer.from(m[2], 'base64');
+  if (buf.length > 4 * 1024 * 1024) throw httpError(400, 'Картинка больше 4 МБ: выбери поменьше');
+  return { buf, mime: `image/${m[1]}`, ext: m[1] === 'jpeg' ? 'jpg' : 'png' };
+}
+async function notionUploadImage(img) {
+  const filename = `post-${Date.now()}.${img.ext}`;
+  const created = await notionReq('POST', '/v1/file_uploads', { filename, content_type: img.mime });
+  const form = new FormData();
+  form.append('file', new Blob([img.buf], { type: img.mime }), filename);
+  const resp = await fetch(`https://api.notion.com/v1/file_uploads/${created.id}/send`, {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${NOTION_API_KEY}`, 'Notion-Version': '2025-09-03' },
+    body: form
+  });
+  const data = await resp.json().catch(() => null);
+  if (!resp.ok) throw new Error(`Notion ${resp.status}: ${(data && (data.message || data.code)) || 'не удалось загрузить файл'}`);
+  return { id: created.id, name: filename };
+}
+
+async function schedCreate(text, iso, owner, askButton = false, imageDataUrl = null) {
   const properties = {
     Name: { title: [{ type: 'text', text: { content: shortPreview(text, 80) || 'Пост' } }] },
     Text: { rich_text: toRichText(text) },
@@ -2118,6 +2148,17 @@ async function schedCreate(text, iso, owner, askButton = false) {
   };
   // Без галочки свойство не пишем: пост создаётся, даже если checkbox «Кнопка вопроса» в базе ещё не заведён
   if (askButton) properties['Кнопка вопроса'] = { checkbox: true };
+  if (imageDataUrl) {
+    const img = parseImageDataUrl(imageDataUrl);
+    try {
+      await schedEnsureImageProp();
+      const up = await notionUploadImage(img);
+      properties['Картинка'] = { files: [{ name: up.name, type: 'file_upload', file_upload: { id: up.id } }] };
+    } catch (e) {
+      if (e.httpStatus) throw e;
+      throw httpError(502, 'Картинку не удалось сохранить в очереди, пост не запланирован: ' + scrubToken(e.message));
+    }
+  }
   const page = await notionReq('POST', '/v1/pages', {
     parent: { type: 'data_source_id', data_source_id: NOTION_SCHEDULE_DS_ID },
     properties
@@ -2170,7 +2211,16 @@ async function runScheduledPost(row, { checkStale = true, notify = true } = {}) 
     await schedUpdate(row.id, { status: 'publishing' });
     let result;
     try {
-      result = await publishToChannel(row.text, null, row.askButton);
+      let imageDataUrl = null;
+      if (row.imageUrl) {
+        // Ссылка на файл в Notion живет около часа, поэтому качаем картинку прямо перед публикацией
+        const r = await fetch(row.imageUrl);
+        if (!r.ok) throw new Error(`Не удалось достать картинку из очереди (HTTP ${r.status}). Пост не опубликован`);
+        const buf = Buffer.from(await r.arrayBuffer());
+        const isPng = buf.length > 4 && buf[0] === 0x89 && buf[1] === 0x50;
+        imageDataUrl = `data:image/${isPng ? 'png' : 'jpeg'};base64,${buf.toString('base64')}`;
+      }
+      result = await publishToChannel(row.text, imageDataUrl, row.askButton);
     } catch (e) {
       const msg = scrubToken(e.message);
       await schedUpdate(row.id, { status: 'failed', error: msg }).catch(() => {});
