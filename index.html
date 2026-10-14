@@ -2440,20 +2440,30 @@
         toggle() { if (el.style.display === 'none') this.show(); else this.hide(); }
       };
     }
-    // Календарь под готовым полем даты и времени (окно планирования и экран переноса в Telegram-очереди)
+    // Окна планирования и переноса Telegram-очереди: родное поле даты и времени прячем, вместо него наш календарь с отметками и поле времени.
+    // Само поле остается хранилищем значения, поэтому остальной код (пресеты, проверки, отправка) работает как раньше.
     function attachCalendar(inputId) {
       const input = document.getElementById(inputId);
       if (!input || input.dataset.cal) return;
       input.dataset.cal = '1';
-      const btn = document.createElement('button'); btn.type = 'button'; btn.className = 'tone-btn'; btn.textContent = 'Календарь: что занято'; btn.style.margin = '6px 0';
-      const cal = calWidget(d => {
-        const cur = /T(\d{2}:\d{2})/.exec(input.value || '');
-        input.value = d + 'T' + (cur ? cur[1] : '12:30');
-        input.dispatchEvent(new Event('input', { bubbles: true })); input.dispatchEvent(new Event('change', { bubbles: true }));
-        cal.hide();
-      }, () => (input.value || '').slice(0, 10));
-      btn.addEventListener('click', () => cal.toggle());
-      input.insertAdjacentElement('afterend', btn); btn.insertAdjacentElement('afterend', cal.el);
+      input.style.display = 'none';
+      const row = document.createElement('div'); row.style.cssText = 'display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:4px 0';
+      const dateBtn = document.createElement('button'); dateBtn.type = 'button'; dateBtn.className = 'tone-btn'; dateBtn.style.flex = '1';
+      const time = document.createElement('input'); time.type = 'time'; time.step = 60; time.style.cssText = 'flex:0 0 120px';
+      const todayStr = () => new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/Warsaw' }).format(new Date());
+      const compose = (d, t) => { input.value = (d || todayStr()) + 'T' + (t || '12:30'); input.dispatchEvent(new Event('input', { bubbles: true })); input.dispatchEvent(new Event('change', { bubbles: true })); };
+      const cal = calWidget(d => { compose(d, time.value); sync(); cal.hide(); }, () => (input.value || '').slice(0, 10));
+      function sync() {
+        const v = input.value || '';
+        const d = v.slice(0, 10), t = v.slice(11, 16);
+        dateBtn.textContent = /^\d{4}-\d{2}-\d{2}$/.test(d) ? 'Дата: ' + d.slice(8, 10) + '.' + d.slice(5, 7) + '.' + d.slice(0, 4) + ' (календарь)' : 'Выбрать дату (календарь)';
+        if (document.activeElement !== time) time.value = t;
+      }
+      time.addEventListener('change', () => { const d = (input.value || '').slice(0, 10); if (time.value) compose(/^\d{4}-/.test(d) ? d : '', time.value); });
+      dateBtn.addEventListener('click', () => cal.toggle());
+      row.appendChild(dateBtn); row.appendChild(time);
+      input.insertAdjacentElement('afterend', row); row.insertAdjacentElement('afterend', cal.el);
+      sync(); setInterval(sync, 400);
     }
     ['schedule-when', 'reschedule-when'].forEach(id => attachCalendar(id));
 
