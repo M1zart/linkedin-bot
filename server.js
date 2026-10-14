@@ -2985,8 +2985,14 @@ async function generateAngles(cand) {
   const norm = t => String(t || '').toLowerCase().replace(/ё/g, 'е').replace(/[\s ]+/g, ' ').replace(/[«»"“”„'’.,!?;:()\-–—]/g, '').trim();
   const nsrc = norm(srcText);
   const posts = [], dropped = [];
-  for (const it of parsed.posts) {
-    const body = noYo(String((it && it.text) || '').trim()).replace(/https?:\/\/\S+/g, '').trim();
+  const prepared = await Promise.all(parsed.posts.map(async it => {
+    let body = noYo(String((it && it.text) || '').trim()).replace(/https?:\/\/\S+/g, '').trim();
+    if (body.length >= 60 && findNegContrast(body).length) {
+      try { body = noYo(String(await runNegContrastFix(body) || body).trim()); } catch (e) { /* оставим как есть, проверка ниже отсеет */ }
+    }
+    return { it, body };
+  }));
+  for (const { it, body } of prepared) {
     const angle = String((it && it.angle) || '').trim().slice(0, 60);
     const why = [];
     if (!body) why.push('пусто');
