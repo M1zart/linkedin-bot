@@ -2504,6 +2504,14 @@
     }
     ['schedule-when', 'reschedule-when'].forEach(id => attachCalendar(id));
 
+    // ISO-время поста в формат «ДД.ММ.ГГГГ ЧЧ:ММ» по Варшаве, чтобы выбор показывал текущие дату и время
+    function thWhenFromIso(iso) {
+      if (!iso) return '';
+      try {
+        const p = Object.fromEntries(new Intl.DateTimeFormat('ru-RU', { timeZone: 'Europe/Warsaw', day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).formatToParts(new Date(iso)).map(x => [x.type, x.value]));
+        return `${p.day}.${p.month}.${p.year} ${p.hour}:${p.minute}`;
+      } catch (e) { return ''; }
+    }
     // Выбор времени для Threads: дата (без минут) и три пресета времени. Минуты всегда :00 или :30.
     // Пустая дата значит «ближайший свободный день»: его подберет сервер на выбранное время (по умолчанию 12:30).
     const TH_TIMES = ['12:30', '15:30', '19:30'];
@@ -2527,7 +2535,10 @@
         chips.forEach(b => { const on = b.textContent === st.time; b.style.outline = on ? '2px solid #2AABEE' : ''; b.style.fontWeight = on ? '700' : ''; });
         hint.textContent = st.date ? '' : 'Дата не выбрана: бот возьмет ближайший свободный день на ' + st.time;
       }
-      el.appendChild(date); chips.forEach(b => el.appendChild(b)); el.appendChild(cal.el); el.appendChild(hint); paint();
+      date.style.cssText = 'flex:1 1 100%';
+      const chipRow = document.createElement('div'); chipRow.style.cssText = 'display:flex;flex-wrap:nowrap;gap:6px;flex:1 1 100%';
+      chips.forEach(b => { b.style.cssText = 'flex:1;min-width:0;white-space:nowrap'; chipRow.appendChild(b); });
+      el.appendChild(date); el.appendChild(cal.el); el.appendChild(chipRow); el.appendChild(hint); paint();
       return {
         el,
         get() {
@@ -2649,7 +2660,7 @@
         const actions = document.createElement('div');
         actions.className = 'digest-actions';
         const when = document.createElement('input');
-        const pk = thPicker('');
+        const pk = thPicker(thWhenFromIso(it.publishAt));
         const mv = document.createElement('button');
         mv.className = 'action-btn'; mv.textContent = 'Перенести';
         mv.addEventListener('click', () => thAction(it.id, 'reschedule', mv, pk.get().when));
@@ -2659,7 +2670,10 @@
         const cancel = document.createElement('button');
         cancel.className = 'action-btn'; cancel.textContent = 'Отменить';
         cancel.addEventListener('click', () => thAction(it.id, 'cancel', cancel));
-        actions.appendChild(pk.el); actions.appendChild(mv);
+        const pickRow = document.createElement('div'); pickRow.style.cssText = 'width:100%;margin:6px 0'; pickRow.appendChild(pk.el);
+        mv.style.flex = '1';
+        actions.appendChild(mv);
+        card.appendChild(pickRow);
         card.appendChild(actions);
         const actions2 = document.createElement('div');
         actions2.className = 'digest-actions';
