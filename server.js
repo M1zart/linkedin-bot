@@ -2330,8 +2330,7 @@ async function setupTelegramBot() {
     { command: 'replies', description: 'Ответы в Threads за N часов' },
     { command: 'stats', description: 'Отчет за 7 дней' },
     { command: 'rubrics', description: 'Рубрики Threads за N дней' },
-    { command: 'invite', description: 'Письмо-приглашение герою' },
-    { command: 'hero', description: 'Текст на согласование герою: /hero N' },
+    { command: 'menu', description: 'Голоса: приглашение, согласование, финиш' },
     { command: 'help', description: 'Что умеет бот' }
   ] });
   webhookState.status = 'active';
@@ -4697,20 +4696,50 @@ function voiceInviteText(roleKey) {
   ].join('\n\n');
 }
 
+const VOICE_DONE_TEXT = () => 'Выпуск с твоим голосом вышел. Полная версия в моем Telegram: ' + VOICE_HERO_TG_URL + ' Короткая в LinkedIn: ' + VOICE_HERO_LI_URL + ' Спасибо, что поделился опытом. Будет здорово, если отправишь выпуск коллегам.';
+
+const voiceMenuMain = () => ({ inline_keyboard: [
+  [{ text: '✉️ Приглашение герою', callback_data: 'iv:i' }],
+  [{ text: '📝 Текст на согласование', callback_data: 'iv:h' }],
+  [{ text: '🏁 Выпуск вышел', callback_data: 'iv:d' }]
+] });
+
 async function voiceInviteMenu(chatId) {
-  const roles = loadQuestions().roles;
-  const rows = Object.keys(roles).map(k => [{ text: roles[k].title, callback_data: 'iv:' + k }]);
-  return botSend(chatId, 'Письмо-приглашение героя. Выбери роль, пришлю одним сообщением: перешли его с «Скрыть имя отправителя».', { reply_markup: { inline_keyboard: rows } });
+  return botSend(chatId, 'Голоса. Что отправляем герою? Текст приходит сообщением, его нужно переслать с «Скрыть имя отправителя».', { reply_markup: voiceMenuMain() });
+}
+
+async function voiceListButtons(kind) {
+  const data = await notionReq('POST', `/v1/data_sources/${NOTION_VOICE_DS_ID}/query`, {
+    sorts: [{ property: 'Номер', direction: 'descending' }], page_size: 12
+  });
+  const vs = (data.results || []).map(pageToVoice).filter(v => v.number);
+  const rows = vs.map(v => [{ text: `#${v.number} ${v.role || ''} ${v.exp ? '· ' + v.exp : ''} (${v.status})`.slice(0, 60), callback_data: `iv:${kind}:${v.number}` }]);
+  rows.push([{ text: '← Назад', callback_data: 'iv:m' }]);
+  return rows;
 }
 
 async function handleInviteCallback(cb) {
   const answer = (text) => tgApi('answerCallbackQuery', { callback_query_id: cb.id, text }).catch(() => {});
   if (!TELEGRAM_ALLOWED_USER_IDS.includes(String(cb.from.id))) return answer('Нет доступа');
-  const key = String(cb.data).split(':')[1];
-  await answer();
+  const [, a, b] = String(cb.data).split(':');
   const chatId = cb.message && cb.message.chat && cb.message.chat.id;
-  try { return await botSend(chatId, voiceInviteText(key), { parse_mode: 'HTML', disable_web_page_preview: true }); }
-  catch (e) { return botSend(chatId, 'Не получилось: ' + scrubToken(e.message).slice(0, 200)).catch(() => {}); }
+  const messageId = cb.message && cb.message.message_id;
+  await answer();
+  const edit = (text, kb) => tgApi('editMessageText', { chat_id: chatId, message_id: messageId, text, reply_markup: kb }).catch(() => botSend(chatId, text, { reply_markup: kb }));
+  try {
+    if (a === 'm') return await edit('Голоса. Что отправляем герою? Текст приходит сообщением, его нужно переслать с «Скрыть имя отправителя».', voiceMenuMain());
+    if (a === 'i') {
+      const roles = loadQuestions().roles;
+      const rows = Object.keys(roles).map(k => [{ text: roles[k].title, callback_data: 'iv:r:' + k }]);
+      rows.push([{ text: '← Назад', callback_data: 'iv:m' }]);
+      return await edit('Выбери роль героя:', { inline_keyboard: rows });
+    }
+    if (a === 'r') return await botSend(chatId, voiceInviteText(b), { parse_mode: 'HTML', disable_web_page_preview: true });
+    if (a === 'h') return await edit('Чей текст отправляем на согласование?', { inline_keyboard: await voiceListButtons('H') });
+    if (a === 'd') return await edit('Чей выпуск вышел?', { inline_keyboard: await voiceListButtons('D') });
+    if (a === 'H') return await voiceHeroSend(chatId, Number(b));
+    if (a === 'D') return await botSend(chatId, VOICE_DONE_TEXT(), { disable_web_page_preview: true });
+  } catch (e) { return botSend(chatId, 'Не получилось: ' + scrubToken(e.message).slice(0, 200)).catch(() => {}); }
 }
 
 async function handleVoiceCallback(cb) {
@@ -4949,7 +4978,7 @@ async function handleBotUpdate(update) {
   if (msg.text && !msg.text.startsWith('/') && voiceSessions.has(userId) && await voiceText(msg).catch(e => { console.error('voice text:', scrubToken(e.message)); return false; })) return;
   if (msg.reply_to_message && msg.text && !msg.text.startsWith('/') && await apHandleEditReply(msg).catch(e => { console.error('autopilot reply:', scrubToken(e.message)); return false; })) return;
   const cmd = String(msg.text || '').trim().split(/\s|@/)[0].toLowerCase();
-  if (cmd === '/invite') return voiceInviteMenu(msg.chat.id).catch(e => botSend(msg.chat.id, 'Не получилось: ' + scrubToken(e.message).slice(0, 200)).catch(() => {}));
+  if (cmd === '/invite' || cmd === '/menu' || cmd === '/golos') return voiceInviteMenu(msg.chat.id).catch(e => botSend(msg.chat.id, 'Не получилось: ' + scrubToken(e.message).slice(0, 200)).catch(() => {}));
   if (cmd === '/hero') {
     const n = Number((String(msg.text || '').match(/\d+/) || [])[0]);
     if (!n) return botSend(msg.chat.id, 'Напиши номер: /hero 3');
