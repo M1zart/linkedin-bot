@@ -4776,9 +4776,9 @@ async function voiceHeroSend(chatId, number) {
   const liNums = qOf(v.linkedin).map(q => fullQs.indexOf(q) + 1).filter(n => n > 0);
   const liNote = liNums.length ? ` В LinkedIn пойдут ответы ${liNums.join(', ')}.` : '';
   const intro = VOICE_HERO_INTRO.replace('Текст ниже.', 'Текст ниже.' + liNote);
-  await botSend(chatId, `Голос #${number}. Три блока, нажми на блок и он скопируется. Пересылай герою по порядку.`);
+  await botSend(chatId, `Голос #${number}. Ниже три сообщения. Выдели их, нажми «Переслать», выбери героя и включи «Скрыть имя отправителя».`);
   const blocks = [intro, ...voiceHeroChunks(full), VOICE_HERO_ASK];
-  for (const b of blocks) await botSend(chatId, `<pre>${htmlEsc(b)}</pre>`, { parse_mode: 'HTML' });
+  for (const b of blocks) await botSend(chatId, b);
 }
 
 // --- Mini App: список и карточка голосов ---
