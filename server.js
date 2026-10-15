@@ -4742,6 +4742,33 @@ async function voiceProcess(s) {
   }
 }
 
+// Сообщения для героя: берутся из сохраненных в Notion текстов (с твоими правками), ты пересылаешь их от своего имени
+const VOICE_HERO_INTRO = 'Привет! Вышел монтаж твоего голоса для рубрики. Текст ниже. Роль и стаж остаются, имена и компании я заменил на нейтральные. Посмотри, пожалуйста: все ли верно по смыслу и нет ли того, по чему тебя могут узнать? Если до завтра тишина, считаю, что все ок.';
+const VOICE_HERO_ASK = 'И просьба: порекомендуй двух-трех людей из индустрии, но не трейдеров, а с других позиций. Риск, CRM, продукт, саппорт, маркетинг, комплаенс, кто тебе ближе. Мне важно, чтобы голоса были с разных сторон бизнеса. Если можешь, скинь контакт или просто напиши, что я могу сказать, что от тебя.';
+
+function voiceHeroClean(t) {
+  return String(t || '').replace(/\*\*/g, '').replace(/^\[(ВСТУПЛЕНИЕ|ФИНАЛ)\]\s*$/gm, '').replace(/\n{3,}/g, '\n\n').trim();
+}
+
+async function voiceHeroSend(chatId, number) {
+  const data = await notionReq('POST', `/v1/data_sources/${NOTION_VOICE_DS_ID}/query`, {
+    filter: { property: 'Номер', number: { equals: number } }, page_size: 1
+  });
+  const v = (data.results || []).map(pageToVoice)[0];
+  if (!v) return botSend(chatId, `Голос #${number} не найден.`);
+  await botSend(chatId, `Голос #${number}. Ниже по очереди: 1) вступление, 2) версия для LinkedIn, 3) полная версия, 4) просьба о рекомендации. Копируй и пересылай герою. Пункт 4 можно не отправлять.`);
+  const send = async (label, text) => {
+    const body = String(text || '').trim();
+    if (!body) return;
+    await botSend(chatId, label);
+    for (let i = 0; i < body.length; i += 3800) await botSend(chatId, body.slice(i, i + 3800));
+  };
+  await send('1/4 Вступление', VOICE_HERO_INTRO);
+  await send('2/4 Версия для LinkedIn', voiceHeroClean(v.linkedin));
+  await send('3/4 Полная версия. Подпись для героя: «Это полная версия, которая пойдет в канал. Если хочешь, глянь и ее».', voiceHeroClean(v.telegram));
+  await send('4/4 Просьба о рекомендации (по желанию)', VOICE_HERO_ASK);
+}
+
 // --- Mini App: список и карточка голосов ---
 
 // Закрытый API для TTS-бота (он принимает голосовые и расшифровывает их). Доступ по VOICE_API_SECRET
@@ -4868,6 +4895,13 @@ async function handleBotUpdate(update) {
   if (msg.text && !msg.text.startsWith('/') && voiceSessions.has(userId) && await voiceText(msg).catch(e => { console.error('voice text:', scrubToken(e.message)); return false; })) return;
   if (msg.reply_to_message && msg.text && !msg.text.startsWith('/') && await apHandleEditReply(msg).catch(e => { console.error('autopilot reply:', scrubToken(e.message)); return false; })) return;
   const cmd = String(msg.text || '').trim().split(/\s|@/)[0].toLowerCase();
+  if (cmd === '/hero') {
+    const n = Number((String(msg.text || '').match(/\d+/) || [])[0]);
+    if (!n) return botSend(msg.chat.id, 'Напиши номер: /hero 3');
+    if (!voiceConfigured()) return botSend(msg.chat.id, 'Голоса не настроены.');
+    try { return await voiceHeroSend(msg.chat.id, n); }
+    catch (e) { return botSend(msg.chat.id, 'Не получилось: ' + scrubToken(e.message).slice(0, 300)).catch(() => {}); }
+  }
   if (cmd === '/draft') {
     if (!threadsConfigured()) return botSend(msg.chat.id, 'Threads не настроен: нет THREADS_ACCESS_TOKEN.');
     await botSend(msg.chat.id, 'Готовлю черновики на ближайшие дни, карточки придут сюда.');
