@@ -2330,6 +2330,8 @@ async function setupTelegramBot() {
     { command: 'replies', description: 'Ответы в Threads за N часов' },
     { command: 'stats', description: 'Отчет за 7 дней' },
     { command: 'rubrics', description: 'Рубрики Threads за N дней' },
+    { command: 'invite', description: 'Письмо-приглашение герою' },
+    { command: 'hero', description: 'Текст на согласование герою: /hero N' },
     { command: 'help', description: 'Что умеет бот' }
   ] });
   webhookState.status = 'active';
@@ -4675,6 +4677,41 @@ async function voiceText(msg) {
   return false;
 }
 
+// Приветственное письмо герою: /invite -> кнопки ролей -> одно сообщение, которое пересылается с «Скрыть имя отправителя»
+function voiceQWord(n) { return n % 10 === 1 && n % 100 !== 11 ? 'вопрос' : (n % 10 >= 2 && n % 10 <= 4 && (n % 100 < 12 || n % 100 > 14) ? 'вопроса' : 'вопросов'); }
+
+function voiceInviteText(roleKey) {
+  const qs = loadQuestions();
+  const role = voiceRole(roleKey, []);
+  const list = [...qs.common, ...role.questions].map((t, i) => `${i + 1}. ${t}`);
+  const li = VOICE_HERO_LI_URL ? ` (${VOICE_HERO_LI_URL})` : '';
+  return [
+    'Привет! Запускаю в канале рубрику «100 голосов iGaming» и хочу, чтобы ты стал одним из первых голосов.',
+    'В iGaming часто говорят от имени компаний, а честный личный опыт остается внутри команд и личных разговоров. Я хочу собрать истории людей из разных ролей: где ошибались, что оказалось совсем не таким, как выглядело со стороны, и что поняли только со временем.',
+    'Правильных ответов здесь нет, и отвечать по шаблону не нужно. Если какой-то вопрос особенно зацепил или болит, это отлично. Можно посвятить ему большую часть ответа, а на остальные ответить короче. Главное искренность и твое честное мнение.',
+    'Имя и название компании публиковать не буду, только роль и стаж в iGaming. Отвечать лучше голосовыми: одним сообщением или отдельно на каждый вопрос. Ориентир около 10 минут, но это не жесткое ограничение.',
+    `Короткая версия выйдет в LinkedIn${li}, полная в Telegram (${VOICE_HERO_TG_URL}). Я расшифрую ответы, уберу повторы и перед публикацией пришлю тебе текст на согласование.`,
+    `Ниже ${list.length} ${voiceQWord(list.length)}.\n\n` + list.join('\n'),
+    'Если последний вопрос хочешь заменить на то, о чем тебе действительно хочется рассказать, можешь это сделать или просто поднять тему, которую считаешь важной.'
+  ].join('\n\n');
+}
+
+async function voiceInviteMenu(chatId) {
+  const roles = loadQuestions().roles;
+  const rows = Object.keys(roles).map(k => [{ text: roles[k].title, callback_data: 'iv:' + k }]);
+  return botSend(chatId, 'Письмо-приглашение героя. Выбери роль, пришлю одним сообщением: перешли его с «Скрыть имя отправителя».', { reply_markup: { inline_keyboard: rows } });
+}
+
+async function handleInviteCallback(cb) {
+  const answer = (text) => tgApi('answerCallbackQuery', { callback_query_id: cb.id, text }).catch(() => {});
+  if (!TELEGRAM_ALLOWED_USER_IDS.includes(String(cb.from.id))) return answer('Нет доступа');
+  const key = String(cb.data).split(':')[1];
+  await answer();
+  const chatId = cb.message && cb.message.chat && cb.message.chat.id;
+  try { return await botSend(chatId, voiceInviteText(key), { disable_web_page_preview: true }); }
+  catch (e) { return botSend(chatId, 'Не получилось: ' + scrubToken(e.message).slice(0, 200)).catch(() => {}); }
+}
+
 async function handleVoiceCallback(cb) {
   const answer = (text) => tgApi('answerCallbackQuery', { callback_query_id: cb.id, text }).catch(() => {});
   const userId = String(cb.from.id);
@@ -4744,7 +4781,7 @@ async function voiceProcess(s) {
 
 // Сообщения для героя: берутся из сохраненных в Notion текстов (с твоими правками), ты пересылаешь их от своего имени
 const VOICE_HERO_TG_URL = (process.env.VOICE_HERO_TG_URL || 'https://t.me/skakunov_igaming').trim();
-const VOICE_HERO_LI_URL = (process.env.VOICE_HERO_LI_URL || '').trim();
+const VOICE_HERO_LI_URL = (process.env.VOICE_HERO_LI_URL || 'https://www.linkedin.com/in/dmitry-skakunov').trim();
 const VOICE_HERO_LINKS = ' Выйдет у меня в Telegram: ' + VOICE_HERO_TG_URL + (VOICE_HERO_LI_URL ? ' и в LinkedIn: ' + VOICE_HERO_LI_URL : '') + '.';
 const VOICE_HERO_INTRO = 'Привет! Вышел монтаж твоего голоса для рубрики. Текст ниже.' + VOICE_HERO_LINKS + ' Роль и стаж остаются, имена и компании я заменил на нейтральные. Посмотри, пожалуйста: все ли верно по смыслу и нет ли того, по чему тебя могут узнать? Если до завтра тишина, считаю, что все ок.';
 const VOICE_HERO_ASK = 'И просьба: порекомендуй двух-трех людей из индустрии, но не трейдеров, а с других позиций. Риск, CRM, продукт, саппорт, маркетинг, комплаенс, кто тебе ближе. Мне важно, чтобы голоса были с разных сторон бизнеса. Если можешь, скинь контакт или просто напиши, что я могу сказать, что от тебя.';
@@ -4887,6 +4924,7 @@ function voiceRoute(req, res) {
 async function handleBotUpdate(update) {
   if (update.chat_member) return handleChatMember(update.chat_member).catch(e => console.error('chat_member:', scrubToken(e.message)));
   if (update.callback_query) {
+    if (/^iv:/.test(String(update.callback_query.data || ''))) return handleInviteCallback(update.callback_query).catch(e => console.error('invite cb:', scrubToken(e.message)));
     if (/^vo:/.test(String(update.callback_query.data || ''))) return handleVoiceCallback(update.callback_query).catch(e => console.error('voice cb:', scrubToken(e.message)));
     if (/^ap:/.test(String(update.callback_query.data || ''))) return handleApCallback(update.callback_query).catch(e => console.error('autopilot cb:', scrubToken(e.message)));
     if (/^cx:\d+$/.test(String(update.callback_query.data || ''))) return handleCommentCallback(update.callback_query);
@@ -4910,6 +4948,7 @@ async function handleBotUpdate(update) {
   if (msg.text && !msg.text.startsWith('/') && voiceSessions.has(userId) && await voiceText(msg).catch(e => { console.error('voice text:', scrubToken(e.message)); return false; })) return;
   if (msg.reply_to_message && msg.text && !msg.text.startsWith('/') && await apHandleEditReply(msg).catch(e => { console.error('autopilot reply:', scrubToken(e.message)); return false; })) return;
   const cmd = String(msg.text || '').trim().split(/\s|@/)[0].toLowerCase();
+  if (cmd === '/invite') return voiceInviteMenu(msg.chat.id).catch(e => botSend(msg.chat.id, 'Не получилось: ' + scrubToken(e.message).slice(0, 200)).catch(() => {}));
   if (cmd === '/hero') {
     const n = Number((String(msg.text || '').match(/\d+/) || [])[0]);
     if (!n) return botSend(msg.chat.id, 'Напиши номер: /hero 3');
