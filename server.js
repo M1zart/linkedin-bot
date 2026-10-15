@@ -4750,23 +4750,35 @@ function voiceHeroClean(t) {
   return String(t || '').replace(/\*\*/g, '').replace(/^\[(ВСТУПЛЕНИЕ|ФИНАЛ)\]\s*$/gm, '').replace(/\n{3,}/g, '\n\n').trim();
 }
 
+const htmlEsc = t => String(t).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+// Режет по абзацам, чтобы не рвать предложения
+function voiceHeroChunks(text, max = 3500) {
+  const out = []; let cur = '';
+  for (const para of String(text).split(/\n\n+/)) {
+    if (cur && (cur.length + para.length + 2) > max) { out.push(cur); cur = ''; }
+    cur = cur ? cur + '\n\n' + para : para;
+  }
+  if (cur) out.push(cur);
+  return out;
+}
+
 async function voiceHeroSend(chatId, number) {
   const data = await notionReq('POST', `/v1/data_sources/${NOTION_VOICE_DS_ID}/query`, {
     filter: { property: 'Номер', number: { equals: number } }, page_size: 1
   });
   const v = (data.results || []).map(pageToVoice)[0];
   if (!v) return botSend(chatId, `Голос #${number} не найден.`);
-  await botSend(chatId, `Голос #${number}. Ниже по очереди: 1) вступление, 2) версия для LinkedIn, 3) полная версия, 4) просьба о рекомендации. Копируй и пересылай герою. Пункт 4 можно не отправлять.`);
-  const send = async (label, text) => {
-    const body = String(text || '').trim();
-    if (!body) return;
-    await botSend(chatId, label);
-    for (let i = 0; i < body.length; i += 3800) await botSend(chatId, body.slice(i, i + 3800));
-  };
-  await send('1/4 Вступление', VOICE_HERO_INTRO);
-  await send('2/4 Версия для LinkedIn', voiceHeroClean(v.linkedin));
-  await send('3/4 Полная версия. Подпись для героя: «Это полная версия, которая пойдет в канал. Если хочешь, глянь и ее».', voiceHeroClean(v.telegram));
-  await send('4/4 Просьба о рекомендации (по желанию)', VOICE_HERO_ASK);
+  const full = voiceHeroClean(v.telegram);
+  // Какие вопросы пойдут в LinkedIn: ищем их по тексту вопроса в полной версии
+  const qOf = t => (String(t).match(/^\*{0,2}(\d+)\.\s+(.+?)\*{0,2}$/gm) || []).map(l => l.replace(/\*/g, '').replace(/^\d+\.\s+/, '').trim());
+  const fullQs = qOf(v.telegram);
+  const liNums = qOf(v.linkedin).map(q => fullQs.indexOf(q) + 1).filter(n => n > 0);
+  const liNote = liNums.length ? ` В LinkedIn пойдут ответы ${liNums.join(', ')}.` : '';
+  const intro = VOICE_HERO_INTRO.replace('Текст ниже.', 'Текст ниже.' + liNote);
+  await botSend(chatId, `Голос #${number}. Три блока, нажми на блок и он скопируется. Пересылай герою по порядку.`);
+  const blocks = [intro, ...voiceHeroChunks(full), VOICE_HERO_ASK];
+  for (const b of blocks) await botSend(chatId, `<pre>${htmlEsc(b)}</pre>`, { parse_mode: 'HTML' });
 }
 
 // --- Mini App: список и карточка голосов ---
