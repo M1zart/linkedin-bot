@@ -4303,7 +4303,10 @@ async function snapshot48Tick() {
 const NOTION_VOICE_DS_ID = (process.env.NOTION_VOICE_DS_ID || '').trim();
 const GEMINI_TRANSCRIBE_MODEL = process.env.GEMINI_TRANSCRIBE_MODEL || 'gemini-2.5-flash';
 const GEMINI_FILES_BASE = 'https://generativelanguage.googleapis.com';
-const VOICE_STATUSES = ['черновик', 'на согласовании', 'опубликован'];
+const VOICE_STATUSES = ['черновик', 'на согласовании', 'согласован', 'готов к публикации', 'опубликован'];
+// База «100 голосов: ответы»: одна строка = один ответ. Для выборок и аналитики
+const NOTION_VOICE_ANSWERS_DS_ID = (process.env.NOTION_VOICE_ANSWERS_DS_ID || '961dc645-d620-4bde-87de-c8ee4499d915').trim();
+const VOICE_TOPICS = ['Деньги и зарплаты', 'Люди и найм', 'AI и автоматизация', 'Риск и мошенничество', 'Бонусы и CRM', 'Провайдеры и платформа', 'Трейдинг и линия', 'Репутация и этика', 'Путь в индустрию'];
 const VOICE_INLINE_MAX = 12 * 1024 * 1024; // больше: через Gemini Files API
 
 const voiceConfigured = () => !!(NOTION_API_KEY && NOTION_VOICE_DS_ID);
@@ -4474,12 +4477,15 @@ const VOICE_SYSTEM_PROMPT = `Ты редактор рубрики «100 голо
 4. Интересное, что герой сказал вне вопросов, положи в "extra" (тоже прямой речью, те же правила очистки). Если такого нет, пустая строка.
 5. Речь на украинском переведи на русский максимально близко к тексту, без украшений, и поставь для этого ответа "translated": true.
 6. Без буквы «ё». Длинное тире как знак препинания не используй, дефис с пробелами тоже. Проценты записывай знаком % (не словом «процентов»).
-7. "risks": список всего, по чему героя могут узнать: названия компаний и брендов, точные цифры, имена людей, города и страны, уникальные истории. Для каждого: "what" (что именно) и "quote" (короткая цитата места из ответа). Если ничего нет, пустой список.
+7. АНОНИМИЗАЦИЯ. В текстах ответов названия компаний, брендов, провайдеров и платформ, а также имена и фамилии людей заменяй нейтральным описанием: «одна из компаний», «крупный провайдер», «коллега», «руководитель» и т.п., по смыслу. Не выдумывай уточнений, которых герой не говорил. Цифры, суммы и случаи оставляй как есть. Названия видов спорта, лиг и общеизвестных индустриальных терминов не заменяй.
+7b. "risks": список того, по чему героя все еще могут узнать ПОСЛЕ замены: города и страны, точные цифры, уникальные истории, редкие детали. Для каждого: "what" (что именно) и "quote" (короткая цитата места из уже обработанного ответа). Если ничего нет, пустой список.
 8. Вопрос с пометкой [МОЖНО ЗАМЕНИТЬ] герой имел право заменить своим. Если вместо ответа на него герой явно говорит на другую тему, которую выбрал сам, положи этот рассказ в ответ на этот вопрос, а в "custom_question" запиши короткий вопрос, на который он на самом деле отвечает (одно предложение, без ё). Если герой ответил на исходный вопрос или ничего не заменял, "custom_question" пустая строка.
 9. "best": список из трех id самых сильных непустых ответов среди ВСЕХ вопросов (и общих c, и ролевых r), от самого сильного к менее сильному. Сильный это конкретный случай из личного опыта, неочевидная мысль, детали, которых нет в общих словах. Слабый это общие фразы и повтор мысли из другого ответа. Если два ответа повторяют один и тот же тезис, возьми только один из них. Если непустых ответов меньше трех, верни сколько есть.
 
+10. Для каждого непустого ответа укажи: "short" (заголовок до 70 символов, суть ответа, без ё и без длинного тире), "topics" (от 1 до 3 тем СТРОГО из списка: ${VOICE_TOPICS.join('; ')}), "has_case" (true, если в ответе есть личный случай из опыта героя), "has_number" (true, если есть конкретная цифра или сумма).
+
 Верни ТОЛЬКО JSON без пояснений и без markdown-ограждений, в формате:
-{"answers":[{"id":"<id вопроса>","text":"...","translated":false}],"custom_question":"...","best":["<id>","<id>","<id>"],"extra":"...","risks":[{"what":"...","quote":"..."}]}
+{"answers":[{"id":"<id вопроса>","text":"...","translated":false,"short":"...","topics":["..."],"has_case":false,"has_number":false}],"custom_question":"...","best":["<id>","<id>","<id>"],"extra":"...","risks":[{"what":"...","quote":"..."}]}
 В "answers" должны быть все вопросы из списка, в том же порядке, с теми же id.`;
 
 async function voiceStructure(questions, transcript) {
@@ -4529,7 +4535,48 @@ function voiceAssemble({ number, roleTitle, exp, questions, commonCount, parsed 
   const linkedin = `${head}\n\n${liQs.map(block).join('\n\n')}`.replace(/\*\*/g, '');
   const risks = (parsed.risks || []).filter(r => r && r.what)
     .map(r => `• ${voiceClean(r.what)}${r.quote ? `: «${voiceClean(r.quote)}»` : ''}`).join('\n');
-  return { telegram, linkedin, risks, extra: voiceClean(parsed.extra) };
+  const rows = qs.map((q, i) => {
+    const a = byId[q.id] || {};
+    const text = voiceClean(a.text);
+    if (!text) return null;
+    const topics = (Array.isArray(a.topics) ? a.topics : []).map(t => String(t).trim()).filter(t => VOICE_TOPICS.includes(t));
+    return {
+      qNum: i + 1, question: q.text, type: q.id.startsWith('c') ? 'Общий' : 'Ролевой',
+      text: a.translated ? text : text, short: voiceClean(a.short) || text.slice(0, 60),
+      topics: [...new Set(topics)], hasCase: !!a.has_case, hasNumber: !!a.has_number,
+      translated: !!a.translated, inLinkedIn: picked.has(q.id)
+    };
+  }).filter(Boolean);
+  return { telegram, linkedin, risks, extra: voiceClean(parsed.extra), rows };
+}
+
+// По строке на ответ в базу «100 голосов: ответы». Сбой здесь не должен ронять сохранение голоса
+async function voiceAnswersCreate({ pageId, number, roleTitle, exp, rows }) {
+  if (!NOTION_VOICE_ANSWERS_DS_ID || !pageId) return;
+  const role = /^Другое$/i.test(roleTitle) ? 'Другая роль' : notionSelectName(roleTitle);
+  for (const r of rows || []) {
+    try {
+      await notionReq('POST', '/v1/pages', {
+        parent: { type: 'data_source_id', data_source_id: NOTION_VOICE_ANSWERS_DS_ID },
+        properties: {
+          'Ответ (кратко)': { title: [{ type: 'text', text: { content: `#${number} ${r.short}`.slice(0, 150) } }] },
+          'Вопрос': rtFull(r.question),
+          'Номер вопроса': { number: r.qNum },
+          'Номер голоса': { number },
+          'Голос': { relation: [{ id: pageId }] },
+          'Роль': { select: { name: role } },
+          'Стаж': rtFull(exp),
+          'Тип вопроса': { select: { name: r.type } },
+          'Ответ': rtFull(r.text),
+          'Тема': { multi_select: r.topics.map(name => ({ name })) },
+          'Есть личный случай': { checkbox: r.hasCase },
+          'Есть конкретная цифра': { checkbox: r.hasNumber },
+          'В версии LinkedIn': { checkbox: r.inLinkedIn },
+          'Язык оригинала': { select: { name: r.translated ? 'Украинский' : 'Русский' } }
+        }
+      });
+    } catch (e) { console.error('voice answers row:', scrubToken(e.message)); }
+  }
 }
 
 // --- Сессия в чате с ботом ---
@@ -4668,7 +4715,8 @@ async function voiceSubmit({ role: roleKey, otherQs, number, exp, transcript }) 
   ];
   const parsed = await voiceStructure(questions, transcript);
   const out = voiceAssemble({ number, roleTitle: role.title, exp, questions, commonCount: q.common.length, parsed });
-  await voiceCreate({ number, roleTitle: role.title, exp, ...out, transcript });
+  const page = await voiceCreate({ number, roleTitle: role.title, exp, ...out, transcript });
+  await voiceAnswersCreate({ pageId: page.id, number, roleTitle: role.title, exp, rows: out.rows });
 }
 
 async function voiceProcess(s) {
