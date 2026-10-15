@@ -18,7 +18,7 @@ const INIT_DATA_MAX_AGE_SEC = 24 * 60 * 60;
 const NOTION_SCHEDULE_DB_ID = process.env.NOTION_SCHEDULE_DB_ID || '9774b7e9-9511-41d4-b563-978931704e5d';
 const NOTION_SCHEDULE_DS_ID = process.env.NOTION_SCHEDULE_DS_ID || 'b818813e-8172-4dc4-8893-e5ea30c6a726';
 const ASK_BUTTON_URL = (process.env.ASK_BUTTON_URL || '').trim() || 'https://t.me/ask_skakunov_bot?start=post';
-const ASK_BUTTON_TEXT = (process.env.ASK_BUTTON_TEXT || '').trim() || 'Задать вопрос';
+const ASK_BUTTON_TEXT = (process.env.ASK_BUTTON_TEXT || '').trim() || 'Задать вопрос букмекеру';
 const SCHEDULER_INTERVAL_MS = Number(process.env.SCHEDULER_INTERVAL_MS) || 30 * 1000;
 // Пост, который просрочен больше чем на это время (сервер был недоступен), не публикуется сам: пользователь решает
 const SCHEDULE_STALE_MS = (Number(process.env.SCHEDULE_STALE_MINUTES) || 30) * 60 * 1000;
@@ -288,6 +288,15 @@ const server = http.createServer(async (req, res) => {
 
   // Параметры в адресе (например, ?reschedule=<id> из кнопки бота) не должны давать 404
   const pagePath = req.url.split('?')[0];
+  const tmpImg = /^\/tmp-img\/([0-9a-f]{24})\.(png|jpg)$/.exec(pagePath);
+  if (req.method === 'GET' && tmpImg) {
+    const photo = tmpImages.get(tmpImg[1]);
+    if (!photo) { res.writeHead(404); res.end('not found'); return; }
+    res.writeHead(200, { 'Content-Type': photo.mime, 'Content-Length': photo.buf.length, 'Cache-Control': 'no-store' });
+    res.end(photo.buf);
+    return;
+  }
+
   if (req.method === 'GET' && (pagePath === '/' || pagePath === '/index.html')) {
     const filePath = path.join(__dirname, 'index.html');
     fs.readFile(filePath, (err, data) => {
@@ -1893,8 +1902,20 @@ function askMarkup() {
   return { inline_keyboard: [[{ text: ASK_BUTTON_TEXT, url: ASK_BUTTON_URL }]] };
 }
 
-async function sendTextToChannel(text, askButton = false) {
+// Картинка для длинного поста: подпись к фото в Telegram не длиннее 1024 символов, поэтому картинку на 15 минут
+// отдаем по публичной ссылке, а Telegram показывает ее над текстом в одном сообщении (link_preview_options)
+const tmpImages = new Map();
+function hostTmpImage(photo) {
+  const base = publicBaseUrl();
+  if (!base) return null;
+  const token = crypto.randomBytes(12).toString('hex');
+  tmpImages.set(token, photo);
+  setTimeout(() => tmpImages.delete(token), 15 * 60 * 1000).unref();
+  return `${base}/tmp-img/${token}.${photo.ext}`;
+}
+async function sendTextToChannel(text, askButton = false, previewUrl = null) {
   const extra = askButton ? { reply_markup: askMarkup() } : {};
+  if (previewUrl) extra.link_preview_options = { url: previewUrl, show_above_text: true, prefer_large_media: true };
   try {
     return await tgApi('sendMessage', { chat_id: TELEGRAM_CHANNEL_ID, text: toTelegramHtml(text), parse_mode: 'HTML', ...extra });
   } catch (e) {
@@ -1951,6 +1972,16 @@ async function publishToChannel(text, imageDataUrl, askButton = false) {
 
   const captionFits = !!photo && len <= 1024;
   const ids = [];
+  // Длинный текст с картинкой: одним сообщением, картинка сверху. Если публичного адреса нет или выключено TG_SINGLE_POST=off, как раньше: фото отдельно, текст отдельно
+  const singleUrl = photo && !captionFits && len <= 4000 && process.env.TG_SINGLE_POST !== 'off' ? hostTmpImage(photo) : null;
+  if (singleUrl) {
+    try {
+      ids.push((await sendTextToChannel(text, askButton, singleUrl)).message_id);
+      return { ok: true, messageIds: ids, link: channelLink(ids[0]), withImage: true, parts: 1 };
+    } catch (e) {
+      throw httpError(502, friendlyTelegramError(e.message));
+    }
+  }
   try {
     // Кнопка вешается на последнее сообщение: на фото, если текст в подписи, иначе на текст
     if (photo) ids.push((await sendPhotoToChannel(photo, captionFits ? text : null, askButton && captionFits)).message_id);
