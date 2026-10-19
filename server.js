@@ -4136,11 +4136,13 @@ async function statsQuery(status, extraFilters = [], direction = 'descending', s
 
 // Вход в канал: пишем строку в Notion. Нужен chat_member в allowed_updates вебхука и права админа у бота
 const joinLabel = v => v === 'threads' ? 'Threads (старый учет)' : v === 'other-link' ? 'другие ссылки (до учета по названиям)' : v === 'no-link' ? 'без ссылки (поиск, публичное имя, пересылки)' : String(v || '').replace(/^link:/, '') || 'без названия';
+const JOIN_SOURCES = process.env.JOIN_SOURCES ? process.env.JOIN_SOURCES.split('|') : ['Linkedin. Post', 'Linkedin. Info and Featured', 'Tribuna.UA. Post', 'Threds bio', 'Threds Post', 'X', 'без ссылки (поиск, публичное имя, пересылки)'];
 function joinsBreakdown(title, joins) {
-  if (!joins.length) return title + ': входов нет.';
+  const norm = s => String(s).toLowerCase().replace(/\s+/g, ' ').trim();
   const by = {};
-  for (const j of joins) { const k = joinLabel(j.text); by[k] = (by[k] || 0) + 1; }
-  const parts = Object.entries(by).sort((a, b) => b[1] - a[1]).map(([k, n]) => k + ' ' + n);
+  for (const j of joins) { const k0 = joinLabel(j.text); const k = JOIN_SOURCES.find(s => norm(s) === norm(k0)) || k0; by[k] = (by[k] || 0) + 1; }
+  for (const s of JOIN_SOURCES) if (!(s in by)) by[s] = 0;
+  const parts = Object.entries(by).sort((x, y) => y[1] - x[1]).map(([k, n]) => k + ' ' + n);
   return title + ': ' + joins.length + '. По источникам: ' + parts.join(', ') + '.';
 }
 async function handleChatMember(cm) {
@@ -4234,14 +4236,10 @@ async function buildStatsReport(days = STATS_REPORT_DAYS) {
   }
   lines.push('');
 
-  // X
+  // X: только счетчик зеркала из Notion, платные чтения X API не используем
   if (xConfigured()) {
-    let xf = null, xErr = '';
-    try { xf = await xFollowers(); } catch (e) { xErr = scrubToken(e.message).slice(0, 120); }
     const xp = await statsQuery('t_published', [{ property: 'X ID', rich_text: { is_not_empty: true } }, ...inPeriod]).catch(() => []);
-    if (xf != null) { snapshot.xFollowers = xf; lines.push('X: подписчики ' + xf + delta(xf, prev && prev.xFollowers)); }
-    else lines.push('X: подписчиков получить не удалось (' + xErr + ')');
-    lines.push('Отзеркалено постов: ' + xp.length + (th.ok ? ' из ' + th.postsCount : ''));
+    lines.push('X: отзеркалено постов ' + xp.length + (th.ok ? ' из ' + th.postsCount : ''));
     lines.push('');
   }
   lines.push('Входы по названиям ссылок считаются с 19.10, раньше бот названий не фиксировал.');
