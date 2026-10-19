@@ -970,15 +970,7 @@
 
     <div class="editor-body">
       <div class="field-label">Текст</div>
-      <div class="link-tools" id="link-tools">
-        <button type="button" class="action-btn" id="link-btn">🔗 Ссылка</button>
-        <div class="link-row" id="link-row" style="display:none;">
-          <input type="text" id="link-url" inputmode="url" autocapitalize="off" autocorrect="off" placeholder="https://… адрес ссылки" />
-          <button type="button" class="action-btn" id="link-apply">Вставить</button>
-          <button type="button" class="action-btn" id="link-cancel">Отмена</button>
-        </div>
-        <div class="muted-note" id="link-hint">Выдели слова в тексте и нажми «Ссылка», либо вставь адрес поверх выделенных слов. В тексте это выглядит как [слова](адрес), в канале будет гиперссылка.</div>
-      </div>
+      <div class="link-tools" id="link-tools"></div>
       <textarea id="result-text" spellcheck="true" lang="ru" autocorrect="on"></textarea>
 
       <div id="rubric-section">
@@ -1351,7 +1343,7 @@
       document.getElementById('publish-row').style.display = isTg ? 'flex' : 'none';
       // Гиперссылки только для Telegram (LinkedIn их из текста не делает)
       document.getElementById('link-tools').style.display = isTg ? 'block' : 'none';
-      if (!isTg) document.getElementById('link-cancel').click();
+      if (!isTg && document.getElementById('link-tools')._close) document.getElementById('link-tools')._close();
 
       box.classList.add('show');
       document.body.classList.add('editor-open');
@@ -1397,12 +1389,25 @@
     });
 
     // ===== ГИПЕРССЫЛКИ: выделил слова, добавил адрес, в тексте появилось [слова](адрес); сервер при публикации делает из этого ссылку Telegram =====
-    (function () {
-      const ta = document.getElementById('result-text');
-      const btn = document.getElementById('link-btn');
-      const row = document.getElementById('link-row');
-      const urlInput = document.getElementById('link-url');
+    // Панель «Ссылка» для любого textarea: основной редактор и правка поста в очереди
+    function mountLinkTools(ta, host) {
       const URL_RE = /^(?:https?:\/\/|tg:\/\/)[^\s()"<>]+$/i;
+      host.innerHTML = '';
+      const btn = document.createElement('button');
+      btn.type = 'button'; btn.className = 'action-btn'; btn.textContent = '🔗 Ссылка';
+      const row = document.createElement('div');
+      row.className = 'link-row'; row.style.display = 'none';
+      const urlInput = document.createElement('input');
+      urlInput.type = 'text'; urlInput.inputMode = 'url'; urlInput.autocapitalize = 'off'; urlInput.placeholder = 'https://… адрес ссылки';
+      const apply = document.createElement('button');
+      apply.type = 'button'; apply.className = 'action-btn'; apply.textContent = 'Вставить';
+      const cancel = document.createElement('button');
+      cancel.type = 'button'; cancel.className = 'action-btn'; cancel.textContent = 'Отмена';
+      row.append(urlInput, apply, cancel);
+      const hint = document.createElement('div');
+      hint.className = 'muted-note';
+      hint.textContent = 'Выдели слова в тексте и нажми «Ссылка», либо вставь адрес поверх выделенных слов. В тексте это выглядит как [слова](адрес), в канале будет гиперссылка.';
+      host.append(btn, row, hint);
       let saved = null; // выделение запоминаем: при фокусе на поле адреса textarea его теряет
 
       function normalizeUrl(raw) {
@@ -1412,7 +1417,7 @@
         return URL_RE.test(u) ? u : '';
       }
 
-      // Заворачивает диапазон [from, to) в [текст](адрес). Скобки внутри текста заменяем, чтобы не ломать разметку
+      // Заворачивает диапазон [from, to) в [текст](адрес). Скобки внутри текста убираем, чтобы не ломать разметку
       function wrapAsLink(from, to, url) {
         const label = ta.value.slice(from, to).replace(/[\[\]]/g, '').replace(/\s*\n\s*/g, ' ');
         const md = `[${label}](${url})`;
@@ -1422,6 +1427,7 @@
       }
 
       function closeRow() { row.style.display = 'none'; urlInput.value = ''; saved = null; }
+      host._close = closeRow;
 
       btn.addEventListener('click', () => {
         const from = ta.selectionStart, to = ta.selectionEnd;
@@ -1431,7 +1437,7 @@
         urlInput.focus();
       });
 
-      document.getElementById('link-apply').addEventListener('click', () => {
+      apply.addEventListener('click', () => {
         const url = normalizeUrl(urlInput.value);
         if (!url) { showToast('Нужен адрес вида https://…', true); return; }
         if (!saved) { closeRow(); return; }
@@ -1440,7 +1446,7 @@
         showToast('Ссылка вставлена');
       });
 
-      document.getElementById('link-cancel').addEventListener('click', closeRow);
+      cancel.addEventListener('click', closeRow);
 
       // Вставка адреса поверх выделенных слов сразу делает из них ссылку
       ta.addEventListener('paste', (e) => {
@@ -1451,7 +1457,8 @@
         e.preventDefault();
         wrapAsLink(from, to, pasted);
       });
-    })();
+    }
+    mountLinkTools(document.getElementById('result-text'), document.getElementById('link-tools'));
 
     // Список рубрик в редакторе берётся из вкладки «Готовый», чтобы он был один (только справочник, не состояние)
     document.getElementById('editor-rubric-select').innerHTML = document.getElementById('rubric-select').innerHTML;
@@ -2289,8 +2296,9 @@
         text.className = 'queue-text';
         renderTgText(text, it.text);
         card.appendChild(text);
+        let toggle = null;
         if (text.textContent.length > 280) {
-          const toggle = document.createElement('button');
+          toggle = document.createElement('button');
           toggle.className = 'queue-toggle';
           toggle.textContent = 'Показать полностью';
           toggle.addEventListener('click', () => {
@@ -2339,12 +2347,81 @@
           cancel.className = 'action-btn';
           cancel.textContent = 'Отменить';
           cancel.addEventListener('click', () => queueAction(it.id, 'cancel', cancel));
+          const edit = document.createElement('button');
+          edit.className = 'action-btn';
+          edit.textContent = '✏️ Редактировать';
+          edit.addEventListener('click', () => openQueueEdit(card, it, text, toggle, actions));
+          actions.appendChild(edit);
           actions.appendChild(mv);
           actions.appendChild(now);
           actions.appendChild(cancel);
           card.appendChild(actions);
         }
         list.appendChild(card);
+      });
+    }
+
+    // Правка текста запланированного поста прямо в очереди: то же поле и те же гиперссылки, что в основном редакторе
+    function openQueueEdit(card, it, textEl, toggleEl, actionsEl) {
+      if (card.querySelector('.queue-edit')) return;
+      textEl.style.display = 'none';
+      if (toggleEl) toggleEl.style.display = 'none';
+      actionsEl.style.display = 'none';
+
+      const box = document.createElement('div');
+      box.className = 'queue-edit';
+      const tools = document.createElement('div');
+      tools.className = 'link-tools';
+      tools.style.display = 'block';
+      const ta = document.createElement('textarea');
+      ta.value = it.text || '';
+      ta.spellcheck = true;
+      ta.lang = 'ru';
+      ta.style.cssText = 'width:100%;box-sizing:border-box;min-height:260px;font-size:15px;line-height:1.6;';
+      const count = document.createElement('div');
+      count.className = 'muted-note';
+      const upd = () => { count.textContent = ta.value.length + ' символов'; };
+      ta.addEventListener('input', upd);
+      upd();
+      const row = document.createElement('div');
+      row.className = 'digest-actions';
+      const save = document.createElement('button');
+      save.className = 'action-btn primary tg';
+      save.textContent = 'Сохранить';
+      const cancel = document.createElement('button');
+      cancel.className = 'action-btn';
+      cancel.textContent = 'Отмена';
+      row.append(save, cancel);
+      box.append(tools, ta, count, row);
+      card.insertBefore(box, actionsEl);
+      mountLinkTools(ta, tools);
+
+      const close = () => {
+        box.remove();
+        textEl.style.display = '';
+        if (toggleEl) toggleEl.style.display = '';
+        actionsEl.style.display = '';
+      };
+      cancel.addEventListener('click', close);
+      save.addEventListener('click', async () => {
+        const value = ta.value;
+        if (!value.trim()) { showToast('Текст не может быть пустым', true); return; }
+        if (value === it.text) { close(); return; }
+        if (queueState.busy) return;
+        queueState.busy = true;
+        save.disabled = cancel.disabled = true;
+        save.textContent = 'Сохраняю…';
+        try {
+          await queueCall('/api/scheduled-action', { method: 'POST', body: JSON.stringify({ id: it.id, action: 'edit', text: value }) });
+          showToast('Текст сохранён');
+          queueState.busy = false;
+          loadQueue();
+        } catch (e) {
+          showToast(e.message.replace(/ \(HTTP \d+\)$/, ''), true);
+          save.disabled = cancel.disabled = false;
+          save.textContent = 'Сохранить';
+          queueState.busy = false;
+        }
       });
     }
 

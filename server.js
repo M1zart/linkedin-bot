@@ -778,9 +778,9 @@ const server = http.createServer(async (req, res) => {
         if (!scheduleConfigured()) return send(503, { error: 'Расписание не настроено: нужен NOTION_API_KEY в переменных Railway' });
         const auth = await authorizeUser(req);
         if (!auth.ok) return send(auth.status, { error: auth.error });
-        const { id, action, value } = JSON.parse(body);
+        const { id, action, value, text } = JSON.parse(body);
         if (!/^[0-9a-f-]{32,40}$/i.test(String(id || ''))) return send(400, { error: 'Некорректный id поста' });
-        if (action !== 'cancel' && action !== 'publish' && action !== 'ask-button') return send(400, { error: 'Неизвестное действие' });
+        if (action !== 'cancel' && action !== 'publish' && action !== 'ask-button' && action !== 'edit') return send(400, { error: 'Неизвестное действие' });
         let row;
         try { row = await schedGet(id); } catch { return send(404, { error: 'Пост не найден или очередь недоступна' }); }
         if (String(row.owner) !== auth.userId) return send(403, { error: 'Это не твой пост' });
@@ -790,6 +790,12 @@ const server = http.createServer(async (req, res) => {
           try { await schedUpdate(row.id, { askButton: value === true }); }
           catch (e) { return send(502, { error: 'Не удалось сохранить кнопку. Проверь, что в базе расписания есть свойство-checkbox «Кнопка вопроса»' }); }
           return send(200, { ok: true, askButton: value === true });
+        }
+        if (action === 'edit') {
+          if (schedInFlight.has(row.id)) return send(409, { error: 'Пост публикуется прямо сейчас' });
+          assertPostText(text);
+          await schedUpdate(row.id, { text });
+          return send(200, { ok: true, text });
         }
         if (action === 'cancel') {
           if (schedInFlight.has(row.id)) return send(409, { error: 'Пост публикуется прямо сейчас' });
@@ -2215,8 +2221,9 @@ async function schedGet(id) {
   return row;
 }
 
-async function schedUpdate(id, { status, link, error, publishAt, askButton }) {
+async function schedUpdate(id, { status, link, error, publishAt, askButton, text }) {
   const properties = {};
+  if (text !== undefined) properties.Text = { rich_text: toRichText(text) };
   if (askButton !== undefined) properties['Кнопка вопроса'] = { checkbox: !!askButton };
   if (publishAt) properties['Publish At'] = { date: { start: publishAt } };
   if (status) properties.Status = { select: { name: status } };
