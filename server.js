@@ -2569,13 +2569,17 @@ async function xAdapt(text) {
   let body = (m ? String(text).slice(0, m.index) : String(text)).trim();
   const room = X_MAX - (url ? 25 : 0) - 3;
   const target = Math.max(120, room - 40);   // модели плохо считают символы: просим с запасом
-  for (let i = 0; i < 5 && xLength(body) > room; i++) {
-    const system = `Ты редактор. Сократи пост для X до ${target} символов (жесткий предел ${room}), сохранив мысль, факты и посыл. Ничего не добавляй. Живая связная речь, полные предложения, от первого лица автора. Русский, буква е без точек, без тире (только запятые и двоеточия), без конструкций «не X, а Y», без эмодзи, хэштегов и ссылок. Верни только текст поста.`;
-    const out = await claudeCall(system, `Сейчас ${xLength(body)} символов, нужно не больше ${target}. Убери второстепенные детали и пояснения, оставь главную мысль и вывод.\n\nТЕКСТ:\n${body}`, 1000);
-    if (!out) break;
-    body = noYo(out.trim()).replace(/\s*[—–]\s*/g, ', ').replace(/\s+-\s+/g, ', ');
+  if (xLength(body) > room) {
+    const system = 'Ты редактор. Напиши для X самостоятельный короткий пост на основе исходного: один главный тезис с коротким обоснованием, понятный без контекста. Не обрезай исходник, а перепиши заново. Не больше ' + target + ' символов (жесткий предел ' + room + '). Первое лицо автора, живая связная речь, полные предложения. Русский, буква е без точек, без тире (только запятые и двоеточия), без конструкций «не X, а Y», без эмодзи, хэштегов и ссылок. Верни только текст поста.';
+    for (let i = 0; i < 4 && xLength(body) > room; i++) {
+      const out = await claudeCall(system, 'Сейчас ' + xLength(body) + ' символов, нужно не больше ' + target + '.\n\nИСХОДНЫЙ ПОСТ:\n' + body, 1000);
+      if (!out) break;
+      body = noYo(out.trim()).replace(/\s*[—–]\s*/g, ', ').replace(/\s+-\s+/g, ', ');
+    }
+    if (xLength(body) > room) { console.error('x: не удалось сжать до', room, 'символов, осталось', xLength(body)); return null; }
+    const verdict = await claudeCall('Ты строгий редактор. Ответь одним словом: ДА или НЕТ.', 'Это самостоятельный пост, понятный читателю без контекста, законченная мысль, а не обрубок и не пустой лозунг?\n\n' + body, 20).catch(() => '');
+    if (!/^\s*ДА/i.test(verdict || '')) { console.error('x: сжатая версия потеряла смысл, пропускаю:', body); return null; }
   }
-  if (xLength(body) > room) { console.error('x: не удалось сжать до', room, 'символов, осталось', xLength(body)); return null; }
   return url ? body + '\n\n' + url : body;
 }
 
