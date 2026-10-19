@@ -4163,7 +4163,7 @@ function statsParseInsight(data) {
   }
   return out;
 }
-async function statsThreads(fromMs, toMs, light) {
+async function statsThreads(fromMs, toMs) {
   const uid = await threadsUserId();
   const res = { ok: false, needPerm: false };
   try {
@@ -4173,19 +4173,24 @@ async function statsThreads(fromMs, toMs, light) {
     catch (e) { if (/metric_type/i.test(e.message)) { delete params.metric_type; data = await threadsReq('GET', `/${uid}/threads_insights`, params); } else throw e; }
     res.user = statsParseInsight(data);
     try { res.followers = statsParseInsight(await threadsReq('GET', `/${uid}/threads_insights`, { metric: 'followers_count' })).followers_count; } catch { res.followers = null; }
-    const posts = ((await threadsReq('GET', `/${uid}/threads`, { fields: 'id,text,timestamp', limit: '30' })).data || [])
+    const posts = ((await threadsReq('GET', `/${uid}/threads`, { fields: 'id,text,timestamp', limit: '100' })).data || [])
       .filter(x => { const t = Date.parse(x.timestamp || 0); return t >= fromMs && t < toMs; });
     res.postsCount = posts.length;
     res.postDays = {};
     for (const x of posts) { const w = warsawParts(Date.parse(x.timestamp)); const k = w.y + '-' + w.mo + '-' + w.d; res.postDays[k] = (res.postDays[k] || 0) + 1; }
-    let best = null;
-    for (const post of (light ? [] : posts.slice(0, 10))) {
+    // Просмотры каждого поста: по ним считаем охват на пост и лучший пост. Посты моложе 48 часов в среднее не берем: они еще не набрали охват
+    const matureBefore = Date.now() - 48 * 3600000;
+    res.posts = [];
+    for (const post of posts.slice(0, 40)) {
       try {
         const ins = statsParseInsight(await threadsReq('GET', `/${post.id}/insights`, { metric: 'views,likes,replies' }));
-        if (!best || (ins.views || 0) > (best.ins.views || 0)) best = { post, ins };
+        res.posts.push({ text: post.text, views: ins.views || 0, likes: ins.likes || 0, replies: ins.replies || 0, mature: Date.parse(post.timestamp) <= matureBefore });
       } catch { /* у отдельного поста метрик может не быть */ }
     }
-    res.best = best;
+    const mature = res.posts.filter(p => p.mature);
+    res.matureN = mature.length;
+    res.avgMature = mature.length ? Math.round(mature.reduce((a, p) => a + p.views, 0) / mature.length) : null;
+    res.best = res.posts.reduce((b, p) => (!b || p.views > b.views) ? p : b, null);
     res.ok = true;
   } catch (e) {
     res.error = scrubToken(e.message);
@@ -4194,22 +4199,22 @@ async function statsThreads(fromMs, toMs, light) {
   return res;
 }
 
-// Отчет за последние days полных дней (по умолчанию неделя). Снимки t_stats бот пишет каждый день, отправляет отчет раз в неделю.
+// Недельный отчет: короткий, для решений (около 20 строк). Подробности по ссылкам: /sources, рубрики: /rubrics.
+// Снимки t_stats бот пишет каждый день, отправляет отчет раз в неделю.
 async function buildStatsReport(days = STATS_REPORT_DAYS) {
   const nowMs = Date.now(), np = warsawParts(nowMs);
   const todayStart = warsawToUtcMs(np.y, np.mo, np.d, 0, 0);
   const sd = new Date(Date.UTC(np.y, np.mo - 1, np.d - days));       // нормализуем переход через начало месяца
   const yStart = warsawToUtcMs(sd.getUTCFullYear(), sd.getUTCMonth() + 1, sd.getUTCDate(), 0, 0);   // начало периода
   const dd = ms => { const p = warsawParts(ms + 3 * 3600 * 1000); return `${String(p.d).padStart(2, '0')}.${String(p.mo).padStart(2, '0')}`; };
-  const lines = ['<b>' + (days === 1 ? '📊 Отчет за ' + dd(yStart) : '📊 Неделя ' + dd(yStart) + '–' + dd(todayStart - 86400000)) + '</b>', ''];
+  const lines = ['<b>' + (days === 1 ? '📊 Итоги дня' : '📊 Итоги недели') + '</b>', days === 1 ? dd(yStart) : dd(yStart) + '–' + dd(todayStart - 86400000), ''];
 
   // Снимок на начало периода для дельты (утренний снимок первого дня периода или раньше)
   const prevRows = await statsQuery('t_stats', [{ property: 'Publish At', date: { before: new Date(yStart + 86400000).toISOString() } }], 'descending', 1);
   let prev = null; try { prev = prevRows[0] ? JSON.parse(prevRows[0].text) : null; } catch { prev = null; }
-  const delta = (cur, old) => (cur == null || old == null) ? '' : ` (${cur - old >= 0 ? '+' : ''}${cur - old})`;
 
   const th = threadsConfigured() ? await statsThreads(yStart, todayStart) : { ok: false, error: 'нет THREADS_ACCESS_TOKEN' };
-  const thPrev = th.ok ? await statsThreads(yStart - days * 86400000, yStart, true) : { ok: false };
+  const thPrev = th.ok ? await statsThreads(yStart - days * 86400000, yStart) : { ok: false };
   const snapshot = { date: new Date(todayStart).toISOString().slice(0, 10) };
   const inPeriod = [
     { property: 'Publish At', date: { on_or_after: new Date(yStart).toISOString() } },
@@ -4222,93 +4227,108 @@ async function buildStatsReport(days = STATS_REPORT_DAYS) {
   const dayName = ['вс', 'пн', 'вт', 'ср', 'чт', 'пт', 'сб'];
   const dayKey = ms => { const w = warsawParts(ms); return w.y + '-' + w.mo + '-' + w.d; };
   const ymd = ms => { const w = warsawParts(ms + 12 * 3600000); return w.y + '-' + String(w.mo).padStart(2, '0') + '-' + String(w.d).padStart(2, '0'); };
-  const leavesFrom = warsawToUtcMs(2026, 10, 19, 0, 0);        // с этого дня бот пишет выходы из канала
-  const leavesPartial = yStart < leavesFrom;
+  const leavesFrom = warsawToUtcMs(2026, 10, 19, 0, 0);        // с этого дня бот пишет выходы и названия ссылок
+  const partial = yStart < leavesFrom;
   const esc = s => String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   const num = n => String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ' ');
   const sgn = n => (n > 0 ? '+' : n < 0 ? '-' : '') + Math.abs(n);
+  const pct = r => (r >= 1 ? '+' : '-') + String(Math.abs(Math.round((r - 1) * 1000) / 10)).replace('.', ',') + '%';
   const nrm = s => String(s).toLowerCase().replace(/\s+/g, ' ').trim();
   const errs = [];
 
-  // 1. TELEGRAM: численность, входы, выходы и сверка событий со снимками
+  // Данные Telegram
   let members = null;
   try { members = Number(await tgApi('getChatMemberCount', { chat_id: TELEGRAM_CHANNEL_ID })); } catch (e) { errs.push('численность канала: ' + scrubToken(e.message).slice(0, 100)); }
   const joins = await statsQuery('t_join', inPeriod);
   const leaves = await statsQuery('t_leave', inPeriod);
   const joinsPrev = await statsQuery('t_join', prevPeriod);
   const was = prev && prev.tgMembers != null ? prev.tgMembers : null;
-  let gap = 0;
-  lines.push('<b>TELEGRAM</b>');
-  if (members != null) {
-    snapshot.tgMembers = members;
-    if (was != null) {
-      const pc = Math.round((members - was) / was * 1000) / 10;
-      lines.push(was + ' → ' + members + '  (' + sgn(members - was) + ', ' + (pc > 0 ? '+' : '') + String(pc).replace('.', ',') + '%)');
-      gap = (members - was) - (joins.length - leaves.length);
-    } else lines.push('н/д → ' + members);
-  } else lines.push('численность н/д');
-  lines.push('Входы ' + joins.length + ' (неделей раньше ' + (joinsPrev.length || 'н/д') + ') · Выходы ' + (leavesPartial ? 'н/д (учет с 19.10' + (leaves.length ? ': ' + leaves.length : '') + ')' : leaves.length));
-  if (gap !== 0) lines.push('Не объяснено событиями: ' + sgn(gap));
-  lines.push('');
+  const total = joins.length;
 
-  // 2. ИСТОЧНИКИ: все именованные ссылки, включая нулевые; неизвестные отдельно
-  const knownNamed = JOIN_SOURCES.filter(s => !/^без ссылки/.test(s));
-  const named = {}, unknown = { none: 0, old: 0 };
-  knownNamed.forEach(s => { named[s] = 0; });
-  for (const j of joins) {
-    const t = j.text;
-    if (t === 'no-link') unknown.none++;
-    else if (t === 'other-link') unknown.old++;
-    else { const lbl = t === 'threads' ? 'Threads (старый учет)' : (String(t).replace(/^link:/, '') || 'без названия'); const key = knownNamed.find(s => nrm(s) === nrm(lbl)) || lbl; named[key] = (named[key] || 0) + 1; }
-  }
-  const srcRows = Object.entries(named).sort((a, b) => b[1] - a[1]);
-  const srcW = Math.min(28, Math.max(...srcRows.map(r => r[0].length)));
-  lines.push('<b>ИСТОЧНИКИ</b>');
-  lines.push('<pre>' + srcRows.map(([k, n]) => esc(k.slice(0, 28).padEnd(srcW)) + '  ' + n).join('\n') + '</pre>');
-  lines.push('Без источника: ' + unknown.none + (unknown.old ? ' · ссылки без названия (до 19.10): ' + unknown.old : ''));
-  lines.push('');
-
-  // 3. ПО ДНЯМ: входы и публикации на площадках, где они доступны (Threads, Telegram, LinkedIn, X)
+  // Публикации по дням на всех площадках: нужны только для пояснения к пикам входов
   const pubs = {};
   const addPub = (k, name, n) => { if (!k || !n) return; (pubs[k] = pubs[k] || {})[name] = (pubs[k][name] || 0) + n; };
-  if (th.ok && th.postDays) for (const k of Object.keys(th.postDays)) addPub(k, 'Th', th.postDays[k]);
-  (await statsQuery('published', inPeriod).catch(() => [])).forEach(r => { if (r.publishAt) addPub(dayKey(Date.parse(r.publishAt)), 'TG', 1); });
+  if (th.ok && th.postDays) for (const k of Object.keys(th.postDays)) addPub(k, 'Threads', th.postDays[k]);
+  (await statsQuery('published', inPeriod).catch(() => [])).forEach(r => { if (r.publishAt) addPub(dayKey(Date.parse(r.publishAt)), 'Telegram', 1); });
   try {
     const ce = await notionReq('POST', '/v1/data_sources/' + AP_CE_DS + '/query', { filter: { and: [{ property: 'Status', select: { equals: 'Published' } }, { property: 'Publish Date', date: { on_or_after: ymd(yStart) } }, { property: 'Publish Date', date: { before: ymd(todayStart) } }] }, page_size: 100 });
-    (ce.results || []).forEach(p => { const d = p.properties && p.properties['Publish Date'] && p.properties['Publish Date'].date && p.properties['Publish Date'].date.start; if (d) addPub(/^\d{4}-\d{2}-\d{2}$/.test(d) ? Number(d.slice(0, 4)) + '-' + Number(d.slice(5, 7)) + '-' + Number(d.slice(8, 10)) : dayKey(Date.parse(d)), 'LI', 1); });
+    (ce.results || []).forEach(p => { const d = p.properties && p.properties['Publish Date'] && p.properties['Publish Date'].date && p.properties['Publish Date'].date.start; if (d) addPub(/^\d{4}-\d{2}-\d{2}$/.test(d) ? Number(d.slice(0, 4)) + '-' + Number(d.slice(5, 7)) + '-' + Number(d.slice(8, 10)) : dayKey(Date.parse(d)), 'LinkedIn', 1); });
   } catch (e) { /* база Content Engine может быть недоступна */ }
   let xp = [];
   if (xConfigured()) {
     xp = await statsQuery('t_published', [{ property: 'X ID', rich_text: { is_not_empty: true } }, ...inPeriod]).catch(() => []);
     xp.forEach(r => { if (r.publishAt) addPub(dayKey(Date.parse(r.publishAt)), 'X', 1); });
   }
-  const pubText = k => pubs[k] ? Object.entries(pubs[k]).map(([a, b]) => a + b).join(' ') : '';
+  const pubText = ks => { const sum = {}; (Array.isArray(ks) ? ks : [ks]).forEach(k => Object.entries(pubs[k] || {}).forEach(([a, b]) => { sum[a] = (sum[a] || 0) + b; })); return Object.entries(sum).map(([a, b]) => a + ' ' + b).join(', '); };
+
+  // Входы по дням
   const byDay = {};
   joins.forEach(j => { if (j.publishAt) { const k = dayKey(Date.parse(j.publishAt)); byDay[k] = (byDay[k] || 0) + 1; } });
-  const dayRows = []; let peak = null;
+  const dayList = [];
   for (let i = 0; i < days; i++) {
-    const ms = yStart + i * 86400000 + 12 * 3600000;
-    const w = warsawParts(ms), k = dayKey(ms), n = byDay[k] || 0;
-    const label = dayName[new Date(Date.UTC(w.y, w.mo - 1, w.d)).getUTCDay()] + ' ' + String(w.d).padStart(2, '0') + '.' + String(w.mo).padStart(2, '0');
-    if (!peak || n > peak.n) peak = { n, label: label.slice(0, 2), k };
-    dayRows.push(label + '  ' + String(n).padStart(2) + '  ' + (pubText(k) || '-'));
+    const ms = yStart + i * 86400000 + 12 * 3600000, w = warsawParts(ms), k = dayKey(ms), dow = new Date(Date.UTC(w.y, w.mo - 1, w.d)).getUTCDay();
+    dayList.push({ k, label: dayName[dow], n: byDay[k] || 0, weekend: dow === 0 || dow === 6 });
   }
-  if (days > 1) {
-    lines.push('<b>ПО ДНЯМ</b>');
-    lines.push('<pre>' + 'День      Вх  Публикации\n' + dayRows.join('\n') + '</pre>');
-    lines.push('<i>Th Threads, TG Telegram, LI LinkedIn</i>');
-    lines.push('');
-  }
+  const peak = dayList.reduce((b, d) => (!b || d.n > b.n) ? d : b, null);
+  const weekendN = dayList.filter(d => d.weekend).reduce((a, d) => a + d.n, 0);
 
-  // 4. THREADS
+  // 1. TELEGRAM
+  lines.push('<b>TELEGRAM</b>');
+  let growth = null;
+  if (members != null) {
+    snapshot.tgMembers = members;
+    if (was != null && was > 0) {
+      growth = members / was;
+      const p = Math.round((members - was) / was * 1000) / 10;
+      lines.push('<b>' + sgn(members - was) + '</b>  (' + was + ' → ' + members + ', ' + (p > 0 ? '+' : '') + String(p).replace('.', ',') + '%)');
+    } else lines.push('н/д → ' + members);
+  } else lines.push('численность н/д');
+  if (days > 1 && total > 0) {
+    const mx = Math.max(...dayList.map(d => d.n), 1), bars = '▁▂▃▄▅▆▇█';
+    const bar = n => n === 0 ? '·' : bars[Math.min(7, Math.ceil(n / mx * 8) - 1)];
+    lines.push('<pre>' + [dayList.map(d => String(d.n).padEnd(3)).join('').trimEnd(), dayList.map(d => bar(d.n).padEnd(3)).join('').trimEnd(), dayList.map(d => d.label.padEnd(3)).join('').trimEnd()].join('\n') + '</pre>');
+  }
+  lines.push('Входы ' + total + ' (неделей раньше ' + (joinsPrev.length || 'н/д') + ') · выходы ' + (partial ? 'н/д' : leaves.length));
+  if (days > 1 && total >= 3 && peak && peak.n > 0) lines.push('Пик: ' + peak.label + ', ' + peak.n + (total >= 5 && weekendN / total >= 0.4 ? '. На выходные пришлось ' + weekendN + ' из ' + total + ' (' + Math.round(weekendN / total * 100) + '%).' : '.'));
+  if (members != null && was != null && !partial && Math.abs((members - was) - (total - leaves.length)) >= 3) errs.push('численность и события расходятся на ' + sgn((members - was) - (total - leaves.length)));
+  lines.push('');
+
+  // 2. ОТКУДА: только то, по чему можно принимать решения; полный список ссылок по команде /sources
+  const named = {}; let none = 0, old = 0;
+  for (const j of joins) {
+    const t = j.text;
+    if (t === 'no-link') none++;
+    else if (t === 'other-link') old++;
+    else { const lbl = t === 'threads' ? 'Threads (старый учет)' : (String(t).replace(/^link:/, '') || 'без названия'); const key = JOIN_SOURCES.find(s => nrm(s) === nrm(lbl)) || lbl; named[key] = (named[key] || 0) + 1; }
+  }
+  const namedN = Object.values(named).reduce((a, b) => a + b, 0);
+  lines.push('<b>ОТКУДА</b>');
+  lines.push('Без ссылки ' + none + (old ? ' · ссылки без названия ' + old : '') + ' · по именованным ссылкам ' + namedN);
+  if (namedN) lines.push(Object.entries(named).sort((a, b) => b[1] - a[1]).slice(0, 4).map(([k, n]) => esc(k) + ' ' + n).join(' · '));
+  if (partial) lines.push('<i>Названия ссылок и выходы учитываются с 19.10, источники можно сравнивать со следующей недели.</i>');
+  lines.push('');
+
+  // 3. THREADS
   lines.push('<b>THREADS</b>');
+  let reach = null, viewsRatio = null;
   if (th.ok) {
     const u = th.user || {}, up = (thPrev.ok && thPrev.user) || null;
-    lines.push('Подписчики ' + (th.followers != null ? th.followers + delta(th.followers, prev && prev.thFollowers) : 'н/д'));
     if (th.followers != null) snapshot.thFollowers = th.followers;
-    lines.push('Постов ' + th.postsCount + (thPrev.ok ? ' (было ' + thPrev.postsCount + ')' : '') + ' · просмотры ' + num(u.views || 0) + (up ? ' (' + (((u.views || 0) - (up.views || 0)) >= 0 ? '+' : '-') + num(Math.abs((u.views || 0) - (up.views || 0))) + ' к прошлой)' : ' (н/д)'));
-    lines.push('Лайки ' + (u.likes || 0) + ' · ответы ' + (u.replies || 0));
-    if (th.best) lines.push('Лучший: «' + esc(String(th.best.post.text || '').replace(/\s+/g, ' ').slice(0, 70)) + '», ' + num(th.best.ins.views || 0) + ' просм., ' + (th.best.ins.likes || 0) + ' лайк., ' + (th.best.ins.replies || 0) + ' отв.');
+    const fol = th.followers != null ? th.followers + (prev && prev.thFollowers != null ? ' (' + sgn(th.followers - prev.thFollowers) + ')' : '') : 'н/д';
+    const pv = thPrev.ok ? ' (было ' + thPrev.postsCount + ')' : '';
+    const vw = num(u.views || 0) + (up ? ' (' + sgn((u.views || 0) - (up.views || 0)) + ')' : '');
+    if (up && up.views > 0) viewsRatio = (u.views || 0) / up.views;
+    const okAvg = th.avgMature != null && th.matureN >= 1;
+    const okAvgPrev = thPrev.ok && thPrev.avgMature != null && thPrev.matureN >= 1;
+    const av = okAvg ? num(th.avgMature) + (okAvgPrev ? ' (было ' + num(thPrev.avgMature) + ')' : '') : 'н/д';
+    if (okAvg && okAvgPrev && th.matureN >= 2 && thPrev.matureN >= 2 && thPrev.avgMature > 0) reach = { cur: th.avgMature, old: thPrev.avgMature, ratio: th.avgMature / thPrev.avgMature };
+    const rows = [['Подписчики', fol], ['Посты', th.postsCount + pv], ['Просмотры', vw], ['На пост', av], ['Лайки / ответы', (u.likes || 0) + ' / ' + (u.replies || 0)]];
+    lines.push('<pre>' + rows.map(r => r[0].padEnd(16) + r[1]).join('\n') + '</pre>');
+    lines.push('<i>На пост: среднее по постам старше 48 часов (' + th.matureN + ' из ' + th.postsCount + ').</i>');
+    if (reach && viewsRatio != null && viewsRatio >= 1.2 && reach.ratio <= 0.75) lines.push('Просмотры выросли за счет числа постов: охват на пост ' + pct(reach.ratio) + '.');
+    else if (reach && viewsRatio != null && viewsRatio >= 1.2 && reach.ratio >= 1.2) lines.push('Рост не только от числа постов: охват на пост ' + pct(reach.ratio) + '.');
+    else if (reach && viewsRatio != null && viewsRatio <= 0.8 && reach.ratio <= 0.8) lines.push('Просмотры и охват на пост снизились: ' + pct(viewsRatio) + ' и ' + pct(reach.ratio) + '.');
+    if (th.best && th.best.views > 0) lines.push('Лучший пост: «' + esc(String(th.best.text || '').replace(/\s+/g, ' ').slice(0, 60)) + '», ' + num(th.best.views) + ' просм.');
     if (xConfigured() && xp.length < th.postsCount) errs.push('X: в зеркале ' + xp.length + ' из ' + th.postsCount);
   } else {
     lines.push('н/д');
@@ -4316,33 +4336,25 @@ async function buildStatsReport(days = STATS_REPORT_DAYS) {
   }
   lines.push('');
 
-  // 5. ВЫВОД: одна главная аномалия по жестким правилам и одно действие
-  const total = joins.length;
-  const noAttr = unknown.none + unknown.old;
-  const zeroSrc = srcRows.filter(r => r[1] === 0).map(r => r[0]);
-  let main, act;
-  if (members != null && was != null && !leavesPartial && Math.abs(gap) >= 3) {
-    main = 'Численность и события расходятся на ' + sgn(gap) + '.';
-    act = 'Проверить, что бот остается админом канала и получает события chat_member.';
-  } else if (total >= 5 && noAttr / total >= 0.5) {
-    main = noAttr + ' из ' + total + ' входов без определенного источника.';
-    act = zeroSrc.length ? 'Проверить, что именованные ссылки стоят там, где по ним 0 входов: ' + zeroSrc.join(', ') + '.' : 'Заменить публичное имя канала именованными ссылками во всех оставшихся местах.';
-  } else if (days > 1 && peak && total >= 5 && peak.n / total >= 0.4) {
-    main = 'Пик входов в ' + peak.label + ': ' + peak.n + ' из ' + total + (pubText(peak.k) ? ' (в этот день вышло: ' + pubText(peak.k) + ')' : ' (публикаций бота в этот день не было)') + '.';
-    act = pubText(peak.k) ? 'Источник пика не подтвержден: сверить публикации этого дня с именованными ссылками.' : 'Выяснить, откуда пришел всплеск: публикаций бота в этот день не было.';
-  } else if (total && leaves.length / total >= 0.15 && !leavesPartial) {
-    main = 'Ушло ' + leaves.length + ' из ' + total + ' пришедших.';
-    act = 'Посмотреть, что выходило в Telegram в дни отписок.';
-  } else if (joinsPrev.length >= 5 && total <= joinsPrev.length / 2) {
-    main = 'Входов ' + total + ' против ' + joinsPrev.length + ' неделей раньше.';
-    act = 'Сравнить публикации по дням с прошлой неделей: что перестало выходить.';
-  } else {
-    main = 'Заметных отклонений нет: входов ' + total + ', неделей раньше ' + (joinsPrev.length || 'н/д') + '.';
-    act = 'Ничего не менять, смотреть вклад именованных ссылок.';
+  // 4. ИТОГ: самое заметное изменение недели по относительной величине, без причинных выводов
+  const cands = [];
+  if (growth != null && growth !== 1) {
+    const g = Math.log(growth) * (growth < 1 ? 4.5 : 3), p = Math.round((growth - 1) * 1000) / 10;
+    cands.push({ score: Math.abs(g), main: growth > 1 ? 'Канал вырос на ' + String(p).replace('.', ',') + '% (' + sgn(members - was) + ').' : 'Канал сократился на ' + String(Math.abs(p)).replace('.', ',') + '% (' + sgn(members - was) + ').', act: partial ? 'С 19.10 смотреть источники по именованным ссылкам: за эту неделю причину роста определить нельзя.' : 'Посмотреть, какие ссылки и публикации стоят за изменением.' });
+  } else if (growth == null && joinsPrev.length >= 5 && total > 0) {
+    cands.push({ score: Math.abs(Math.log(total / joinsPrev.length)), main: 'Входов ' + total + ' против ' + joinsPrev.length + ' неделей раньше.', act: 'Сравнить публикации по дням с прошлой неделей.' });
   }
-  lines.push('<b>ВЫВОД</b>');
-  lines.push(esc(main));
-  lines.push('Сделать: ' + esc(act));
+  if (!partial && total > 0 && leaves.length / total >= 0.15) cands.push({ score: 3 * leaves.length / total, main: 'Ушло ' + leaves.length + ' из ' + total + ' пришедших.', act: 'Посмотреть, что выходило в Telegram в дни отписок.' });
+  if (reach) cands.push({ score: Math.abs(Math.log(reach.ratio)), main: 'Охват на пост ' + (reach.ratio < 1 ? 'упал' : 'вырос') + ' на ' + String(Math.abs(Math.round((reach.ratio - 1) * 100))) + '% (' + num(reach.cur) + ' против ' + num(reach.old) + ')' + (thPrev.postsCount && th.postsCount !== thPrev.postsCount ? ' при числе постов ' + thPrev.postsCount + ' → ' + th.postsCount : '') + '.', act: reach.ratio < 1 ? 'Прежде чем менять частоту, посмотреть, какие рубрики дают охват: /rubrics 7.' : 'Посмотреть /rubrics 7: какие рубрики дали рост.' });
+  else if (viewsRatio != null && viewsRatio > 0) cands.push({ score: Math.abs(Math.log(viewsRatio)) * 0.8, main: 'Просмотры Threads ' + pct(viewsRatio) + ' к прошлой неделе.', act: 'Сравнить с числом постов и рубриками: /rubrics 7.' });
+  if (days > 1 && total >= 5 && weekendN / total >= 0.4) cands.push({ score: (weekendN / total - 0.3) * 3, main: 'Выходные дали ' + weekendN + ' из ' + total + ' входов (' + Math.round(weekendN / total * 100) + '%).' + (pubText(dayList.filter(d => d.weekend).map(d => d.k)) ? ' Публикации в эти дни: ' + pubText(dayList.filter(d => d.weekend).map(d => d.k)) + '.' : ' Публикаций бота в эти дни не было.'), act: 'Причина не подтверждена: проверить источники пика по именованным ссылкам.' });
+  else if (days > 1 && total >= 5 && peak && peak.n / total >= 0.4) cands.push({ score: (peak.n / total - 0.2) * 2, main: 'Пик входов: ' + peak.label + ', ' + peak.n + ' из ' + total + '. ' + (pubText(peak.k) ? 'В этот день вышло: ' + pubText(peak.k) + '.' : 'Публикаций бота в этот день не было.'), act: 'Причина не подтверждена: проверить источник пика по именованным ссылкам.' });
+  if (!partial && total >= 5 && (none + old) / total >= 0.5) cands.push({ score: 0.5 * (none + old) / total, main: (none + old) + ' из ' + total + ' входов без определенного источника.', act: 'Проверить, что именованные ссылки стоят во всех профилях и постах: список по каждой в /sources.' });
+  cands.sort((a, b) => b.score - a.score);
+  const top = cands[0] && cands[0].score >= 0.25 ? cands[0] : null;
+  lines.push('<b>ИТОГ</b>');
+  lines.push('Наблюдение: ' + esc(top ? top.main : 'заметных изменений нет.'));
+  lines.push('Действие: ' + esc(top ? top.act : 'ничего не менять.'));
   if (errs.length) { lines.push(''); lines.push('<i>⚠️ ' + esc(errs.join('; ')) + '</i>'); }
   return { text: lines.join('\n'), snapshot, todayStart };
 }
@@ -5259,6 +5271,13 @@ async function handleBotUpdate(update) {
     try { const r = await statsRun({ manual: true }); if (!r) return botSend(msg.chat.id, 'Отчет уже собирается, подожди минуту.'); return; }
     catch (e) { return botSend(msg.chat.id, 'Не получилось собрать отчет: ' + scrubToken(e.message).slice(0, 300)).catch(() => {}); }
   }
+  if (cmd === '/sources') {
+    const days = Math.min(90, Math.max(1, Number((String(msg.text || '').match(/\d+/) || [7])[0]) || 7));
+    try {
+      const joins = await statsQuery('t_join', [{ property: 'Publish At', date: { on_or_after: new Date(Date.now() - days * 86400000).toISOString() } }]);
+      return botSend(msg.chat.id, joinsBreakdown('Входы в канал за ' + days + ' дн.', joins), { disable_web_page_preview: true });
+    } catch (e) { return botSend(msg.chat.id, 'Не получилось: ' + scrubToken(e.message).slice(0, 300)).catch(() => {}); }
+  }
   if (cmd === '/rubrics') {
     const days = Math.min(90, Math.max(1, Number((String(msg.text || '').match(/\d+/) || [7])[0]) || 7));
     try {
@@ -5268,7 +5287,7 @@ async function handleBotUpdate(update) {
     } catch (e) { return botSend(msg.chat.id, 'Не получилось: ' + scrubToken(e.message).slice(0, 300)).catch(() => {}); }
   }
   if (cmd === '/start' || cmd === '/help') {
-    return botSend(msg.chat.id, 'Команды:\n/scheduled: запланированные посты, отмена и публикация сразу.\n/replies 24: найти ответы в Threads за последние 24 часа (число часов можно менять).\n/stats: отчет по Threads и каналу за последние 7 дней (сам приходит по понедельникам).\n/rubrics 7: сводка по рубрикам Threads за 7 дней (число дней можно менять).\n/draft: подготовить черновики Threads на ближайшие дни (автопилот).\n\nСоздавать и планировать посты нужно в приложении (кнопка меню).');
+    return botSend(msg.chat.id, 'Команды:\n/scheduled: запланированные посты, отмена и публикация сразу.\n/replies 24: найти ответы в Threads за последние 24 часа (число часов можно менять).\n/stats: отчет по Threads и каналу за последние 7 дней (сам приходит по понедельникам).\n/rubrics 7: сводка по рубрикам Threads за 7 дней (число дней можно менять).\n/sources 7: откуда пришли подписчики канала по каждой ссылке (полный список, с нулями).\n/draft: подготовить черновики Threads на ближайшие дни (автопилот).\n\nСоздавать и планировать посты нужно в приложении (кнопка меню).');
   }
 }
 
