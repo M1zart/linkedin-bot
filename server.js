@@ -2522,6 +2522,79 @@ async function publishToThreads(text, replyToId) {
   return { id: pub.id, link };
 }
 
+// ── X (Twitter): зеркало Threads. Каждый опубликованный в Threads пост уходит и в X ──
+// Нужны переменные Railway: X_API_KEY, X_API_SECRET, X_ACCESS_TOKEN, X_ACCESS_TOKEN_SECRET (приложение X с правом Read and Write, ключи пользователя @аккаунта).
+// X_MIRROR=off выключает зеркало. Лимит поста 280 по правилам X: ссылка считается как 23 символа, кириллица как 1.
+const X_KEY = process.env.X_API_KEY || '', X_SECRET = process.env.X_API_SECRET || '';
+const X_TOKEN = process.env.X_ACCESS_TOKEN || '', X_TOKEN_SECRET = process.env.X_ACCESS_TOKEN_SECRET || '';
+const X_API = 'https://api.x.com/2';
+const X_MAX = 280;
+const xConfigured = () => !!(X_KEY && X_SECRET && X_TOKEN && X_TOKEN_SECRET);
+const xMirrorOn = () => xConfigured() && process.env.X_MIRROR !== 'off';
+
+function xLength(text) {
+  let n = 0;
+  const t = String(text || '').replace(/https?:\/\/\S+/g, () => { n += 23; return ''; });
+  for (const ch of t) {
+    const c = ch.codePointAt(0);
+    n += (c <= 4351 || (c >= 8192 && c <= 8205) || (c >= 8208 && c <= 8223) || (c >= 8242 && c <= 8247)) ? 1 : 2;
+  }
+  return n;
+}
+
+const xPct = v => encodeURIComponent(v).replace(/[!'()*]/g, c => '%' + c.charCodeAt(0).toString(16).toUpperCase());
+function xAuthHeader(method, url) {
+  const o = { oauth_consumer_key: X_KEY, oauth_nonce: crypto.randomBytes(16).toString('hex'), oauth_signature_method: 'HMAC-SHA1', oauth_timestamp: String(Math.floor(Date.now() / 1000)), oauth_token: X_TOKEN, oauth_version: '1.0' };
+  const norm = Object.keys(o).sort().map(k => xPct(k) + '=' + xPct(o[k])).join('&');
+  const base = [method.toUpperCase(), xPct(url), xPct(norm)].join('&');
+  o.oauth_signature = crypto.createHmac('sha1', xPct(X_SECRET) + '&' + xPct(X_TOKEN_SECRET)).update(base).digest('base64');
+  return 'OAuth ' + Object.keys(o).sort().map(k => xPct(k) + '="' + xPct(o[k]) + '"').join(', ');
+}
+
+async function publishToX(text) {
+  const url = X_API + '/tweets';
+  const resp = await fetch(url, { method: 'POST', headers: { Authorization: xAuthHeader('POST', url), 'Content-Type': 'application/json' }, body: JSON.stringify({ text }) });
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok || !data.data || !data.data.id) {
+    const m = data.detail || data.title || (data.errors && data.errors[0] && data.errors[0].message) || ('HTTP ' + resp.status);
+    throw new Error('X: ' + m);
+  }
+  return { id: data.data.id, link: 'https://x.com/i/status/' + data.data.id };
+}
+
+// Подгоняет пост Threads под 280: ссылка остается отдельной последней строкой, текст при необходимости сжимается моделью без потери мысли
+async function xAdapt(text) {
+  const m = String(text).match(/\n*\s*(https?:\/\/\S+)\s*$/);
+  const url = m ? m[1] : '';
+  let body = (m ? String(text).slice(0, m.index) : String(text)).trim();
+  const room = X_MAX - (url ? 25 : 0) - 3;
+  for (let i = 0; i < 3 && xLength(body) > room; i++) {
+    const system = `Ты редактор. Сократи пост для X до ${room} символов, сохранив мысль, факты и посыл. Ничего не добавляй. Живая связная речь, полные предложения, от первого лица автора. Русский, буква е без точек, без тире (только запятые и двоеточия), без конструкций «не X, а Y», без эмодзи, хэштегов и ссылок. Верни только текст поста.`;
+    const out = await claudeCall(system, `Сейчас ${xLength(body)} символов, нужно не больше ${room}.\n\nТЕКСТ:\n${body}`, 1000);
+    if (!out) break;
+    body = noYo(out.trim()).replace(/\s*[—–]\s*/g, ', ').replace(/\s+-\s+/g, ', ');
+  }
+  if (xLength(body) > room) return null;
+  return url ? body + '\n\n' + url : body;
+}
+
+let xPropOk = false;
+async function xSaveResult(rowId, res) {
+  try {
+    if (!xPropOk) { await notionReq('PATCH', `/v1/data_sources/${NOTION_SCHEDULE_DS_ID}`, { properties: { 'X ID': { rich_text: {} } } }); xPropOk = true; }
+    await notionReq('PATCH', `/v1/pages/${encodeURIComponent(rowId)}`, { properties: { 'X ID': { rich_text: toRichText(String(res.id)) } } });
+  } catch (e) { console.error('x: ID не записан в Notion:', scrubToken(e.message)); }
+}
+
+// Возвращает строку для уведомления владельцу
+async function mirrorToX(row) {
+  const text = await xAdapt(row.text);
+  if (!text) return '⚠️ В X не вышло: текст не удалось уложить в 280 символов, пост остался только в Threads.';
+  const res = await publishToX(text);
+  await xSaveResult(row.id, res);
+  return '𝕏 ' + res.link;
+}
+
 async function tCreate(text, iso, owner, meta) {
   const page = await notionReq('POST', '/v1/pages', {
     parent: { type: 'data_source_id', data_source_id: NOTION_SCHEDULE_DS_ID },
@@ -2566,7 +2639,9 @@ async function runThreadsPost(row, { checkStale = true, notify = true } = {}) {
     // Фиксируем фактическое время выхода (при «опубликовать сейчас» оно отличается от планового): от него считаются 48 часов
     notionReq('PATCH', `/v1/pages/${encodeURIComponent(row.id)}`, { properties: { 'Threads ID': { rich_text: toRichText(String(result.id)) }, 'Publish At': { date: { start: new Date().toISOString() } } } })
       .catch(e => console.error('threads: ID поста не записан:', scrubToken(e.message)));
-    if (notify) await notifyOwner(row, `✅ Опубликовано в Threads${result.link ? '\n' + result.link : ''}\n\n${shortPreview(row.text)}`);
+    let xNote = '';
+    if (xMirrorOn()) xNote = await mirrorToX(row).catch(e => '⚠️ В X не вышло: ' + scrubToken(e.message));
+    if (notify) await notifyOwner(row, `✅ Опубликовано в Threads${result.link ? '\n' + result.link : ''}${xNote ? '\n' + xNote : ''}\n\n${shortPreview(row.text)}`);
     return { status: 'published', link: result.link };
   } finally {
     schedInFlight.delete(row.id);
