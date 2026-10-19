@@ -4149,6 +4149,7 @@ async function handleChatMember(cm) {
   if (!cm || !cm.chat || cm.chat.type !== 'channel') return;
   const was = cm.old_chat_member && cm.old_chat_member.status, now = cm.new_chat_member && cm.new_chat_member.status;
   const wasIn = ['member', 'administrator', 'creator'].includes(was), isIn = ['member', 'administrator', 'creator'].includes(now);
+  if (wasIn && !isIn) { await statsCreateRow('➖ выход из канала', 't_leave', 'leave', new Date().toISOString()); return; }
   if (wasIn || !isIn) return;
   const via = cm.invite_link ? ('link:' + String(cm.invite_link.name || tgLinkCode(cm.invite_link.invite_link) || '?').slice(0, 80)) : 'no-link';
   statsState.joinsSeen++;
@@ -4162,7 +4163,7 @@ function statsParseInsight(data) {
   }
   return out;
 }
-async function statsThreads(fromMs, toMs) {
+async function statsThreads(fromMs, toMs, light) {
   const uid = await threadsUserId();
   const res = { ok: false, needPerm: false };
   try {
@@ -4175,8 +4176,10 @@ async function statsThreads(fromMs, toMs) {
     const posts = ((await threadsReq('GET', `/${uid}/threads`, { fields: 'id,text,timestamp', limit: '30' })).data || [])
       .filter(x => { const t = Date.parse(x.timestamp || 0); return t >= fromMs && t < toMs; });
     res.postsCount = posts.length;
+    res.postDays = {};
+    for (const x of posts) { const w = warsawParts(Date.parse(x.timestamp)); const k = w.y + '-' + w.mo + '-' + w.d; res.postDays[k] = (res.postDays[k] || 0) + 1; }
     let best = null;
-    for (const post of posts.slice(0, 10)) {
+    for (const post of (light ? [] : posts.slice(0, 10))) {
       try {
         const ins = statsParseInsight(await threadsReq('GET', `/${post.id}/insights`, { metric: 'views,likes,replies' }));
         if (!best || (ins.views || 0) > (best.ins.views || 0)) best = { post, ins };
@@ -4206,43 +4209,78 @@ async function buildStatsReport(days = STATS_REPORT_DAYS) {
   const delta = (cur, old) => (cur == null || old == null) ? '' : ` (${cur - old >= 0 ? '+' : ''}${cur - old})`;
 
   const th = threadsConfigured() ? await statsThreads(yStart, todayStart) : { ok: false, error: 'нет THREADS_ACCESS_TOKEN' };
+  const thPrev = th.ok ? await statsThreads(yStart - days * 86400000, yStart, true) : { ok: false };
   const snapshot = { date: new Date(todayStart).toISOString().slice(0, 10) };
   const inPeriod = [
     { property: 'Publish At', date: { on_or_after: new Date(yStart).toISOString() } },
     { property: 'Publish At', date: { before: new Date(todayStart).toISOString() } }
   ];
+  const prevPeriod = [
+    { property: 'Publish At', date: { on_or_after: new Date(yStart - days * 86400000).toISOString() } },
+    { property: 'Publish At', date: { before: new Date(yStart).toISOString() } }
+  ];
+  const dayName = ['вс', 'пн', 'вт', 'ср', 'чт', 'пт', 'сб'];
+  const dayKey = ms => { const w = warsawParts(ms); return w.y + '-' + w.mo + '-' + w.d; };
 
   // Telegram-канал
   let members = null;
   try { members = Number(await tgApi('getChatMemberCount', { chat_id: TELEGRAM_CHANNEL_ID })); } catch (e) { lines.push('Канал: не удалось получить число подписчиков (' + scrubToken(e.message).slice(0, 120) + ')'); }
-  if (members != null) { lines.push('Telegram-канал: ' + members + delta(members, prev && prev.tgMembers)); snapshot.tgMembers = members; }
-  lines.push(joinsBreakdown('Пришли', await statsQuery('t_join', inPeriod)));
+  const joins = await statsQuery('t_join', inPeriod);
+  const leaves = await statsQuery('t_leave', inPeriod);
+  const joinsPrev = await statsQuery('t_join', prevPeriod);
+  if (members != null) {
+    snapshot.tgMembers = members;
+    const was = prev && prev.tgMembers;
+    const pct = was ? ', рост ' + (Math.round((members - was) / was * 1000) / 10).toString().replace('.', ',') + '%' : '';
+    lines.push('Telegram-канал: ' + (was != null ? was + ' → ' : '') + members + delta(members, was) + pct);
+  }
+  lines.push('Пришло ' + joins.length + (joinsPrev.length ? ' (неделей раньше ' + joinsPrev.length + ')' : '') + ', ушло ' + leaves.length);
+  lines.push(joinsBreakdown('Входы', joins));
+  // Входы по дням рядом с постами Threads: это основание для гипотезы, не доказательство
+  const byDay = {};
+  joins.forEach(j => { if (j.publishAt) { const k = dayKey(Date.parse(j.publishAt)); byDay[k] = (byDay[k] || 0) + 1; } });
+  const dayParts = []; let peak = null;
+  for (let i = 0; i < days; i++) {
+    const ms = yStart + i * 86400000 + 12 * 3600000;
+    const w = warsawParts(ms), k = dayKey(ms), n = byDay[k] || 0, pc = (th.ok && th.postDays && th.postDays[k]) || 0;
+    const label = dayName[new Date(Date.UTC(w.y, w.mo - 1, w.d)).getUTCDay()];
+    dayParts.push(label + ' ' + n + (th.ok ? '/' + pc : ''));
+    if (!peak || n > peak.n) peak = { n, label };
+  }
+  if (days > 1) lines.push('По дням (входы' + (th.ok ? ' / посты Threads' : '') + '): ' + dayParts.join(', '));
   lines.push('');
 
   // Threads
   if (th.ok) {
-    const u = th.user || {};
+    const u = th.user || {}, up = (thPrev.ok && thPrev.user) || null;
     const perPost = th.postsCount ? Math.round((u.views || 0) / th.postsCount) : 0;
     lines.push('Threads: подписчики ' + (th.followers != null ? th.followers + delta(th.followers, prev && prev.thFollowers) : 'нет данных'));
     if (th.followers != null) snapshot.thFollowers = th.followers;
-    lines.push('Постов ' + th.postsCount + ', просмотры ' + (u.views || 0) + ' (в среднем ' + perPost + ' на пост), лайки ' + (u.likes || 0) + ', ответы ' + (u.replies || 0) + ', репосты ' + (u.reposts || 0));
-    const rr = await statsQuery('t_reply', inPeriod);
-    const auto = rr.filter(x => x.text === 'auto').length;
-    lines.push('Ответов от бота: сам ' + auto + ', ты кнопкой ' + (rr.length - auto));
+    lines.push('Постов ' + th.postsCount + ', просмотры ' + (u.views || 0) + (up ? ' (неделей раньше ' + (up.views || 0) + ')' : '') + ', в среднем ' + perPost + ' на пост, лайки ' + (u.likes || 0) + ', ответы ' + (u.replies || 0) + ', репосты ' + (u.reposts || 0));
+    if (th.best) lines.push('Лучший пост недели: «' + String(th.best.post.text || '').replace(/\s+/g, ' ').slice(0, 80) + '», просмотров ' + (th.best.ins.views || 0) + ', лайков ' + (th.best.ins.likes || 0) + ', ответов ' + (th.best.ins.replies || 0));
   } else if (th.needPerm) {
     lines.push('Threads: нет доступа к статистике. В приложении Meta добавь право threads_manage_insights, сгенерируй токен заново и обнови THREADS_ACCESS_TOKEN в Railway.');
   } else {
     lines.push('Threads: статистика не получена: ' + String(th.error || 'неизвестная ошибка').slice(0, 200));
   }
+  // X: показываем только если зеркало отстает от Threads (это проверка исправности, не эффективность)
+  if (xConfigured() && th.ok) {
+    const xp = await statsQuery('t_published', [{ property: 'X ID', rich_text: { is_not_empty: true } }, ...inPeriod]).catch(() => []);
+    if (xp.length < th.postsCount) lines.push('X: отзеркалено ' + xp.length + ' из ' + th.postsCount + ', причины смотри в сообщениях бота.');
+  }
   lines.push('');
 
-  // X: только счетчик зеркала из Notion, платные чтения X API не используем
-  if (xConfigured()) {
-    const xp = await statsQuery('t_published', [{ property: 'X ID', rich_text: { is_not_empty: true } }, ...inPeriod]).catch(() => []);
-    lines.push('X: отзеркалено постов ' + xp.length + (th.ok ? ' из ' + th.postsCount : ''));
-    lines.push('');
-  }
-  lines.push('Входы по названиям ссылок считаются с 19.10, раньше бот названий не фиксировал.');
+  // Вывод строго по правилам из данных
+  const total = joins.length, concl = [], next = [];
+  const noAttr = joins.filter(j => j.text === 'no-link' || j.text === 'other-link').length;
+  if (total >= 5 && noAttr / total >= 0.5) { concl.push(noAttr + ' из ' + total + ' пришли без определенного источника: это публичное имя канала, поиск Telegram или пересылки.'); next.push('Проверить, что во всех профилях и постах стоят именованные ссылки.'); }
+  if (days > 1 && peak && total >= 5 && peak.n / total >= 0.4) { concl.push('Пик входов: ' + peak.label + ', ' + peak.n + ' из ' + total + '.'); next.push('Посмотреть, что вышло в этот день в Telegram, Threads и LinkedIn.'); }
+  if (total && leaves.length / total >= 0.15) { concl.push('Ушло ' + leaves.length + ' из ' + total + ' пришедших.'); next.push('Посмотреть, какие посты выходили перед отписками.'); }
+  if (th.ok && ((th.user && th.user.views) || 0) > 0 && !joins.some(j => /thre[a-z]*/i.test(j.text))) concl.push('Из Threads по ссылке 0 входов при ' + th.user.views + ' просмотрах: ссылка стоит только в части постов, это не доказывает, что Threads не работает.');
+  lines.push('Вывод недели: ' + (concl.length ? concl.join(' ') : 'данных пока мало для выводов.'));
+  lines.push('Проверить на следующей неделе: ' + (next.length ? next.join(' ') : 'долю входов по именованным ссылкам.'));
+  lines.push('');
+  lines.push('Входы по названиям ссылок считаются с 19.10, выходы тоже с 19.10: раньше бот их не фиксировал.');
   return { text: lines.join('\n'), snapshot, todayStart };
 }
 
