@@ -2568,13 +2568,14 @@ async function xAdapt(text) {
   const url = m ? m[1] : '';
   let body = (m ? String(text).slice(0, m.index) : String(text)).trim();
   const room = X_MAX - (url ? 25 : 0) - 3;
-  for (let i = 0; i < 3 && xLength(body) > room; i++) {
-    const system = `Ты редактор. Сократи пост для X до ${room} символов, сохранив мысль, факты и посыл. Ничего не добавляй. Живая связная речь, полные предложения, от первого лица автора. Русский, буква е без точек, без тире (только запятые и двоеточия), без конструкций «не X, а Y», без эмодзи, хэштегов и ссылок. Верни только текст поста.`;
-    const out = await claudeCall(system, `Сейчас ${xLength(body)} символов, нужно не больше ${room}.\n\nТЕКСТ:\n${body}`, 1000);
+  const target = Math.max(120, room - 40);   // модели плохо считают символы: просим с запасом
+  for (let i = 0; i < 5 && xLength(body) > room; i++) {
+    const system = `Ты редактор. Сократи пост для X до ${target} символов (жесткий предел ${room}), сохранив мысль, факты и посыл. Ничего не добавляй. Живая связная речь, полные предложения, от первого лица автора. Русский, буква е без точек, без тире (только запятые и двоеточия), без конструкций «не X, а Y», без эмодзи, хэштегов и ссылок. Верни только текст поста.`;
+    const out = await claudeCall(system, `Сейчас ${xLength(body)} символов, нужно не больше ${target}. Убери второстепенные детали и пояснения, оставь главную мысль и вывод.\n\nТЕКСТ:\n${body}`, 1000);
     if (!out) break;
     body = noYo(out.trim()).replace(/\s*[—–]\s*/g, ', ').replace(/\s+-\s+/g, ', ');
   }
-  if (xLength(body) > room) return null;
+  if (xLength(body) > room) { console.error('x: не удалось сжать до', room, 'символов, осталось', xLength(body)); return null; }
   return url ? body + '\n\n' + url : body;
 }
 
