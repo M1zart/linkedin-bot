@@ -842,6 +842,7 @@
     <div class="tone-selector" id="ready-platform">
       <button class="tone-btn selected" data-platform="telegram">Telegram</button>
       <button class="tone-btn" data-platform="linkedin">LinkedIn</button>
+      <button class="tone-btn" data-platform="threads">Threads + X</button>
     </div>
 
     <div id="ready-rubric-block">
@@ -865,6 +866,13 @@
       <option value="15">😏 ВОСКРЕСНОЕ</option>
       <option value="16">🎙 100 ГОЛОСОВ iGAMING</option>
     </select>
+    </div>
+
+    <div id="ready-th-block" style="display:none">
+      <div class="digest-row" id="ready-th-count"></div>
+      <div class="field-label">Когда</div>
+      <div id="ready-th-when"></div>
+      <div class="digest-row">Текст идёт в Threads как есть. В X уйдёт сам при публикации (если не влезает в 280 символов, бот перепишет короче).</div>
     </div>
 
     <button class="generate-btn tg-btn" id="ready-btn" onclick="processReady()">Определить рубрику и оформить</button>
@@ -3332,11 +3340,38 @@
 
     // Под LinkedIn рубрики, хэштега и подписи нет: прячем выбор рубрики и меняем кнопку
     function updateReadyPlatform() {
-      const isTg = getReadyPlatform() === 'telegram';
+      const p = getReadyPlatform(), isTg = p === 'telegram', isTh = p === 'threads';
       document.getElementById('ready-rubric-block').style.display = isTg ? '' : 'none';
+      document.getElementById('ready-th-block').style.display = isTh ? '' : 'none';
       const btn = document.getElementById('ready-btn');
-      btn.textContent = isTg ? 'Определить рубрику и оформить' : 'Оформить для LinkedIn';
-      btn.classList.toggle('tg-btn', isTg);
+      btn.textContent = isTg ? 'Определить рубрику и оформить' : isTh ? 'Поставить в очередь Threads' : 'Оформить для LinkedIn';
+      btn.classList.toggle('tg-btn', isTg || isTh);
+      if (isTh) readyThCount();
+    }
+
+    // Готовый пост для Threads (и X): ставим в очередь как есть, без переписывания
+    const readyPk = thPicker('');
+    document.getElementById('ready-th-when').appendChild(readyPk.el);
+    function readyThCount() {
+      const n = thLen(document.getElementById('newsquote-input').value);
+      const c = document.getElementById('ready-th-count');
+      c.textContent = n + ' из ' + TH_MAX; c.style.color = n > TH_MAX ? 'var(--red)' : '';
+    }
+    document.getElementById('newsquote-input').addEventListener('input', () => { if (getReadyPlatform() === 'threads') readyThCount(); });
+    async function readyToThreads() {
+      const ta = document.getElementById('newsquote-input');
+      const text = ta.value.trim();
+      if (!text) { showToast('Вставь текст поста', true); return; }
+      if (thLen(text) > TH_MAX) { showToast('Длиннее ' + TH_MAX + ' символов', true); return; }
+      if (thState.busy) return;
+      const btn = document.getElementById('ready-btn');
+      const w = readyPk.get();
+      thState.busy = true; btn.disabled = true; btn.textContent = 'Ставлю…';
+      try {
+        await queueCall('/api/threads-schedule', { method: 'POST', body: JSON.stringify({ items: [{ text, when: w.when, slot: w.slot }] }) });
+        showToast('В очереди Threads'); ta.value = ''; readyThCount(); thLoadQueue();
+      } catch (e) { showToast(thErr(e), true); }
+      finally { thState.busy = false; btn.disabled = false; updateReadyPlatform(); }
     }
 
     document.querySelectorAll('#ready-platform .tone-btn').forEach(b => b.addEventListener('click', updateReadyPlatform));
@@ -3344,6 +3379,7 @@
     // Готовый текст идёт в ту же цепочку, что и сгенерированный: Telegram — рубрика, акценты, хэштег, подпись;
     // LinkedIn — только разбивка на абзацы и маркеры
     function processReady() {
+      if (getReadyPlatform() === 'threads') { readyToThreads(); return; }
       originMode = 'newsquote';
       resetCover();
       const text = document.getElementById('newsquote-input').value;
