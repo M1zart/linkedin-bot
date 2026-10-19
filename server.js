@@ -1779,6 +1779,7 @@ function getRubricFormatSystemPrompt() {
 Добавлять новые тезисы, цифры, факты которых не было в оригинале.
 Добавлять больше одного хэштега.
 Использовать символ ">" где бы то ни было в тексте.
+Трогать ссылки вида [текст](https://адрес): переносить их в ответ символ в символ, не менять текст и адрес, не убирать скобки, не выделять жирным и не вставлять внутрь них акценты.
 Выделять жирным голую цифру без контекста.
 Оставлять хэштег и подпись слипшимися без отступа между ними.
 
@@ -1879,15 +1880,26 @@ function verifyTelegramInitData(initData) {
   return { ok: true, userId: String(user.id) };
 }
 
-// Жирный из **текст** в HTML-теги Telegram; всё остальное экранируется, чтобы <, > и & в посте не ломали разметку
+// Гиперссылка в тексте поста: [текст](https://адрес). Адрес только http(s) или tg://, без пробелов и кавычек
+const MD_LINK_RE = /\[([^\[\]\n]+?)\]\(\s*((?:https?:\/\/|tg:\/\/)[^\s()"<>]+(?:\([^\s()"<>]*\)[^\s()"<>]*)*)\s*\)/g;
+
+// Жирный из **текст** и ссылки из [текст](адрес) в HTML-теги Telegram; всё остальное экранируется, чтобы <, > и & в посте не ломали разметку
 function toTelegramHtml(md) {
   const escaped = md.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-  return escaped.replace(/\*\*([^\n]+?)\*\*/g, '<b>$1</b>');
+  // Ссылки первыми: после экранирования & в адресе уже &amp;, это то, что нужно внутри href
+  return escaped
+    .replace(MD_LINK_RE, (_, label, url) => `<a href="${url}">${label}</a>`)
+    .replace(/\*\*([^\n]+?)\*\*/g, '<b>$1</b>');
+}
+
+// Текст без разметки: на случай, если Telegram разметку не принял. Ссылка остаётся видимой: «текст (адрес)»
+function stripPostMarkup(text) {
+  return String(text).replace(MD_LINK_RE, '$1 ($2)').replace(/\*\*/g, '');
 }
 
 // Длина текста, которую считает Telegram (после разбора разметки)
 function visibleLength(html) {
-  return html.replace(/<\/?b>/g, '').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&').length;
+  return html.replace(/<\/?(?:b|a)(?: href="[^"]*")?>/g, '').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&').length;
 }
 
 function channelLink(messageId) {
@@ -1921,7 +1933,7 @@ async function sendTextToChannel(text, askButton = false, previewUrl = null) {
   } catch (e) {
     // Разметка не принята: публикуем обычным текстом без звёздочек (до этого ничего не отправлено)
     if (/can't parse entities/i.test(e.message)) {
-      return tgApi('sendMessage', { chat_id: TELEGRAM_CHANNEL_ID, text: text.replace(/\*\*/g, ''), ...extra });
+      return tgApi('sendMessage', { chat_id: TELEGRAM_CHANNEL_ID, text: stripPostMarkup(text), ...extra });
     }
     throw e;
   }
@@ -1943,7 +1955,7 @@ async function sendPhotoToChannel(photo, captionText, askButton = false) {
     return await tgApi('sendPhoto', build(captionText ? toTelegramHtml(captionText) : null, true), true);
   } catch (e) {
     if (captionText && /can't parse entities/i.test(e.message)) {
-      return tgApi('sendPhoto', build(captionText.replace(/\*\*/g, ''), false), true);
+      return tgApi('sendPhoto', build(stripPostMarkup(captionText), false), true);
     }
     throw e;
   }

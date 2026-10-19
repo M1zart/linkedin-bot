@@ -289,6 +289,14 @@
       overflow: hidden;
     }
 
+    .link-tools { display: none; margin-bottom: 8px; }
+    .link-tools .action-btn { width: auto; }
+    .link-tools .link-row { gap: 6px; margin-top: 8px; align-items: center; }
+    .link-tools .link-row input { flex: 1; min-width: 0; }
+    .link-tools .muted-note { margin-top: 6px; font-size: 12px; }
+
+    .queue-text a { color: var(--tg); text-decoration: underline; }
+
     .result-box.tg-result textarea:focus,
     .result-box.tg-result select:focus {
       border-color: var(--tg);
@@ -962,6 +970,15 @@
 
     <div class="editor-body">
       <div class="field-label">Текст</div>
+      <div class="link-tools" id="link-tools">
+        <button type="button" class="action-btn" id="link-btn">🔗 Ссылка</button>
+        <div class="link-row" id="link-row" style="display:none;">
+          <input type="text" id="link-url" inputmode="url" autocapitalize="off" autocorrect="off" placeholder="https://… адрес ссылки" />
+          <button type="button" class="action-btn" id="link-apply">Вставить</button>
+          <button type="button" class="action-btn" id="link-cancel">Отмена</button>
+        </div>
+        <div class="muted-note" id="link-hint">Выдели слова в тексте и нажми «Ссылка», либо вставь адрес поверх выделенных слов. В тексте это выглядит как [слова](адрес), в канале будет гиперссылка.</div>
+      </div>
       <textarea id="result-text" spellcheck="true" lang="ru" autocorrect="on"></textarea>
 
       <div id="rubric-section">
@@ -1332,6 +1349,9 @@
       document.getElementById('rubric-section').style.display = isTg && lastMode !== 'newsquote' ? '' : 'none';
       // Публикация в канал только для Telegram-постов; у LinkedIn остаётся копирование
       document.getElementById('publish-row').style.display = isTg ? 'flex' : 'none';
+      // Гиперссылки только для Telegram (LinkedIn их из текста не делает)
+      document.getElementById('link-tools').style.display = isTg ? 'block' : 'none';
+      if (!isTg) document.getElementById('link-cancel').click();
 
       box.classList.add('show');
       document.body.classList.add('editor-open');
@@ -1375,6 +1395,63 @@
       autoGrow(e.target);
       document.getElementById('char-count').textContent = lastGenerated.length + ' символов';
     });
+
+    // ===== ГИПЕРССЫЛКИ: выделил слова, добавил адрес, в тексте появилось [слова](адрес); сервер при публикации делает из этого ссылку Telegram =====
+    (function () {
+      const ta = document.getElementById('result-text');
+      const btn = document.getElementById('link-btn');
+      const row = document.getElementById('link-row');
+      const urlInput = document.getElementById('link-url');
+      const URL_RE = /^(?:https?:\/\/|tg:\/\/)[^\s()"<>]+$/i;
+      let saved = null; // выделение запоминаем: при фокусе на поле адреса textarea его теряет
+
+      function normalizeUrl(raw) {
+        let u = String(raw || '').trim();
+        if (!u) return '';
+        if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(u)) u = 'https://' + u;
+        return URL_RE.test(u) ? u : '';
+      }
+
+      // Заворачивает диапазон [from, to) в [текст](адрес). Скобки внутри текста заменяем, чтобы не ломать разметку
+      function wrapAsLink(from, to, url) {
+        const label = ta.value.slice(from, to).replace(/[\[\]]/g, '').replace(/\s*\n\s*/g, ' ');
+        const md = `[${label}](${url})`;
+        ta.value = ta.value.slice(0, from) + md + ta.value.slice(to);
+        ta.setSelectionRange(from + md.length, from + md.length);
+        ta.dispatchEvent(new Event('input', { bubbles: true }));
+      }
+
+      function closeRow() { row.style.display = 'none'; urlInput.value = ''; saved = null; }
+
+      btn.addEventListener('click', () => {
+        const from = ta.selectionStart, to = ta.selectionEnd;
+        if (from === to) { showToast('Сначала выдели в тексте слова для ссылки', true); return; }
+        saved = { from, to };
+        row.style.display = 'flex';
+        urlInput.focus();
+      });
+
+      document.getElementById('link-apply').addEventListener('click', () => {
+        const url = normalizeUrl(urlInput.value);
+        if (!url) { showToast('Нужен адрес вида https://…', true); return; }
+        if (!saved) { closeRow(); return; }
+        wrapAsLink(saved.from, saved.to, url);
+        closeRow();
+        showToast('Ссылка вставлена');
+      });
+
+      document.getElementById('link-cancel').addEventListener('click', closeRow);
+
+      // Вставка адреса поверх выделенных слов сразу делает из них ссылку
+      ta.addEventListener('paste', (e) => {
+        const from = ta.selectionStart, to = ta.selectionEnd;
+        if (from === to) return;
+        const pasted = ((e.clipboardData && e.clipboardData.getData('text')) || '').trim();
+        if (!URL_RE.test(pasted)) return;
+        e.preventDefault();
+        wrapAsLink(from, to, pasted);
+      });
+    })();
 
     // Список рубрик в редакторе берётся из вкладки «Готовый», чтобы он был один (только справочник, не состояние)
     document.getElementById('editor-rubric-select').innerHTML = document.getElementById('rubric-select').innerHTML;
@@ -2145,13 +2222,23 @@
     function renderTgText(el, text) {
       el.textContent = '';
       const src = String(text || '').trim();
-      const re = /\*\*([^\n]+?)\*\*/g;
+      // Жирный **текст** и ссылки [текст](адрес), как их соберет сервер
+      const re = /\*\*([^\n]+?)\*\*|\[([^\[\]\n]+?)\]\(\s*((?:https?:\/\/|tg:\/\/)[^\s()"<>]+)\s*\)/g;
       let last = 0, m;
       while ((m = re.exec(src))) {
         if (m.index > last) el.appendChild(document.createTextNode(src.slice(last, m.index)));
-        const b = document.createElement('b');
-        b.textContent = m[1];
-        el.appendChild(b);
+        if (m[3]) {
+          const a = document.createElement('a');
+          a.textContent = m[2];
+          a.href = m[3];
+          a.target = '_blank';
+          a.rel = 'noopener noreferrer';
+          el.appendChild(a);
+        } else {
+          const b = document.createElement('b');
+          b.textContent = m[1];
+          el.appendChild(b);
+        }
         last = m.index + m[0].length;
       }
       if (last < src.length) el.appendChild(document.createTextNode(src.slice(last)));
