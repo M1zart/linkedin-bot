@@ -2640,7 +2640,8 @@ async function runThreadsPost(row, { checkStale = true, notify = true } = {}) {
     notionReq('PATCH', `/v1/pages/${encodeURIComponent(row.id)}`, { properties: { 'Threads ID': { rich_text: toRichText(String(result.id)) }, 'Publish At': { date: { start: new Date().toISOString() } } } })
       .catch(e => console.error('threads: ID поста не записан:', scrubToken(e.message)));
     let xNote = '';
-    if (xMirrorOn()) xNote = await mirrorToX(row).catch(e => '⚠️ В X не вышло: ' + scrubToken(e.message));
+    if (xMirrorOn()) xNote = await mirrorToX(row).catch(e => { const m = scrubToken(e.message); console.error('x: зеркало не вышло:', m); return '⚠️ В X не вышло: ' + m; });
+    if (xNote && !notify) await notifyOwner(row, xNote).catch(() => {});   // «опубликовать сразу» без уведомления: результат X все равно присылаем
     if (notify) await notifyOwner(row, `✅ Опубликовано в Threads${result.link ? '\n' + result.link : ''}${xNote ? '\n' + xNote : ''}\n\n${shortPreview(row.text)}`);
     return { status: 'published', link: result.link };
   } finally {
