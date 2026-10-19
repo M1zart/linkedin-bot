@@ -4125,12 +4125,20 @@ async function statsQuery(status, extraFilters = [], direction = 'descending', s
 }
 
 // Вход в канал: пишем строку в Notion. Нужен chat_member в allowed_updates вебхука и права админа у бота
+const joinLabel = v => v === 'threads' ? 'Threads (старый учет)' : v === 'other-link' ? 'другие ссылки (до учета по названиям)' : v === 'no-link' ? 'без ссылки (поиск, публичное имя, пересылки)' : String(v || '').replace(/^link:/, '') || 'без названия';
+function joinsBreakdown(title, joins) {
+  if (!joins.length) return title + ': входов нет.';
+  const by = {};
+  for (const j of joins) { const k = joinLabel(j.text); by[k] = (by[k] || 0) + 1; }
+  const parts = Object.entries(by).sort((a, b) => b[1] - a[1]).map(([k, n]) => k + ' ' + n);
+  return title + ': ' + joins.length + '. По источникам: ' + parts.join(', ') + '.';
+}
 async function handleChatMember(cm) {
   if (!cm || !cm.chat || cm.chat.type !== 'channel') return;
   const was = cm.old_chat_member && cm.old_chat_member.status, now = cm.new_chat_member && cm.new_chat_member.status;
   const wasIn = ['member', 'administrator', 'creator'].includes(was), isIn = ['member', 'administrator', 'creator'].includes(now);
   if (wasIn || !isIn) return;
-  const via = cm.invite_link ? (isThreadsInvite(cm.invite_link) ? 'threads' : 'other-link') : 'no-link';
+  const via = cm.invite_link ? ('link:' + String(cm.invite_link.name || tgLinkCode(cm.invite_link.invite_link) || '?').slice(0, 80)) : 'no-link';
   statsState.joinsSeen++;
   await statsCreateRow('➕ вход в канал', 't_join', via, new Date().toISOString());
 }
@@ -4216,11 +4224,9 @@ async function buildStatsReport(days = STATS_REPORT_DAYS) {
     { property: 'Publish At', date: { on_or_after: new Date(yStart).toISOString() } },
     { property: 'Publish At', date: { before: new Date(todayStart).toISOString() } }
   ]);
-  const fromThreads = joins.filter(j => j.text === 'threads').length;
-  lines.push(`Пришли по ссылке из Threads: ${fromThreads}. Через другие ссылки или поиск: ${joins.length - fromThreads}.`);
+  lines.push(joinsBreakdown('Пришли в канал', joins));
   const joinsToday = await statsQuery('t_join', [{ property: 'Publish At', date: { on_or_after: new Date(todayStart).toISOString() } }]);
-  const thToday = joinsToday.filter(j => j.text === 'threads').length;
-  lines.push(`Сегодня с начала дня: по ссылке из Threads ${thToday}, остальные ${joinsToday.length - thToday}.`);
+  lines.push(joinsBreakdown('Сегодня с начала дня', joinsToday));
   lines.push('Входы считаются с момента, когда бот начал получать эти события.');
   return { text: lines.join('\n'), snapshot, todayStart };
 }
