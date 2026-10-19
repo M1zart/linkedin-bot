@@ -2543,9 +2543,10 @@ function xLength(text) {
 }
 
 const xPct = v => encodeURIComponent(v).replace(/[!'()*]/g, c => '%' + c.charCodeAt(0).toString(16).toUpperCase());
-function xAuthHeader(method, url) {
+function xAuthHeader(method, url, extra) {
   const o = { oauth_consumer_key: X_KEY, oauth_nonce: crypto.randomBytes(16).toString('hex'), oauth_signature_method: 'HMAC-SHA1', oauth_timestamp: String(Math.floor(Date.now() / 1000)), oauth_token: X_TOKEN, oauth_version: '1.0' };
-  const norm = Object.keys(o).sort().map(k => xPct(k) + '=' + xPct(o[k])).join('&');
+  const all = Object.assign({}, o, extra || {});
+  const norm = Object.keys(all).sort().map(k => xPct(k) + '=' + xPct(all[k])).join('&');
   const base = [method.toUpperCase(), xPct(url), xPct(norm)].join('&');
   o.oauth_signature = crypto.createHmac('sha1', xPct(X_SECRET) + '&' + xPct(X_TOKEN_SECRET)).update(base).digest('base64');
   return 'OAuth ' + Object.keys(o).sort().map(k => xPct(k) + '="' + xPct(o[k]) + '"').join(', ');
@@ -2560,6 +2561,15 @@ async function publishToX(text) {
     throw new Error('X: ' + m);
   }
   return { id: data.data.id, link: 'https://x.com/i/status/' + data.data.id };
+}
+
+async function xFollowers() {
+  const url = X_API + '/users/me';
+  const resp = await fetch(url + '?user.fields=public_metrics', { headers: { Authorization: xAuthHeader('GET', url, { 'user.fields': 'public_metrics' }) } });
+  const data = await resp.json().catch(() => ({}));
+  const pm = data && data.data && data.data.public_metrics;
+  if (!resp.ok || !pm) throw new Error('X: ' + (data.detail || data.title || ('HTTP ' + resp.status)));
+  return pm.followers_count;
 }
 
 // Подгоняет пост Threads под 280: ссылка остается отдельной последней строкой, текст при необходимости сжимается моделью без потери мысли
@@ -4126,11 +4136,13 @@ async function statsQuery(status, extraFilters = [], direction = 'descending', s
 
 // Вход в канал: пишем строку в Notion. Нужен chat_member в allowed_updates вебхука и права админа у бота
 const joinLabel = v => v === 'threads' ? 'Threads (старый учет)' : v === 'other-link' ? 'другие ссылки (до учета по названиям)' : v === 'no-link' ? 'без ссылки (поиск, публичное имя, пересылки)' : String(v || '').replace(/^link:/, '') || 'без названия';
+const JOIN_SOURCES = process.env.JOIN_SOURCES ? process.env.JOIN_SOURCES.split('|') : ['Linkedin. Post', 'Linkedin. Info and Featured', 'Tribuna.UA. Post', 'Threds bio', 'Threds Post', 'X', 'без ссылки (поиск, публичное имя, пересылки)'];
 function joinsBreakdown(title, joins) {
-  if (!joins.length) return title + ': входов нет.';
+  const norm = s => String(s).toLowerCase().replace(/\s+/g, ' ').trim();
   const by = {};
-  for (const j of joins) { const k = joinLabel(j.text); by[k] = (by[k] || 0) + 1; }
-  const parts = Object.entries(by).sort((a, b) => b[1] - a[1]).map(([k, n]) => k + ' ' + n);
+  for (const j of joins) { const k0 = joinLabel(j.text); const k = JOIN_SOURCES.find(s => norm(s) === norm(k0)) || k0; by[k] = (by[k] || 0) + 1; }
+  for (const s of JOIN_SOURCES) if (!(s in by)) by[s] = 0;
+  const parts = Object.entries(by).sort((x, y) => y[1] - x[1]).map(([k, n]) => k + ' ' + n);
   return title + ': ' + joins.length + '. По источникам: ' + parts.join(', ') + '.';
 }
 async function handleChatMember(cm) {
@@ -4195,39 +4207,42 @@ async function buildStatsReport(days = STATS_REPORT_DAYS) {
 
   const th = threadsConfigured() ? await statsThreads(yStart, todayStart) : { ok: false, error: 'нет THREADS_ACCESS_TOKEN' };
   const snapshot = { date: new Date(todayStart).toISOString().slice(0, 10) };
+  const inPeriod = [
+    { property: 'Publish At', date: { on_or_after: new Date(yStart).toISOString() } },
+    { property: 'Publish At', date: { before: new Date(todayStart).toISOString() } }
+  ];
+
+  // Telegram-канал
+  let members = null;
+  try { members = Number(await tgApi('getChatMemberCount', { chat_id: TELEGRAM_CHANNEL_ID })); } catch (e) { lines.push('Канал: не удалось получить число подписчиков (' + scrubToken(e.message).slice(0, 120) + ')'); }
+  if (members != null) { lines.push('Telegram-канал: ' + members + delta(members, prev && prev.tgMembers)); snapshot.tgMembers = members; }
+  lines.push(joinsBreakdown('Пришли', await statsQuery('t_join', inPeriod)));
+  lines.push('');
+
+  // Threads
   if (th.ok) {
     const u = th.user || {};
-    lines.push('Threads', `Просмотры ${u.views || 0}, лайки ${u.likes || 0}, ответы ${u.replies || 0}, репосты ${u.reposts || 0}, цитаты ${u.quotes || 0}`);
-    lines.push(`Вышло постов: ${th.postsCount}`);
-    {
-      const rr = await statsQuery('t_reply', [
-        { property: 'Publish At', date: { on_or_after: new Date(yStart).toISOString() } },
-        { property: 'Publish At', date: { before: new Date(todayStart).toISOString() } }
-      ]);
-      const auto = rr.filter(x => x.text === 'auto').length;
-      lines.push(`Ответов от бота в Threads: сам ${auto}, ты кнопкой ${rr.length - auto}`);
-    }
-    if (th.followers != null) { lines.push(`Подписчиков в Threads: ${th.followers}${delta(th.followers, prev && prev.thFollowers)}`); snapshot.thFollowers = th.followers; }
-    if (th.best) lines.push(`Лучший пост ${days === 1 ? 'дня' : 'недели'} (его цифры за все время): «${String(th.best.post.text || '').replace(/\s+/g, ' ').slice(0, 80)}», просмотров ${th.best.ins.views || 0}, лайков ${th.best.ins.likes || 0}, ответов ${th.best.ins.replies || 0}`);
+    const perPost = th.postsCount ? Math.round((u.views || 0) / th.postsCount) : 0;
+    lines.push('Threads: подписчики ' + (th.followers != null ? th.followers + delta(th.followers, prev && prev.thFollowers) : 'нет данных'));
+    if (th.followers != null) snapshot.thFollowers = th.followers;
+    lines.push('Постов ' + th.postsCount + ', просмотры ' + (u.views || 0) + ' (в среднем ' + perPost + ' на пост), лайки ' + (u.likes || 0) + ', ответы ' + (u.replies || 0) + ', репосты ' + (u.reposts || 0));
+    const rr = await statsQuery('t_reply', inPeriod);
+    const auto = rr.filter(x => x.text === 'auto').length;
+    lines.push('Ответов от бота: сам ' + auto + ', ты кнопкой ' + (rr.length - auto));
   } else if (th.needPerm) {
-    lines.push('Threads', 'Нет доступа к статистике. В приложении Meta добавь право threads_manage_insights, сгенерируй токен заново и обнови THREADS_ACCESS_TOKEN в Railway.');
+    lines.push('Threads: нет доступа к статистике. В приложении Meta добавь право threads_manage_insights, сгенерируй токен заново и обнови THREADS_ACCESS_TOKEN в Railway.');
   } else {
-    lines.push('Threads', 'Статистика не получена: ' + String(th.error || 'неизвестная ошибка').slice(0, 200));
+    lines.push('Threads: статистика не получена: ' + String(th.error || 'неизвестная ошибка').slice(0, 200));
   }
   lines.push('');
 
-  // Канал
-  let members = null;
-  try { members = Number(await tgApi('getChatMemberCount', { chat_id: TELEGRAM_CHANNEL_ID })); } catch (e) { lines.push('Канал: не удалось получить число подписчиков (' + scrubToken(e.message).slice(0, 120) + ')'); }
-  if (members != null) { lines.push(`Подписчиков в канале: ${members}${delta(members, prev && prev.tgMembers)}`); snapshot.tgMembers = members; }
-  const joins = await statsQuery('t_join', [
-    { property: 'Publish At', date: { on_or_after: new Date(yStart).toISOString() } },
-    { property: 'Publish At', date: { before: new Date(todayStart).toISOString() } }
-  ]);
-  lines.push(joinsBreakdown('Пришли в канал', joins));
-  const joinsToday = await statsQuery('t_join', [{ property: 'Publish At', date: { on_or_after: new Date(todayStart).toISOString() } }]);
-  lines.push(joinsBreakdown('Сегодня с начала дня', joinsToday));
-  lines.push('Входы считаются с момента, когда бот начал получать эти события.');
+  // X: только счетчик зеркала из Notion, платные чтения X API не используем
+  if (xConfigured()) {
+    const xp = await statsQuery('t_published', [{ property: 'X ID', rich_text: { is_not_empty: true } }, ...inPeriod]).catch(() => []);
+    lines.push('X: отзеркалено постов ' + xp.length + (th.ok ? ' из ' + th.postsCount : ''));
+    lines.push('');
+  }
+  lines.push('Входы по названиям ссылок считаются с 19.10, раньше бот названий не фиксировал.');
   return { text: lines.join('\n'), snapshot, todayStart };
 }
 
@@ -4235,18 +4250,14 @@ async function statsRun({ manual = false } = {}) {
   if (statsState.running) return null;
   statsState.running = true; statsState.lastRunAt = new Date().toISOString();
   try {
+    const np0 = warsawParts(Date.now()), dayStart0 = warsawToUtcMs(np0.y, np0.mo, np0.d, 0, 0);
+    if (!manual) { const done = await statsQuery('t_stats', [{ property: 'Publish At', date: { on_or_after: new Date(dayStart0).toISOString() } }], 'descending', 1); if (done.length) return null; }   // уже считали сегодня: защита от двойного запуска
     await refreshPostMetrics().catch(e => console.error('rubrics refresh:', scrubToken(e.message)));
     const rep = await buildStatsReport();
-    // Каждый день бот только обновляет цифры и пишет снимок; сообщения уходят раз в неделю (STATS_WEEKDAY, по умолчанию понедельник) или по запросу
+    if (!manual) await statsCreateRow('📊 ' + rep.snapshot.date, 't_stats', JSON.stringify(rep.snapshot), new Date().toISOString());
+    // Каждый день бот пишет снимок; сообщение уходит раз в неделю (STATS_WEEKDAY, по умолчанию понедельник) или по запросу. Рубрики и модерация: команды /rubrics и /stats
     const reportDay = (wp => new Date(Date.UTC(wp.y, wp.mo - 1, wp.d)).getUTCDay())(warsawParts(Date.now())) === STATS_WEEKDAY;
     if (manual || reportDay) for (const u of TELEGRAM_ALLOWED_USER_IDS) await botSend(Number(u), rep.text, { disable_web_page_preview: true });
-    if (!manual && reportDay) {
-      const rr = await buildRubricReport(7).catch(e => 'Сводка по рубрикам не собралась: ' + scrubToken(e.message).slice(0, 200));
-      for (const u of TELEGRAM_ALLOWED_USER_IDS) await botSend(Number(u), rr, { disable_web_page_preview: true });
-      const mr = await apModerationReport(7).catch(() => null);
-      if (mr) for (const u of TELEGRAM_ALLOWED_USER_IDS) await botSend(Number(u), mr);
-    }
-    if (!manual) await statsCreateRow('📊 ' + rep.snapshot.date, 't_stats', JSON.stringify(rep.snapshot), new Date().toISOString());
     statsState.lastError = null;
     return rep;
   } catch (e) {
