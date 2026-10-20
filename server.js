@@ -2350,6 +2350,7 @@ async function setupTelegramBot() {
     { command: 'stats', description: 'Отчет за 7 дней' },
     { command: 'rubrics', description: 'Рубрики Threads за N дней' },
     { command: 'menu', description: 'Голоса: приглашение, согласование, финиш' },
+    { command: 'suggest', description: 'Подборка «Что почитать из архива»' },
     { command: 'help', description: 'Что умеет бот' }
   ] });
   webhookState.status = 'active';
@@ -2429,6 +2430,16 @@ async function rescheduleRow(row, newIso) {
 }
 const cardText = row => `🕒 ${formatWarsaw(row.publishAt)} (Варшава)\n\n${shortPreview(row.text, 500)}`;
 const botSend = (chatId, text, extra = {}) => tgApi('sendMessage', { chat_id: chatId, text, ...extra });
+
+// Еженедельная подборка «Что почитать из архива» (archive-picker.js, callback-префикс «ar:», команды /suggest и /status)
+const archivePicker = require('./archive-picker')({
+  tgApi: (...a) => tgApi(...a),
+  botSend: (...a) => botSend(...a),
+  notionReq: (...a) => notionReq(...a),
+  scrubToken: m => scrubToken(m),
+  owners: () => TELEGRAM_ALLOWED_USER_IDS,
+  channelId: () => TELEGRAM_CHANNEL_ID
+});
 
 async function sendScheduledList(chatId, userId) {
   const rows = await schedQuery({ and: [statusIs('scheduled'), { property: 'Owner', number: { equals: Number(userId) } }] }, 50);
@@ -5215,6 +5226,7 @@ async function handleBotUpdate(update) {
   if (update.callback_query) {
     if (/^iv:/.test(String(update.callback_query.data || ''))) return handleInviteCallback(update.callback_query).catch(e => console.error('invite cb:', scrubToken(e.message)));
     if (/^vo:/.test(String(update.callback_query.data || ''))) return handleVoiceCallback(update.callback_query).catch(e => console.error('voice cb:', scrubToken(e.message)));
+    if (/^ar:/.test(String(update.callback_query.data || ''))) return archivePicker.handleCallback(update.callback_query).catch(e => console.error('archive cb:', scrubToken(e.message)));
     if (/^ap:/.test(String(update.callback_query.data || ''))) return handleApCallback(update.callback_query).catch(e => console.error('autopilot cb:', scrubToken(e.message)));
     if (/^cx:\d+$/.test(String(update.callback_query.data || ''))) return handleCommentCallback(update.callback_query);
     if (/^(tp:\d+:\d+|tm:\d+)$/.test(String(update.callback_query.data || ''))) return handleThreadsReplyCallback(update.callback_query);
@@ -5230,6 +5242,7 @@ async function handleBotUpdate(update) {
   if (!TELEGRAM_ALLOWED_USER_IDS.includes(userId)) {
     return botSend(msg.chat.id, `Нет доступа. Твой Telegram ID: ${userId}`);
   }
+  if (msg.text && await archivePicker.handleMessage(msg).catch(e => { console.error('archive msg:', scrubToken(e.message)); return false; })) return;
   if (msg.text && voiceDonePending.has(userId)) {
     if (msg.text.startsWith('/')) voiceDonePending.delete(userId);
     else {
@@ -5392,4 +5405,5 @@ Substack — профессиональный канал для практико
 server.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
   startScheduling();
+  archivePicker.start();
 });
