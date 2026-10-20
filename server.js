@@ -4948,7 +4948,9 @@ function voiceInviteText(roleKey) {
   ].join('\n\n');
 }
 
-const VOICE_DONE_TEXT = () => 'Выпуск с твоим голосом вышел. Полная версия в моем Telegram: ' + VOICE_HERO_TG_URL + ' Короткая в LinkedIn: ' + VOICE_HERO_LI_URL + ' Спасибо, что поделился опытом. Будет здорово, если отправишь выпуск коллегам.';
+// Текст герою после выхода выпуска: ссылки на посты, просьба поделиться и вопрос про следующего героя
+const voiceDonePending = new Map(); // userId -> номер голоса, ждем ссылки на посты
+const voiceDoneText = (tgUrl, liUrl) => 'Выпуск с твоим голосом вышел.\n\nПолная версия в Telegram: ' + tgUrl + '\nКороткая в LinkedIn: ' + liUrl + '\n\nСпасибо, что поделился опытом. Будет здорово, если отправишь выпуск коллегам.\n\nИ вопрос: кого из коллег по индустрии стоило бы позвать следующим? Любая роль, в том числе из другой части бизнеса.';
 
 const voiceMenuMain = () => ({ inline_keyboard: [
   [{ text: '✉️ Приглашение герою', callback_data: 'iv:i' }],
@@ -4990,7 +4992,10 @@ async function handleInviteCallback(cb) {
     if (a === 'h') return await edit('Чей текст отправляем на согласование?', { inline_keyboard: await voiceListButtons('H') });
     if (a === 'd') return await edit('Чей выпуск вышел?', { inline_keyboard: await voiceListButtons('D') });
     if (a === 'H') return await voiceHeroSend(chatId, Number(b));
-    if (a === 'D') return await botSend(chatId, VOICE_DONE_TEXT(), { disable_web_page_preview: true });
+    if (a === 'D') {
+      voiceDonePending.set(String(cb.from.id), Number(b));
+      return await botSend(chatId, 'Пришли одним сообщением ссылки на посты этого выпуска: сначала Telegram, потом LinkedIn. Если ссылка на LinkedIn пока не готова, пришли только Telegram, подставлю ссылку на профиль. Отмена: любая команда, например /menu.');
+    }
   } catch (e) { return botSend(chatId, 'Не получилось: ' + scrubToken(e.message).slice(0, 200)).catch(() => {}); }
 }
 
@@ -5224,6 +5229,15 @@ async function handleBotUpdate(update) {
   const userId = String(msg.from.id);
   if (!TELEGRAM_ALLOWED_USER_IDS.includes(userId)) {
     return botSend(msg.chat.id, `Нет доступа. Твой Telegram ID: ${userId}`);
+  }
+  if (msg.text && voiceDonePending.has(userId)) {
+    if (msg.text.startsWith('/')) voiceDonePending.delete(userId);
+    else {
+      const urls = msg.text.match(/https?:\/\/\S+/g) || [];
+      if (!urls.length) return botSend(msg.chat.id, 'Не вижу ссылок. Пришли ссылку на пост в Telegram, затем на пост в LinkedIn.');
+      voiceDonePending.delete(userId);
+      return botSend(msg.chat.id, voiceDoneText(urls[0], urls[1] || VOICE_HERO_LI_URL), { disable_web_page_preview: true });
+    }
   }
   if (isVoiceMessage(msg) && VOICE_API_SECRET) {
     return botSend(msg.chat.id, 'Голосовые для «100 голосов» теперь принимает бот озвучки. Перешли их туда.');
