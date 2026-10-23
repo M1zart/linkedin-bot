@@ -4654,6 +4654,12 @@ async function voiceExtraOf(id) {
     .filter(Boolean).join('\n\n');
 }
 
+// Страница уходит в корзину Notion: оттуда ее можно вернуть
+async function notionTrash(id) {
+  try { return await notionReq('PATCH', `/v1/pages/${encodeURIComponent(id)}`, { in_trash: true }); }
+  catch { return notionReq('PATCH', `/v1/pages/${encodeURIComponent(id)}`, { archived: true }); }
+}
+
 async function voiceGet(id) {
   const v = pageToVoice(await notionReq('GET', `/v1/pages/${encodeURIComponent(id)}`));
   if (!v.parentOk) throw new Error('Страница не из базы голосов');
@@ -5172,7 +5178,8 @@ function voiceRoute(req, res) {
   const isList = req.method === 'GET' && url === '/api/voices';
   const isGet = req.method === 'GET' && url === '/api/voice';
   const isUpd = req.method === 'POST' && url === '/api/voice-update';
-  if (!isList && !isGet && !isUpd) return false;
+  const isDel = req.method === 'POST' && url === '/api/voice-delete';
+  if (!isList && !isGet && !isUpd && !isDel) return false;
   const send = (status, obj) => { res.writeHead(status, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(obj)); };
   const run = async (body) => {
     try {
@@ -5194,6 +5201,20 @@ function voiceRoute(req, res) {
         v.extra = await voiceExtraOf(id).catch(() => '');
         delete v.parentOk;
         return send(200, v);
+      }
+      if (isDel) {
+        const delId = String((JSON.parse(body) || {}).id || '');
+        if (!/^[0-9a-f-]{32,40}$/i.test(delId)) return send(400, { error: 'Некорректный id' });
+        try { await voiceGet(delId); } catch { return send(404, { error: 'Голос не найден' }); }
+        // Строки ответов этого голоса в базе «100 голосов: ответы» уходят вместе с ним, чтобы не портить статистику
+        try {
+          const rel = await notionReq('POST', `/v1/data_sources/${NOTION_VOICE_ANSWERS_DS_ID}/query`, {
+            filter: { property: 'Голос', relation: { contains: delId } }, page_size: 100
+          });
+          for (const r of rel.results || []) await notionTrash(r.id).catch(e => console.error('voice answer trash:', scrubToken(e.message)));
+        } catch (e) { console.error('voice answers query:', scrubToken(e.message)); }
+        await notionTrash(delId);
+        return send(200, { ok: true });
       }
       const { id, telegram, linkedin, status } = JSON.parse(body);
       if (!/^[0-9a-f-]{32,40}$/i.test(String(id || ''))) return send(400, { error: 'Некорректный id' });

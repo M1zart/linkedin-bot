@@ -914,6 +914,7 @@
         <button class="action-btn" onclick="voiceSave(true)">💾 Сохранить</button>
         <button class="action-btn" onclick="voiceSetStatus('на согласовании')">Статус: на согласовании</button>
         <button class="action-btn primary tg" onclick="voicePublish()">В публикацию</button>
+        <button class="action-btn" onclick="voiceDelete(voiceState.cur.id, '#' + voiceState.cur.number + ' ' + voiceState.cur.role)">🗑 Удалить</button>
       </div>
     </div>
   </div>
@@ -2482,6 +2483,13 @@
           const d = it.date ? new Date(it.date).toLocaleDateString('ru-RU') : '';
           title.textContent = '🎙 Голос #' + it.number + ' · ' + it.role + ' · ' + it.status + (d ? ' · ' + d : '');
           head.appendChild(title);
+          const del = document.createElement('button');
+          del.className = 'action-btn';
+          del.textContent = '🗑';
+          del.title = 'Удалить';
+          del.style.marginLeft = 'auto';
+          del.addEventListener('click', ev => { ev.stopPropagation(); voiceDelete(it.id, '#' + it.number + ' ' + it.role); });
+          head.appendChild(del);
           card.appendChild(head);
           card.addEventListener('click', () => voiceOpen(it.id));
           list.appendChild(card);
@@ -2509,6 +2517,16 @@
     }
 
     function voiceBack() { voiceLoadList(); }
+
+    async function voiceDelete(id, label) {
+      if (!(await confirmAsk('Удалить голос ' + label + '? Черновик и его строки в базе ответов уйдут в корзину Notion.'))) return;
+      try {
+        await queueCall('/api/voice-delete', { method: 'POST', body: JSON.stringify({ id }) });
+        voiceState.cur = null;
+        showToast('Голос удален');
+        voiceLoadList();
+      } catch (e) { showToast(voiceErr(e), true); }
+    }
 
     // Переключатель Telegram / LinkedIn: правки текущей версии остаются в черновике
     function voiceStash() {
