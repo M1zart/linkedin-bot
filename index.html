@@ -909,6 +909,11 @@
       <details style="margin:10px 0;"><summary style="cursor:pointer;">Сырая расшифровка</summary>
         <div class="digest-row" id="voice-transcript" style="white-space:pre-wrap;margin-top:6px;"></div>
       </details>
+      <div class="digest-actions" style="flex-wrap:wrap;align-items:center;">
+        <span class="digest-row" style="margin:0;">Номер выпуска</span>
+        <input id="voice-release" type="number" min="1" max="9999" placeholder="авто" style="width:90px;">
+        <button class="action-btn" onclick="voiceSetReleaseUi()">Задать</button>
+      </div>
       <div class="digest-actions" style="flex-wrap:wrap;">
         <button class="action-btn" onclick="voiceCopy()">📋 Копировать</button>
         <button class="action-btn" onclick="voiceSave(true)">💾 Сохранить</button>
@@ -2481,7 +2486,7 @@
           const title = document.createElement('div');
           title.className = 'digest-title';
           const d = it.date ? new Date(it.date).toLocaleDateString('ru-RU') : '';
-          title.textContent = '🎙 Голос #' + it.number + ' · ' + it.role + ' · ' + it.status + (d ? ' · ' + d : '');
+          title.textContent = '🎙 Голос #' + it.number + (it.release ? ' · выпуск #' + it.release : '') + ' · ' + it.role + ' · ' + it.status + (d ? ' · ' + d : '');
           head.appendChild(title);
           const del = document.createElement('button');
           del.className = 'action-btn';
@@ -2506,7 +2511,8 @@
         voiceState.cur = v;
         voiceState.platform = 'telegram';
         document.querySelectorAll('#voice-platform .tone-btn').forEach(b => b.classList.toggle('selected', b.dataset.platform === 'telegram'));
-        document.getElementById('voice-title').textContent = '🎙 Голос #' + v.number + ' · ' + v.role + ' · ' + v.status;
+        document.getElementById('voice-title').textContent = '🎙 Голос #' + v.number + (v.release ? ' · выпуск #' + v.release : '') + ' · ' + v.role + ' · ' + v.status;
+        document.getElementById('voice-release').value = v.release || '';
         document.getElementById('voice-text').value = v.telegram;
         document.getElementById('voice-risks').textContent = v.risks || 'Не найдено';
         document.getElementById('voice-extra').textContent = v.extra || 'Нет';
@@ -2557,13 +2563,47 @@
     async function voiceSetStatus(status) {
       if (!(await voiceSave(false, { status }))) return;
       voiceState.cur.status = status;
-      document.getElementById('voice-title').textContent = '🎙 Голос #' + voiceState.cur.number + ' · ' + voiceState.cur.role + ' · ' + status;
+      document.getElementById('voice-title').textContent = '🎙 Голос #' + voiceState.cur.number + (voiceState.cur.release ? ' · выпуск #' + voiceState.cur.release : '') + ' · ' + voiceState.cur.role + ' · ' + status;
       showToast('Статус: ' + status);
     }
 
     // Telegram-версия идёт в обычную цепочку: рубрика 16, акценты, хэштег #100_голосов, подпись, кнопка «Задать вопрос»
+    // Применяет ответ /api/voice-release: новый номер в тексте и в карточке
+    function voiceApplyRelease(r) {
+      voiceState.cur.release = r.release;
+      voiceState.cur.telegram = r.telegram;
+      voiceState.cur.linkedin = r.linkedin;
+      document.getElementById('voice-text').value = voiceState.cur[voiceState.platform];
+      document.getElementById('voice-release').value = r.release;
+      document.getElementById('voice-title').textContent = '🎙 Голос #' + voiceState.cur.number + ' · выпуск #' + r.release + ' · ' + voiceState.cur.role + ' · ' + voiceState.cur.status;
+    }
+
+    async function voiceCallRelease(release, swap) {
+      return queueCall('/api/voice-release', { method: 'POST', body: JSON.stringify({ id: voiceState.cur.id, release, swap: !!swap }) });
+    }
+
+    async function voiceSetReleaseUi() {
+      if (!voiceState.cur) return;
+      const raw = document.getElementById('voice-release').value.trim();
+      if (!(await voiceSave(false))) return;
+      try {
+        let r;
+        try { r = await voiceCallRelease(raw === '' ? null : Number(raw), false); }
+        catch (e) {
+          if (!/уже у голоса/.test(e.message)) throw e;
+          if (!(await confirmAsk(voiceErr(e) + '. Поменять местами?'))) return;
+          r = await voiceCallRelease(Number(raw), true);
+        }
+        voiceApplyRelease(r);
+        showToast('Номер выпуска: #' + r.release);
+      } catch (e) { showToast(voiceErr(e), true); }
+    }
+
     async function voicePublish() {
       if (!(await voiceSave(false))) return;
+      // Номер выпуска ставится автоматически (следующий после последнего), если его еще нет
+      try { voiceApplyRelease(await voiceCallRelease(null, false)); }
+      catch (e) { showToast(voiceErr(e), true); return; }
       const text = voiceState.cur.telegram.trim();
       if (!text) { showToast('Telegram-версия пустая', true); return; }
       if (/\[(ВСТУПЛЕНИЕ|ФИНАЛ)\]/.test(text) && !(await confirmAsk('В тексте остались пустые блоки [ВСТУПЛЕНИЕ] или [ФИНАЛ]. Всё равно отправить в публикацию?'))) return;

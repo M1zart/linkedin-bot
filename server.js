@@ -4600,6 +4600,7 @@ function pageToVoice(p) {
     parentOk: !p.parent || p.parent.data_source_id === NOTION_VOICE_DS_ID,
     name: fromRichText(pr.Name && pr.Name.title),
     number: pr['Номер'] && pr['Номер'].number !== undefined ? pr['Номер'].number : null,
+    release: pr['Выпуск'] && Number.isFinite(pr['Выпуск'].number) ? pr['Выпуск'].number : null,
     role: (pr['Роль'] && pr['Роль'].select && pr['Роль'].select.name) || '',
     exp: fromRichText(pr['Стаж'] && pr['Стаж'].rich_text),
     status: (pr['Статус'] && pr['Статус'].select && pr['Статус'].select.name) || 'черновик',
@@ -4652,6 +4653,49 @@ async function voiceExtraOf(id) {
     .filter(b => b.type === 'paragraph')
     .map(b => fromRichText(b.paragraph && b.paragraph.rich_text))
     .filter(Boolean).join('\n\n');
+}
+
+// Номер выпуска: отдельное поле «Выпуск». Номер записи («Номер») остается на месте и связан с героем и строками ответов
+let voiceReleasePropReady = false;
+async function voiceEnsureReleaseProp() {
+  if (voiceReleasePropReady) return;
+  const ds = await notionReq('GET', `/v1/data_sources/${NOTION_VOICE_DS_ID}`);
+  if (!ds.properties || !ds.properties['Выпуск']) {
+    try { await notionReq('PATCH', `/v1/data_sources/${NOTION_VOICE_DS_ID}`, { properties: { 'Выпуск': { number: { format: 'number' } } } }); }
+    catch (e) { throw new Error('Не удалось создать поле «Выпуск». Добавь в базу «100 голосов iGaming» числовое поле «Выпуск» вручную'); }
+  }
+  voiceReleasePropReady = true;
+}
+
+// Меняет номер только в первой строке «Голос #N: роль», остальной текст и ручные правки не трогает
+function voiceSetHeaderNumber(text, n) {
+  return String(text || '').replace(/^Голос #(\d+|\?)/, `Голос #${n === null ? '?' : n}`);
+}
+
+async function voiceSetRelease(v, n) {
+  await notionReq('PATCH', `/v1/pages/${encodeURIComponent(v.id)}`, {
+    properties: {
+      'Выпуск': { number: n },
+      Telegram: rtFull(voiceSetHeaderNumber(v.telegram, n)),
+      LinkedIn: rtFull(voiceSetHeaderNumber(v.linkedin, n))
+    }
+  });
+}
+
+async function voiceFindByRelease(n) {
+  const data = await notionReq('POST', `/v1/data_sources/${NOTION_VOICE_DS_ID}/query`, {
+    filter: { property: 'Выпуск', number: { equals: n } }, page_size: 5
+  });
+  return (data.results || []).map(pageToVoice)[0] || null;
+}
+
+async function voiceNextRelease() {
+  const data = await notionReq('POST', `/v1/data_sources/${NOTION_VOICE_DS_ID}/query`, {
+    filter: { property: 'Выпуск', number: { is_not_empty: true } },
+    sorts: [{ property: 'Выпуск', direction: 'descending' }], page_size: 1
+  });
+  const top = (data.results || []).map(pageToVoice)[0];
+  return top && Number.isFinite(top.release) ? top.release + 1 : 1;
 }
 
 // Страница уходит в корзину Notion: оттуда ее можно вернуть
@@ -4787,7 +4831,8 @@ function voiceAssemble({ number, roleTitle, exp, questions, commonCount, parsed 
   const byId = Object.fromEntries((parsed.answers || []).map(a => [a.id, a]));
   const custom = voiceClean(parsed.custom_question);
   const qs = questions.map(q => (q.replaceable && custom ? { ...q, text: custom } : q));
-  const head = `Голос #${number}: ${roleTitle}${exp ? ', ' + exp : ''}`;
+  // Номер выпуска неизвестен до публикации: ставится автоматически при «В публикацию» или вручную в карточке
+  const head = `Голос #?: ${roleTitle}${exp ? ', ' + exp : ''}`;
   const has = q => !!voiceClean((byId[q.id] || {}).text);
   const block = (q, i) => {
     const a = byId[q.id] || {};
@@ -5179,7 +5224,8 @@ function voiceRoute(req, res) {
   const isGet = req.method === 'GET' && url === '/api/voice';
   const isUpd = req.method === 'POST' && url === '/api/voice-update';
   const isDel = req.method === 'POST' && url === '/api/voice-delete';
-  if (!isList && !isGet && !isUpd && !isDel) return false;
+  const isRel = req.method === 'POST' && url === '/api/voice-release';
+  if (!isList && !isGet && !isUpd && !isDel && !isRel) return false;
   const send = (status, obj) => { res.writeHead(status, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(obj)); };
   const run = async (body) => {
     try {
@@ -5190,7 +5236,7 @@ function voiceRoute(req, res) {
         const data = await notionReq('POST', `/v1/data_sources/${NOTION_VOICE_DS_ID}/query`, {
           sorts: [{ property: 'Номер', direction: 'descending' }], page_size: 100
         });
-        const items = (data.results || []).map(pageToVoice).map(v => ({ id: v.id, number: v.number, role: v.role, status: v.status, date: v.date }));
+        const items = (data.results || []).map(pageToVoice).map(v => ({ id: v.id, number: v.number, release: v.release, role: v.role, status: v.status, date: v.date }));
         return send(200, { items });
       }
       if (isGet) {
@@ -5201,6 +5247,31 @@ function voiceRoute(req, res) {
         v.extra = await voiceExtraOf(id).catch(() => '');
         delete v.parentOk;
         return send(200, v);
+      }
+      if (isRel) {
+        const d = JSON.parse(body || '{}');
+        const relId = String(d.id || '');
+        if (!/^[0-9a-f-]{32,40}$/i.test(relId)) return send(400, { error: 'Некорректный id' });
+        let v;
+        try { v = await voiceGet(relId); } catch { return send(404, { error: 'Голос не найден' }); }
+        await voiceEnsureReleaseProp();
+        const manual = d.release !== undefined && d.release !== null && d.release !== '';
+        let n;
+        if (manual) {
+          n = Number(d.release);
+          if (!Number.isInteger(n) || n < 1 || n > 9999) return send(400, { error: 'Номер выпуска: целое число от 1 до 9999' });
+          const other = n === v.release ? null : await voiceFindByRelease(n);
+          if (other && other.id !== v.id) {
+            if (!d.swap) return send(409, { error: `Выпуск #${n} уже у голоса «${other.role}»`, conflict: { id: other.id, role: other.role, number: other.number } });
+            // Меняем местами: у другого голоса остается прежний номер этого (или пусто)
+            await voiceSetRelease(await voiceGet(other.id), v.release);
+          }
+        } else {
+          n = Number.isFinite(v.release) ? v.release : await voiceNextRelease();
+        }
+        await voiceSetRelease(v, n);
+        const fresh = await voiceGet(relId);
+        return send(200, { ok: true, release: n, telegram: fresh.telegram, linkedin: fresh.linkedin });
       }
       if (isDel) {
         const delId = String((JSON.parse(body) || {}).id || '');
