@@ -4612,6 +4612,19 @@ function pageToVoice(p) {
   };
 }
 
+// Сколько голосов уже есть по каждой роли: бот озвучки пишет «это 2-й голос роли»
+async function voiceRoleCounts() {
+  const counts = {};
+  let cursor;
+  for (let i = 0; i < 5; i++) {
+    const data = await notionReq('POST', `/v1/data_sources/${NOTION_VOICE_DS_ID}/query`, { page_size: 100, ...(cursor ? { start_cursor: cursor } : {}) });
+    for (const v of (data.results || []).map(pageToVoice)) if (v.role) counts[v.role] = (counts[v.role] || 0) + 1;
+    if (!data.has_more) break;
+    cursor = data.next_cursor;
+  }
+  return counts;
+}
+
 async function voiceNextNumber() {
   const data = await notionReq('POST', `/v1/data_sources/${NOTION_VOICE_DS_ID}/query`, {
     sorts: [{ property: 'Номер', direction: 'descending' }], page_size: 1
@@ -5092,8 +5105,10 @@ async function handleVoiceCallback(cb) {
 }
 
 // Расшифровка уже готова: раскладываем по вопросам роли и пишем в Notion. Вызывается и из бота, и из API (TTS-бот)
-async function voiceSubmit({ role: roleKey, otherQs, number, exp, transcript }) {
+async function voiceSubmit({ role: roleKey, otherQs, number, exp, transcript, roleTitle }) {
   const role = voiceRole(roleKey, otherQs);
+  if (roleKey === 'other' && roleTitle) role.title = roleTitle;
+  if (!Number.isInteger(number) || number < 1) number = await voiceNextNumber();
   const q = loadQuestions();
   const questions = [
     ...q.common.map((x, i) => ({ id: 'c' + (i + 1), text: typeof x === 'string' ? x : x.text })),
@@ -5103,6 +5118,7 @@ async function voiceSubmit({ role: roleKey, otherQs, number, exp, transcript }) 
   const out = voiceAssemble({ number, roleTitle: role.title, exp, questions, commonCount: q.common.length, parsed });
   const page = await voiceCreate({ number, roleTitle: role.title, exp, ...out, transcript });
   await voiceAnswersCreate({ pageId: page.id, number, roleTitle: role.title, exp, rows: out.rows });
+  return number;
 }
 
 async function voiceProcess(s) {
@@ -5188,11 +5204,12 @@ function voiceApiRoute(req, res) {
     try {
       if (req.method === 'GET' && url === '/api/voice-api/info') {
         const q = loadQuestions();
-        let next = 1;
+        let next = 1, counts = {};
         try { next = await voiceNextNumber(); } catch (e) { console.error('voice number:', scrubToken(e.message)); }
+        try { counts = await voiceRoleCounts(); } catch (e) { console.error('voice counts:', scrubToken(e.message)); }
         return send(200, {
-          ok: true, next,
-          roles: Object.entries(q.roles).map(([key, r]) => ({ key, title: r.title })),
+          ok: true, next, counts,
+          roles: Object.entries(q.roles).map(([key, r]) => ({ key, title: r.title, aliases: r.aliases || [], selectName: notionSelectName(r.title) })),
           other: (q.other && q.other.title) || 'Другое',
           roleQuestions: (q.roles.head_of_sportsbook || Object.values(q.roles)[0]).questions.length
         });
@@ -5200,9 +5217,10 @@ function voiceApiRoute(req, res) {
       if (req.method === 'POST' && url === '/api/voice-api/submit') {
         const d = JSON.parse(body || '{}');
         const number = Number(d.number);
-        if (!d.role || !Number.isInteger(number) || number < 1 || !String(d.transcript || '').trim()) return send(400, { ok: false, error: 'нужны role, number, transcript' });
-        await voiceSubmit({ role: d.role, otherQs: Array.isArray(d.otherQs) ? d.otherQs.map(String) : [], number, exp: String(d.exp || '').slice(0, 80), transcript: String(d.transcript) });
-        return send(200, { ok: true, number });
+        if (!d.role || !String(d.transcript || '').trim()) return send(400, { ok: false, error: 'нужны role и transcript' });
+        const num = Number.isInteger(number) && number > 0 ? number : null;
+        const done = await voiceSubmit({ role: d.role, otherQs: Array.isArray(d.otherQs) ? d.otherQs.map(String) : [], number: num, exp: String(d.exp || '').slice(0, 80), transcript: String(d.transcript), roleTitle: String(d.roleTitle || '').slice(0, 60) });
+        return send(200, { ok: true, number: done });
       }
       return send(404, { ok: false, error: 'not found' });
     } catch (e) {
