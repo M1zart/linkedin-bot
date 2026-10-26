@@ -4806,12 +4806,13 @@ const VOICE_SYSTEM_PROMPT = `Ты редактор рубрики «100 голо
 7. АНОНИМИЗАЦИЯ. В текстах ответов названия компаний, брендов, провайдеров и платформ, а также имена и фамилии людей заменяй нейтральным описанием: «одна из компаний», «крупный провайдер», «коллега», «руководитель» и т.п., по смыслу. Не выдумывай уточнений, которых герой не говорил. Цифры, суммы и случаи оставляй как есть, КРОМЕ валюты: гривны, злотые, рубли и любую местную валюту замени на доллары или евро с тем же числом (если герой назвал долларом или евро, оставь как есть), чтобы по валюте нельзя было понять страну героя и читатель не из Украины не определил рынок. Числа не пересчитывай. Названия видов спорта, лиг, церемоний и премий (Оскар, Золотой мяч и т.п.) и общеизвестных индустриальных терминов не заменяй.
 7b. "risks": список того, по чему героя все еще могут узнать ПОСЛЕ замены: города и страны, точные цифры, уникальные истории, редкие детали. Для каждого: "what" (что именно) и "quote" (короткая цитата места из уже обработанного ответа). Если ничего нет, пустой список.
 8. Вопрос с пометкой [МОЖНО ЗАМЕНИТЬ] герой имел право заменить своим. Если вместо ответа на него герой явно говорит на другую тему, которую выбрал сам, положи этот рассказ в ответ на этот вопрос, а в "custom_question" запиши короткий вопрос, на который он на самом деле отвечает (одно предложение, без ё). Если герой ответил на исходный вопрос или ничего не заменял, "custom_question" пустая строка.
+8b. Вопрос с пометкой [ВОПРОС НЕИЗВЕСТЕН]: у героя была своя роль, и ролевых вопросов у тебя нет. Найди в расшифровке ответы, которые идут после двух общих вопросов, раздели их по темам (не больше трех ответов) и положи по порядку в r1, r2, r3. Для каждого такого ответа в поле "question" напиши короткий вопрос на «ты» в стиле остальных вопросов, который прямо вытекает из самого ответа, без новых фактов. Если ответов меньше трех, лишние верни с пустыми "text" и "question".
 9. "best": список из трех id самых сильных непустых ответов среди ВСЕХ вопросов (и общих c, и ролевых r), от самого сильного к менее сильному. Сильный это конкретный случай из личного опыта, неочевидная мысль, детали, которых нет в общих словах. Слабый это общие фразы и повтор мысли из другого ответа. Если два ответа повторяют один и тот же тезис, возьми только один из них. Если непустых ответов меньше трех, верни сколько есть.
 
 10. Для каждого непустого ответа укажи: "short" (заголовок до 70 символов, суть ответа, без ё и без длинного тире), "topics" (от 1 до 3 тем СТРОГО из списка: ${VOICE_TOPICS.join('; ')}), "has_case" (true, если в ответе есть личный случай из опыта героя), "has_number" (true, если есть конкретная цифра или сумма).
 
 Верни ТОЛЬКО JSON без пояснений и без markdown-ограждений, в формате:
-{"answers":[{"id":"<id вопроса>","text":"...","translated":false,"short":"...","topics":["..."],"has_case":false,"has_number":false}],"custom_question":"...","best":["<id>","<id>","<id>"],"extra":"...","risks":[{"what":"...","quote":"..."}]}
+{"answers":[{"id":"<id вопроса>","text":"...","question":"только для [ВОПРОС НЕИЗВЕСТЕН], иначе пусто","translated":false,"short":"...","topics":["..."],"has_case":false,"has_number":false}],"custom_question":"...","best":["<id>","<id>","<id>"],"extra":"...","risks":[{"what":"...","quote":"..."}]}
 В "answers" должны быть все вопросы из списка, в том же порядке, с теми же id.`;
 
 async function voiceStructure(questions, transcript) {
@@ -5110,11 +5111,20 @@ async function voiceSubmit({ role: roleKey, otherQs, number, exp, transcript, ro
   if (roleKey === 'other' && roleTitle) role.title = roleTitle;
   if (!Number.isInteger(number) || number < 1) number = await voiceNextNumber();
   const q = loadQuestions();
-  const questions = [
+  // Роль вне списка: вопросов нет, модель восстанавливает их из самих ответов
+  const unknownRole = roleKey === 'other' && !(otherQs && otherQs.length);
+  let questions = [
     ...q.common.map((x, i) => ({ id: 'c' + (i + 1), text: typeof x === 'string' ? x : x.text })),
-    ...role.questions.map((x, i, arr) => ({ id: 'r' + (i + 1), text: typeof x === 'string' ? x : x.text, replaceable: i === arr.length - 1 }))
+    ...(unknownRole
+      ? [1, 2, 3].map(i => ({ id: 'r' + i, text: '[ВОПРОС НЕИЗВЕСТЕН]', unknown: true }))
+      : role.questions.map((x, i, arr) => ({ id: 'r' + (i + 1), text: typeof x === 'string' ? x : x.text, replaceable: i === arr.length - 1 })))
   ];
   const parsed = await voiceStructure(questions, transcript);
+  if (unknownRole) {
+    const byId = Object.fromEntries((parsed.answers || []).map(a => [a.id, a]));
+    questions = questions.map(x => (x.unknown ? { ...x, text: voiceClean((byId[x.id] || {}).question) } : x))
+      .filter(x => !x.unknown || (x.text && voiceClean((byId[x.id] || {}).text)));
+  }
   const out = voiceAssemble({ number, roleTitle: role.title, exp, questions, commonCount: q.common.length, parsed });
   const page = await voiceCreate({ number, roleTitle: role.title, exp, ...out, transcript });
   await voiceAnswersCreate({ pageId: page.id, number, roleTitle: role.title, exp, rows: out.rows });
