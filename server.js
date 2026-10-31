@@ -3394,12 +3394,64 @@ async function apMakeNews(recentRows) {
   return null;
 }
 
+// Повторы: та же мысль другими словами. Сначала дешевая проверка по общим словам, потом модель сверяет мысль с последними постами
+const apStems = t => new Set(((String(t || '').toLowerCase().replace(/ё/g, 'е').match(/[а-яa-z]{4,}/g)) || []).map(w => w.slice(0, 5)));
+function apOverlap(a, b) {
+  const A = apStems(a), B = apStems(b);
+  if (!A.size || !B.size) return 0;
+  let n = 0; for (const x of A) if (B.has(x)) n++;
+  return n / Math.min(A.size, B.size);
+}
+async function apIsRepeat(text, rows) {
+  const hist = rows.filter(r => r.text).slice(0, 40);
+  const lex = hist.find(r => apOverlap(text, r.text) >= 0.6);
+  if (lex) return shortPreview(lex.text, 90);
+  if (!hist.length) return null;
+  const system = 'Ты проверяешь повторы в ленте. Повтор: у нового поста та же основная мысль, тот же тезис, пример или сравнение, что у одного из недавних, пусть другими словами и с другого начала. Одна общая тема (ставки, решения, продажи) повтором не считается: повтор только когда читатель скажет «это я уже читал». Верни только JSON {"repeat":true или false,"n":номер недавнего поста или 0}.';
+  const list = hist.map((r, i) => (i + 1) + '. ' + shortPreview(r.text, 220)).join('\n');
+  const res = await claudeJson(system, 'НОВЫЙ ПОСТ:\n' + text + '\n\nНЕДАВНИЕ ПОСТЫ:\n' + list, 300).catch(() => null);
+  if (res && res.repeat && hist[Number(res.n) - 1]) return shortPreview(hist[Number(res.n) - 1].text, 90);
+  return null;
+}
+
+// Темы механики денег: берем ту, по которой в последних постах еще нет ключевых слов, чтобы рубрика не сползала в один и тот же прием
+const AP_MECH_TOPICS = [
+  { t: 'маржа букмекера внутри коэффициентов: вероятности всех исходов в сумме дают больше 100%, и откуда берется разница', k: ['маржа', 'маржи'] },
+  { t: 'ожидаемая ценность ставки: ставка может выигрывать часто и все равно быть невыгодной', k: ['ожидан', 'математическ'] },
+  { t: 'дисперсия: длинная серия проигрышей возможна и у выгодной стратегии', k: ['дисперс', 'серия'] },
+  { t: 'экспресс: как в нем перемножаются шансы и маржа букмекера', k: ['экспресс'] },
+  { t: 'кэшаут: что именно покупает игрок, закрывая ставку раньше времени', k: ['кэшаут', 'кешаут'] },
+  { t: 'банкролл и размер ставки: почему одинаковая ставка даже при верной оценке может разорить', k: ['банкрол'] },
+  { t: 'ошибка игрока: монета не помнит прошлых бросков', k: ['монета', 'решка'] },
+  { t: 'как перевести коэффициент в вероятность и обратно, на одном простом примере', k: ['коэффициент'] },
+  { t: 'ставки во время матча: почему задержка в секунды меняет цену', k: ['лайв', 'прямом эфире', 'во время матча'] },
+  { t: 'рынки предсказаний: цена контракта как оценка вероятности и чем она отличается от коэффициента', k: ['polymarket', 'рынки предсказан', 'prediction'] },
+  { t: 'фаворит и толпа: почему популярная сторона обычно стоит дороже, чем ее шансы', k: ['фаворит'] },
+  { t: 'почему в казино и у букмекера дом выигрывает на длинной дистанции, даже когда игрок выигрывает сегодня', k: ['на длинной дистанции', 'закон больших'] }
+];
+
 async function apMakeBatch(format, recentRows) {
-  apContext = recentRows.length ? 'НЕ ПОВТОРЯЙ темы и первые строки недавних постов:\n' + recentRows.slice(0, 12).map(r => '- ' + shortPreview(r.text, 90)).join('\n') : '';
-  try {
-    const b = await generateThreadsBatch(format, 1);
-    return b.posts.find(t => !AP_TG_MENTION.test(t)) || null;
-  } finally { apContext = ''; }
+  const recentText = recentRows.slice(0, 30).map(r => String(r.text || '').toLowerCase()).join(' ');
+  let topic = '';
+  if (format === 'mechanics') {
+    const free = AP_MECH_TOPICS.filter(x => !x.k.some(k => recentText.includes(k)));
+    const pool = free.length ? free : AP_MECH_TOPICS;
+    topic = pool[Math.floor(Math.random() * pool.length)].t;
+  }
+  for (let i = 0; i < 3; i++) {
+    apContext = (recentRows.length ? 'НЕ ПОВТОРЯЙ мысли, примеры и первые строки недавних постов. Не повторяй и конструкцию: если несколько последних постов построены одинаково (например, бытовое наблюдение про привычки и мозг), выбери другую область и другое построение:\n' + recentRows.slice(0, 30).map(r => '- ' + shortPreview(r.text, 140)).join('\n') : '')
+      + (topic ? '\n\nТЕМА ЭТОГО ПОСТА: ' + topic + '. Бери только общеизвестную механику, без выдуманных фактов и цифр.' : '');
+    let text = null;
+    try {
+      const b = await generateThreadsBatch(format, 1);
+      text = b.posts.find(t => !AP_TG_MENTION.test(t)) || null;
+    } finally { apContext = ''; }
+    if (!text) continue;
+    const rep = await apIsRepeat(text, recentRows).catch(() => null);
+    if (!rep) return text;
+    console.log('autopilot: черновик отброшен: повтор «' + rep + '»');
+  }
+  return null;
 }
 
 // ── Темы из постов Дмитрия: Content Engine в Notion (посты LinkedIn) и опубликованные посты Telegram ──
@@ -3562,6 +3614,8 @@ async function apMakeFromSources(kind, recentRows, linkDue = false) {
     why = check(text);
   }
   if (why.length) { console.log('autopilot: черновик из поста отброшен:', why.join(', ')); return null; }
+  const repeatOf = await apIsRepeat(text, recentRows).catch(() => null);
+  if (repeatOf) { console.log('autopilot: черновик из поста отброшен: повтор «' + repeatOf + '»'); return null; }
   const urls = text.match(/https?:\/\/\S+/g) || [];
   return {
     text, type: AP_KIND[kind].type, goal: urls.length ? 'telegram_bridge' : 'reach',
@@ -3621,7 +3675,7 @@ async function apTick({ force = false } = {}) {
     const dayKey = ms => { const p = warsawParts(ms); return `${p.y}-${p.mo}-${p.d}`; };
     const busy = new Set(rows.filter(r => r.publishAt).map(r => dayKey(Date.parse(r.publishAt))));
     const recentRows = rows.slice().sort((a, b) => Date.parse(b.publishAt || 0) - Date.parse(a.publishAt || 0));
-    const histRows = [...recentRows, ...(await tRecent(30).catch(() => []))];
+    const histRows = [...recentRows, ...(await tRecent(40).catch(() => []))];
     const base = warsawParts(now);
     const [sh, sm] = AP_SLOT.split(':').map(Number);
     for (let off = 0; off < AP_DAYS; off++) {
