@@ -3477,10 +3477,11 @@ async function apPageText(pageId, limit = 6000) {
 
 async function apUsedSources() {
   const used = new Set();
+  used.ideas = {};
   let cursor;
   for (let i = 0; i < 5; i++) {
     const data = await notionReq('POST', `/v1/data_sources/${NOTION_SCHEDULE_DS_ID}/query`, { filter: { property: 'Источник', rich_text: { is_not_empty: true } }, page_size: 100, ...(cursor ? { start_cursor: cursor } : {}) });
-    for (const r of (data.results || []).map(pageToRow)) if (r.src) used.add(r.src.split('|')[0]);
+    for (const r of (data.results || []).map(pageToRow)) if (r.src) { const [k, rest] = r.src.split('|'); used.add(k); if (k.startsWith('bk:') && rest) (used.ideas[k] = used.ideas[k] || []).push(rest); }
     if (!data.has_more) break;
     cursor = data.next_cursor;
   }
@@ -3489,27 +3490,78 @@ async function apUsedSources() {
 
 // Книги: идеи для рубрик про решения и механику. Это чужие мысли, не личный опыт Дмитрия, поэтому в тексте поста только пересказ идеи и применение к его теме
 const AP_BOOKS = [
-  { title: "Thinking, Fast and Slow", author: "Daniel Kahneman", idea: "мышление работает в двух режимах: быстрая интуиция и медленный расчет; интуиция систематически ошибается в оценке вероятностей (привязка к первой цифре, страх потери сильнее радости от такой же выгоды), поэтому важные решения при неопределенности стоит проверять расчетом" },
-  { title: "Thinking in Bets", author: "Annie Duke", idea: "бывшая профессиональная покеристка рассматривает каждое решение как ставку с вероятностями; качество решения нельзя судить по результату, потому что удачный исход бывает у плохого решения и наоборот; ошибка оценивать решение по исходу называется resulting" },
-  { title: "Fooled by Randomness", author: "Nassim Taleb", idea: "люди принимают удачу за мастерство: из большого числа участников кто-то неизбежно покажет серию успехов случайно, а мы видим только выживших и приписываем им талант" },
-  { title: "The Black Swan", author: "Nassim Taleb", idea: "редкие события с огромным эффектом определяют результат сильнее, чем обычные колебания; модели, построенные на прошлом, их недооценивают, поэтому важнее устойчивость к редкому удару, чем точный прогноз" },
-  { title: "Antifragile", author: "Nassim Taleb", idea: "одни системы ломаются от потрясений, другие становятся сильнее; вместо попыток предсказать удар лучше убирать хрупкость и ограничивать потери от худшего сценария" },
-  { title: "Skin in the Game", author: "Nassim Taleb", idea: "тот, кто принимает решение, должен сам нести последствия своих ошибок; без этого цена ошибки перекладывается на других, и решения становятся небрежнее" },
-  { title: "The Signal and the Noise", author: "Nate Silver", idea: "большая часть данных шум; хороший прогнозист мыслит вероятностями, а не утверждениями, обновляет оценку при новых данных и честно измеряет, как часто его прогнозы сбываются" },
-  { title: "Superforecasting", author: "Philip Tetlock", idea: "долгое исследование прогнозов показало: лучшие прогнозисты не гении, а люди, которые разбивают вопрос на части, меняют мнение небольшими шагами при новых фактах и ведут счет своим ошибкам" },
-  { title: "The Psychology of Money", author: "Morgan Housel", idea: "результат с деньгами зависит больше от поведения, чем от знаний; главное правило долгой игры: не вылететь, потому что сложный процент работает только у тех, кто остался в игре" },
-  { title: "Predictably Irrational", author: "Dan Ariely", idea: "люди ошибаются не случайно, а предсказуемо: сравнение с якорем, особая притягательность слова «бесплатно», решения зависят от того, как варианты поставлены рядом" },
-  { title: "Misbehaving", author: "Richard Thaler", idea: "реальные люди не ведут себя как рациональные агенты: считают деньги в разных «карманах», держатся за уже потраченное, рискуют выигранным иначе, чем своим; это предсказуемо и учитывается в продуктах" },
-  { title: "The Drunkard's Walk", author: "Leonard Mlodinow", idea: "случайность влияет на жизнь сильнее, чем кажется; люди склонны видеть закономерность и причину там, где ее нет, и объяснять успех и провал постфактум" },
-  { title: "The Success Equation", author: "Michael Mauboussin", idea: "результат складывается из навыка и удачи; парадокс мастерства: чем ближе участники по уровню, тем больше решает случай; чтобы учиться, надо отделять одно от другого" },
-  { title: "Fortune's Formula", author: "William Poundstone", idea: "рассказывает про критерий Келли: доля банкролла в ставке должна зависеть от преимущества и коэффициента; слишком большая ставка при верной оценке может разорить так же, как неверная оценка" },
-  { title: "Beat the Dealer", author: "Edward Thorp", idea: "математик показал, что в блэкджеке можно получить преимущество над казино, следя за вышедшими картами; идея в том, что преимущество измеряется расчетом, а не ощущением" },
-  { title: "Algorithms to Live By", author: "Brian Christian, Tom Griffiths", idea: "компьютерные алгоритмы дают правила для жизни: когда остановить поиск и выбрать лучшее из увиденного, когда пробовать новое, а когда использовать известное хорошее" },
-  { title: "High Output Management", author: "Andrew Grove", idea: "результат менеджера равен результату его команды и соседних команд, на которые он влияет; встречи и разговоры это и есть работа руководителя, а главный рычаг в том, на что тратится его время" },
-  { title: "The Hard Thing About Hard Things", author: "Ben Horowitz", idea: "для по-настоящему трудных решений нет рецепта: можно только пережить момент; в кризис руководителю нужен другой стиль, чем в спокойное время, и честность с командой о плохом" },
-  { title: "Principles", author: "Ray Dalio", idea: "решения повторяются, поэтому полезно записывать правила, по которым они принимаются, разбирать свои ошибки открыто и проверять идеи в споре, а не по должности" },
-  { title: "Good Strategy Bad Strategy", author: "Richard Rumelt", idea: "у хорошей стратегии есть диагноз проблемы, ключевой подход и согласованные действия; плохая стратегия это список желаемых целей без ответа, что именно мешает и что с этим делать" }
+  { title: "Thinking, Fast and Slow", author: "Daniel Kahneman" },
+  { title: "Noise", author: "Daniel Kahneman, Olivier Sibony, Cass Sunstein" },
+  { title: "Thinking in Bets", author: "Annie Duke" },
+  { title: "Quit", author: "Annie Duke" },
+  { title: "Fooled by Randomness", author: "Nassim Taleb" },
+  { title: "The Black Swan", author: "Nassim Taleb" },
+  { title: "Antifragile", author: "Nassim Taleb" },
+  { title: "Skin in the Game", author: "Nassim Taleb" },
+  { title: "The Signal and the Noise", author: "Nate Silver" },
+  { title: "Superforecasting", author: "Philip Tetlock" },
+  { title: "The Psychology of Money", author: "Morgan Housel" },
+  { title: "Predictably Irrational", author: "Dan Ariely" },
+  { title: "Misbehaving", author: "Richard Thaler" },
+  { title: "Nudge", author: "Richard Thaler, Cass Sunstein" },
+  { title: "The Drunkard's Walk", author: "Leonard Mlodinow" },
+  { title: "The Success Equation", author: "Michael Mauboussin" },
+  { title: "Fortune's Formula", author: "William Poundstone" },
+  { title: "Beat the Dealer", author: "Edward Thorp" },
+  { title: "A Man for All Markets", author: "Edward Thorp" },
+  { title: "Algorithms to Live By", author: "Brian Christian, Tom Griffiths" },
+  { title: "How Not to Be Wrong", author: "Jordan Ellenberg" },
+  { title: "Risk Savvy", author: "Gerd Gigerenzer" },
+  { title: "The Undoing Project", author: "Michael Lewis" },
+  { title: "Moneyball", author: "Michael Lewis" },
+  { title: "The Art of Thinking Clearly", author: "Rolf Dobelli" },
+  { title: "Influence", author: "Robert Cialdini" },
+  { title: "Against the Gods", author: "Peter Bernstein" },
+  { title: "The Intelligent Investor", author: "Benjamin Graham" },
+  { title: "Reminiscences of a Stock Operator", author: "Edwin Lefevre" },
+  { title: "The Theory of Poker", author: "David Sklansky" },
+  { title: "The Biggest Bluff", author: "Maria Konnikova" },
+  { title: "Mindset", author: "Carol Dweck" },
+  { title: "Grit", author: "Angela Duckworth" },
+  { title: "Atomic Habits", author: "James Clear" },
+  { title: "Deep Work", author: "Cal Newport" },
+  { title: "Essentialism", author: "Greg McKeown" },
+  { title: "Range", author: "David Epstein" },
+  { title: "Outliers", author: "Malcolm Gladwell" },
+  { title: "Blink", author: "Malcolm Gladwell" },
+  { title: "Freakonomics", author: "Steven Levitt, Stephen Dubner" },
+  { title: "Zero to One", author: "Peter Thiel" },
+  { title: "The Lean Startup", author: "Eric Ries" },
+  { title: "Good to Great", author: "Jim Collins" },
+  { title: "The Innovator's Dilemma", author: "Clayton Christensen" },
+  { title: "Hooked", author: "Nir Eyal" },
+  { title: "Thinking in Systems", author: "Donella Meadows" },
+  { title: "The Goal", author: "Eliyahu Goldratt" },
+  { title: "Turn the Ship Around", author: "David Marquet" },
+  { title: "The Five Dysfunctions of a Team", author: "Patrick Lencioni" },
+  { title: "Radical Candor", author: "Kim Scott" },
+  { title: "Never Split the Difference", author: "Chris Voss" },
+  { title: "Getting to Yes", author: "Roger Fisher, William Ury" },
+  { title: "The Culture Code", author: "Daniel Coyle" },
+  { title: "Drive", author: "Daniel Pink" },
+  { title: "Extreme Ownership", author: "Jocko Willink, Leif Babin" },
+  { title: "The Mom Test", author: "Rob Fitzpatrick" },
+  { title: "Inspired", author: "Marty Cagan" },
+  { title: "Measure What Matters", author: "John Doerr" },
+  { title: "The Effective Executive", author: "Peter Drucker" },
+  { title: "High Output Management", author: "Andrew Grove" },
+  { title: "The Hard Thing About Hard Things", author: "Ben Horowitz" },
+  { title: "Principles", author: "Ray Dalio" },
+  { title: "Good Strategy Bad Strategy", author: "Richard Rumelt" }
 ];
+// Идею из книги берет модель из общеизвестного содержания, поэтому просим только уверенную центральную идею и не повторяем уже использованные
+async function apBookIdea(b, usedIdeas) {
+  const system = 'Ты помогаешь выбрать идею из известной книги. Назови ОДНУ центральную, широко известную идею книги, в которой ты полностью уверен: ту, что обычно пересказывают в обзорах. Не добавляй примеры, эксперименты, имена и цифры, если не уверен в них на 100%. Идея не должна совпадать по смыслу с уже использованными из списка used. Если уверенной новой идеи нет, верни low. Верни только JSON {"idea":"одно-два предложения","confidence":"high или low"}.';
+  const res = await claudeJson(system, JSON.stringify({ book: b.title, author: b.author, used: usedIdeas || [] }), 600).catch(() => null);
+  if (!res || res.confidence !== 'high' || !res.idea || String(res.idea).length < 40) return null;
+  return String(res.idea).trim();
+}
+
 
 async function apSourcePool() {
   const pool = [];
@@ -3535,7 +3587,7 @@ async function apSourcePool() {
       if (r.text && r.text.length > 200) pool.push({ key: 'tg:' + r.id, id: r.id, origin: 'Telegram', title: shortPreview(r.text, 80), text: r.text });
     }
   } catch (e) { console.error('autopilot: посты Telegram:', scrubToken(e.message)); }
-  AP_BOOKS.forEach((b, i) => pool.push({ key: 'bk:' + i, id: 'bk' + i, origin: 'Книга', title: b.title + ', ' + b.author, text: 'Идея из книги «' + b.title + '» (' + b.author + '): ' + b.idea + '. ДЛЯ ЧЕРНОВИКА: это чужая книга, не личный опыт автора поста. Не пиши «я прочитал», «я знаком с автором», «в моей практике». Перескажи идею своими словами и примени к решениям, риску, ставкам или управлению командой. Название и автора можно назвать один раз. Без цитат из книги и без цифр, которых нет в этом описании.' }));
+  AP_BOOKS.forEach((b, i) => pool.push({ key: 'bk:' + i, id: 'bk' + i, origin: 'Книга', title: b.title + ', ' + b.author, book: b }));
   return pool;
 }
 
@@ -3589,12 +3641,18 @@ async function apMakeFromSources(kind, recentRows, linkDue = false) {
   const pool = await apSourcePool();
   if (!pool.length) return null;
   const used = await apUsedSources().catch(() => new Set());
-  const fresh = pool.filter(x => !used.has(x.key));
+  const fresh = pool.filter(x => x.origin === 'Книга' || !used.has(x.key));
   if (!fresh.length) return null;
   for (let i = fresh.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [fresh[i], fresh[j]] = [fresh[j], fresh[i]]; }
   const bk = fresh.filter(x => x.origin === 'Книга'), own = fresh.filter(x => x.origin !== 'Книга');
-  const cands = ((bk.length && (!own.length || Math.random() < 0.3)) ? bk : own).slice(0, 6);
-  for (const c of cands) if (!c.text) c.text = ((c.hint ? c.hint + '\n' : '') + await apPageText(c.id).catch(() => '')).trim();
+  const useBooks = bk.length && (!own.length || Math.random() < 0.3);
+  const cands = (useBooks ? bk : own).slice(0, useBooks ? 3 : 6);
+  for (const c of cands) {
+    if (c.origin === 'Книга') {
+      c.idea = await apBookIdea(c.book, (used.ideas && used.ideas[c.key]) || []);
+      c.text = c.idea ? 'Идея из книги «' + c.book.title + '» (' + c.book.author + '): ' + c.idea + ' ДЛЯ ЧЕРНОВИКА: это чужая книга, не личный опыт автора поста. Не пиши «я прочитал», «я знаком с автором», «в моей практике». Перескажи идею своими словами и примени к решениям, риску, ставкам или управлению командой. Название и автора можно назвать один раз. Без цитат из книги и без цифр, которых нет в этом описании.' : '';
+    } else if (!c.text) c.text = ((c.hint ? c.hint + '\n' : '') + await apPageText(c.id).catch(() => '')).trim();
+  }
   const usable = cands.filter(c => c.text && c.text.length > 150);
   if (!usable.length) return null;
   const input = {
@@ -3645,7 +3703,7 @@ async function apMakeFromSources(kind, recentRows, linkDue = false) {
   const urls = text.match(/https?:\/\/\S+/g) || [];
   return {
     text, type: AP_KIND[kind].type, goal: urls.length ? 'telegram_bridge' : 'reach',
-    src: `${src.key}|${src.title}`.slice(0, 300),
+    src: `${src.key}|${src.origin === 'Книга' ? src.idea : src.title}`.slice(0, 300),
     sourceTitle: `${src.origin}: ${src.title}`,
     takeaway: String(res.takeaway || '').trim().slice(0, 300)
   };
