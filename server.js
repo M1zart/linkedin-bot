@@ -3477,15 +3477,91 @@ async function apPageText(pageId, limit = 6000) {
 
 async function apUsedSources() {
   const used = new Set();
+  used.ideas = {};
   let cursor;
   for (let i = 0; i < 5; i++) {
     const data = await notionReq('POST', `/v1/data_sources/${NOTION_SCHEDULE_DS_ID}/query`, { filter: { property: 'Источник', rich_text: { is_not_empty: true } }, page_size: 100, ...(cursor ? { start_cursor: cursor } : {}) });
-    for (const r of (data.results || []).map(pageToRow)) if (r.src) used.add(r.src.split('|')[0]);
+    for (const r of (data.results || []).map(pageToRow)) if (r.src) { const [k, rest] = r.src.split('|'); used.add(k); if (k.startsWith('bk:') && rest) (used.ideas[k] = used.ideas[k] || []).push(rest); }
     if (!data.has_more) break;
     cursor = data.next_cursor;
   }
   return used;
 }
+
+// Книги: идеи для рубрик про решения и механику. Это чужие мысли, не личный опыт Дмитрия, поэтому в тексте поста только пересказ идеи и применение к его теме
+const AP_BOOKS = [
+  { title: "Thinking, Fast and Slow", author: "Daniel Kahneman" },
+  { title: "Noise", author: "Daniel Kahneman, Olivier Sibony, Cass Sunstein" },
+  { title: "Thinking in Bets", author: "Annie Duke" },
+  { title: "Quit", author: "Annie Duke" },
+  { title: "Fooled by Randomness", author: "Nassim Taleb" },
+  { title: "The Black Swan", author: "Nassim Taleb" },
+  { title: "Antifragile", author: "Nassim Taleb" },
+  { title: "Skin in the Game", author: "Nassim Taleb" },
+  { title: "The Signal and the Noise", author: "Nate Silver" },
+  { title: "Superforecasting", author: "Philip Tetlock" },
+  { title: "The Psychology of Money", author: "Morgan Housel" },
+  { title: "Predictably Irrational", author: "Dan Ariely" },
+  { title: "Misbehaving", author: "Richard Thaler" },
+  { title: "Nudge", author: "Richard Thaler, Cass Sunstein" },
+  { title: "The Drunkard's Walk", author: "Leonard Mlodinow" },
+  { title: "The Success Equation", author: "Michael Mauboussin" },
+  { title: "Fortune's Formula", author: "William Poundstone" },
+  { title: "Beat the Dealer", author: "Edward Thorp" },
+  { title: "A Man for All Markets", author: "Edward Thorp" },
+  { title: "Algorithms to Live By", author: "Brian Christian, Tom Griffiths" },
+  { title: "How Not to Be Wrong", author: "Jordan Ellenberg" },
+  { title: "Risk Savvy", author: "Gerd Gigerenzer" },
+  { title: "The Undoing Project", author: "Michael Lewis" },
+  { title: "Moneyball", author: "Michael Lewis" },
+  { title: "The Art of Thinking Clearly", author: "Rolf Dobelli" },
+  { title: "Influence", author: "Robert Cialdini" },
+  { title: "Against the Gods", author: "Peter Bernstein" },
+  { title: "The Intelligent Investor", author: "Benjamin Graham" },
+  { title: "Reminiscences of a Stock Operator", author: "Edwin Lefevre" },
+  { title: "The Theory of Poker", author: "David Sklansky" },
+  { title: "The Biggest Bluff", author: "Maria Konnikova" },
+  { title: "Mindset", author: "Carol Dweck" },
+  { title: "Grit", author: "Angela Duckworth" },
+  { title: "Atomic Habits", author: "James Clear" },
+  { title: "Deep Work", author: "Cal Newport" },
+  { title: "Essentialism", author: "Greg McKeown" },
+  { title: "Range", author: "David Epstein" },
+  { title: "Outliers", author: "Malcolm Gladwell" },
+  { title: "Blink", author: "Malcolm Gladwell" },
+  { title: "Freakonomics", author: "Steven Levitt, Stephen Dubner" },
+  { title: "Zero to One", author: "Peter Thiel" },
+  { title: "The Lean Startup", author: "Eric Ries" },
+  { title: "Good to Great", author: "Jim Collins" },
+  { title: "The Innovator's Dilemma", author: "Clayton Christensen" },
+  { title: "Hooked", author: "Nir Eyal" },
+  { title: "Thinking in Systems", author: "Donella Meadows" },
+  { title: "The Goal", author: "Eliyahu Goldratt" },
+  { title: "Turn the Ship Around", author: "David Marquet" },
+  { title: "The Five Dysfunctions of a Team", author: "Patrick Lencioni" },
+  { title: "Radical Candor", author: "Kim Scott" },
+  { title: "Never Split the Difference", author: "Chris Voss" },
+  { title: "Getting to Yes", author: "Roger Fisher, William Ury" },
+  { title: "The Culture Code", author: "Daniel Coyle" },
+  { title: "Drive", author: "Daniel Pink" },
+  { title: "Extreme Ownership", author: "Jocko Willink, Leif Babin" },
+  { title: "The Mom Test", author: "Rob Fitzpatrick" },
+  { title: "Inspired", author: "Marty Cagan" },
+  { title: "Measure What Matters", author: "John Doerr" },
+  { title: "The Effective Executive", author: "Peter Drucker" },
+  { title: "High Output Management", author: "Andrew Grove" },
+  { title: "The Hard Thing About Hard Things", author: "Ben Horowitz" },
+  { title: "Principles", author: "Ray Dalio" },
+  { title: "Good Strategy Bad Strategy", author: "Richard Rumelt" }
+];
+// Идею из книги берет модель из общеизвестного содержания, поэтому просим только уверенную центральную идею и не повторяем уже использованные
+async function apBookIdea(b, usedIdeas) {
+  const system = 'Ты помогаешь выбрать идею из известной книги. Назови ОДНУ центральную, широко известную идею книги, в которой ты полностью уверен: ту, что обычно пересказывают в обзорах. Не добавляй примеры, эксперименты, имена и цифры, если не уверен в них на 100%. Идея не должна совпадать по смыслу с уже использованными из списка used. Если уверенной новой идеи нет, верни low. Верни только JSON {"idea":"одно-два предложения","confidence":"high или low"}.';
+  const res = await claudeJson(system, JSON.stringify({ book: b.title, author: b.author, used: usedIdeas || [] }), 600).catch(() => null);
+  if (!res || res.confidence !== 'high' || !res.idea || String(res.idea).length < 40) return null;
+  return String(res.idea).trim();
+}
+
 
 async function apSourcePool() {
   const pool = [];
@@ -3511,6 +3587,7 @@ async function apSourcePool() {
       if (r.text && r.text.length > 200) pool.push({ key: 'tg:' + r.id, id: r.id, origin: 'Telegram', title: shortPreview(r.text, 80), text: r.text });
     }
   } catch (e) { console.error('autopilot: посты Telegram:', scrubToken(e.message)); }
+  AP_BOOKS.forEach((b, i) => pool.push({ key: 'bk:' + i, id: 'bk' + i, origin: 'Книга', title: b.title + ', ' + b.author, book: b }));
   return pool;
 }
 
@@ -3564,11 +3641,18 @@ async function apMakeFromSources(kind, recentRows, linkDue = false) {
   const pool = await apSourcePool();
   if (!pool.length) return null;
   const used = await apUsedSources().catch(() => new Set());
-  const fresh = pool.filter(x => !used.has(x.key));
+  const fresh = pool.filter(x => x.origin === 'Книга' || !used.has(x.key));
   if (!fresh.length) return null;
   for (let i = fresh.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [fresh[i], fresh[j]] = [fresh[j], fresh[i]]; }
-  const cands = fresh.slice(0, 6);
-  for (const c of cands) if (!c.text) c.text = ((c.hint ? c.hint + '\n' : '') + await apPageText(c.id).catch(() => '')).trim();
+  const bk = fresh.filter(x => x.origin === 'Книга'), own = fresh.filter(x => x.origin !== 'Книга');
+  const useBooks = bk.length && (!own.length || Math.random() < 0.3);
+  const cands = (useBooks ? bk : own).slice(0, useBooks ? 3 : 6);
+  for (const c of cands) {
+    if (c.origin === 'Книга') {
+      c.idea = await apBookIdea(c.book, (used.ideas && used.ideas[c.key]) || []);
+      c.text = c.idea ? 'Идея из книги «' + c.book.title + '» (' + c.book.author + '): ' + c.idea + ' ДЛЯ ЧЕРНОВИКА: это чужая книга, не личный опыт автора поста. Не пиши «я прочитал», «я знаком с автором», «в моей практике». Перескажи идею своими словами и примени к решениям, риску, ставкам или управлению командой. Название и автора можно назвать один раз. Без цитат из книги и без цифр, которых нет в этом описании.' : '';
+    } else if (!c.text) c.text = ((c.hint ? c.hint + '\n' : '') + await apPageText(c.id).catch(() => '')).trim();
+  }
   const usable = cands.filter(c => c.text && c.text.length > 150);
   if (!usable.length) return null;
   const input = {
@@ -3593,7 +3677,7 @@ async function apMakeFromSources(kind, recentRows, linkDue = false) {
     const body = t.split(THREADS_INVITE_LINK).join(' ');
     if (!linkDue && (urls.length || AP_TG_MENTION.test(t))) why.push('ссылка или упоминание Telegram не по очереди');
     if (linkDue && (urls.length > 1 || urls.some(u => u !== THREADS_INVITE_LINK))) why.push('чужая ссылка');
-    for (const [re, w] of THREADS_BAD) if (w !== 'выдуманный личный опыт' && re.test(body)) why.push(w);
+    for (const [re, w] of THREADS_BAD) if (w !== 'выдуманный личный опыт' && !(w === 'слово «книга»' && src.origin === 'Книга') && re.test(body)) why.push(w);
     if (findNegContrast(t).length) why.push('конструкция «не X, а Y» или «это не X, это Y»');
     if (/[—–]/.test(t) || /\s-\s/.test(t)) why.push('тире');
     if (US_GAMBLING.test(t) && !PRED_MARKET.test(t)) why.push('США');
@@ -3619,7 +3703,7 @@ async function apMakeFromSources(kind, recentRows, linkDue = false) {
   const urls = text.match(/https?:\/\/\S+/g) || [];
   return {
     text, type: AP_KIND[kind].type, goal: urls.length ? 'telegram_bridge' : 'reach',
-    src: `${src.key}|${src.title}`.slice(0, 300),
+    src: `${src.key}|${src.origin === 'Книга' ? src.idea : src.title}`.slice(0, 300),
     sourceTitle: `${src.origin}: ${src.title}`,
     takeaway: String(res.takeaway || '').trim().slice(0, 300)
   };
