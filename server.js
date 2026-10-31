@@ -3487,6 +3487,30 @@ async function apUsedSources() {
   return used;
 }
 
+// Книги: идеи для рубрик про решения и механику. Это чужие мысли, не личный опыт Дмитрия, поэтому в тексте поста только пересказ идеи и применение к его теме
+const AP_BOOKS = [
+  { title: "Thinking, Fast and Slow", author: "Daniel Kahneman", idea: "мышление работает в двух режимах: быстрая интуиция и медленный расчет; интуиция систематически ошибается в оценке вероятностей (привязка к первой цифре, страх потери сильнее радости от такой же выгоды), поэтому важные решения при неопределенности стоит проверять расчетом" },
+  { title: "Thinking in Bets", author: "Annie Duke", idea: "бывшая профессиональная покеристка рассматривает каждое решение как ставку с вероятностями; качество решения нельзя судить по результату, потому что удачный исход бывает у плохого решения и наоборот; ошибка оценивать решение по исходу называется resulting" },
+  { title: "Fooled by Randomness", author: "Nassim Taleb", idea: "люди принимают удачу за мастерство: из большого числа участников кто-то неизбежно покажет серию успехов случайно, а мы видим только выживших и приписываем им талант" },
+  { title: "The Black Swan", author: "Nassim Taleb", idea: "редкие события с огромным эффектом определяют результат сильнее, чем обычные колебания; модели, построенные на прошлом, их недооценивают, поэтому важнее устойчивость к редкому удару, чем точный прогноз" },
+  { title: "Antifragile", author: "Nassim Taleb", idea: "одни системы ломаются от потрясений, другие становятся сильнее; вместо попыток предсказать удар лучше убирать хрупкость и ограничивать потери от худшего сценария" },
+  { title: "Skin in the Game", author: "Nassim Taleb", idea: "тот, кто принимает решение, должен сам нести последствия своих ошибок; без этого цена ошибки перекладывается на других, и решения становятся небрежнее" },
+  { title: "The Signal and the Noise", author: "Nate Silver", idea: "большая часть данных шум; хороший прогнозист мыслит вероятностями, а не утверждениями, обновляет оценку при новых данных и честно измеряет, как часто его прогнозы сбываются" },
+  { title: "Superforecasting", author: "Philip Tetlock", idea: "долгое исследование прогнозов показало: лучшие прогнозисты не гении, а люди, которые разбивают вопрос на части, меняют мнение небольшими шагами при новых фактах и ведут счет своим ошибкам" },
+  { title: "The Psychology of Money", author: "Morgan Housel", idea: "результат с деньгами зависит больше от поведения, чем от знаний; главное правило долгой игры: не вылететь, потому что сложный процент работает только у тех, кто остался в игре" },
+  { title: "Predictably Irrational", author: "Dan Ariely", idea: "люди ошибаются не случайно, а предсказуемо: сравнение с якорем, особая притягательность слова «бесплатно», решения зависят от того, как варианты поставлены рядом" },
+  { title: "Misbehaving", author: "Richard Thaler", idea: "реальные люди не ведут себя как рациональные агенты: считают деньги в разных «карманах», держатся за уже потраченное, рискуют выигранным иначе, чем своим; это предсказуемо и учитывается в продуктах" },
+  { title: "The Drunkard's Walk", author: "Leonard Mlodinow", idea: "случайность влияет на жизнь сильнее, чем кажется; люди склонны видеть закономерность и причину там, где ее нет, и объяснять успех и провал постфактум" },
+  { title: "The Success Equation", author: "Michael Mauboussin", idea: "результат складывается из навыка и удачи; парадокс мастерства: чем ближе участники по уровню, тем больше решает случай; чтобы учиться, надо отделять одно от другого" },
+  { title: "Fortune's Formula", author: "William Poundstone", idea: "рассказывает про критерий Келли: доля банкролла в ставке должна зависеть от преимущества и коэффициента; слишком большая ставка при верной оценке может разорить так же, как неверная оценка" },
+  { title: "Beat the Dealer", author: "Edward Thorp", idea: "математик показал, что в блэкджеке можно получить преимущество над казино, следя за вышедшими картами; идея в том, что преимущество измеряется расчетом, а не ощущением" },
+  { title: "Algorithms to Live By", author: "Brian Christian, Tom Griffiths", idea: "компьютерные алгоритмы дают правила для жизни: когда остановить поиск и выбрать лучшее из увиденного, когда пробовать новое, а когда использовать известное хорошее" },
+  { title: "High Output Management", author: "Andrew Grove", idea: "результат менеджера равен результату его команды и соседних команд, на которые он влияет; встречи и разговоры это и есть работа руководителя, а главный рычаг в том, на что тратится его время" },
+  { title: "The Hard Thing About Hard Things", author: "Ben Horowitz", idea: "для по-настоящему трудных решений нет рецепта: можно только пережить момент; в кризис руководителю нужен другой стиль, чем в спокойное время, и честность с командой о плохом" },
+  { title: "Principles", author: "Ray Dalio", idea: "решения повторяются, поэтому полезно записывать правила, по которым они принимаются, разбирать свои ошибки открыто и проверять идеи в споре, а не по должности" },
+  { title: "Good Strategy Bad Strategy", author: "Richard Rumelt", idea: "у хорошей стратегии есть диагноз проблемы, ключевой подход и согласованные действия; плохая стратегия это список желаемых целей без ответа, что именно мешает и что с этим делать" }
+];
+
 async function apSourcePool() {
   const pool = [];
   try {
@@ -3511,6 +3535,7 @@ async function apSourcePool() {
       if (r.text && r.text.length > 200) pool.push({ key: 'tg:' + r.id, id: r.id, origin: 'Telegram', title: shortPreview(r.text, 80), text: r.text });
     }
   } catch (e) { console.error('autopilot: посты Telegram:', scrubToken(e.message)); }
+  AP_BOOKS.forEach((b, i) => pool.push({ key: 'bk:' + i, id: 'bk' + i, origin: 'Книга', title: b.title + ', ' + b.author, text: 'Идея из книги «' + b.title + '» (' + b.author + '): ' + b.idea + '. ДЛЯ ЧЕРНОВИКА: это чужая книга, не личный опыт автора поста. Не пиши «я прочитал», «я знаком с автором», «в моей практике». Перескажи идею своими словами и примени к решениям, риску, ставкам или управлению командой. Название и автора можно назвать один раз. Без цитат из книги и без цифр, которых нет в этом описании.' }));
   return pool;
 }
 
@@ -3567,7 +3592,8 @@ async function apMakeFromSources(kind, recentRows, linkDue = false) {
   const fresh = pool.filter(x => !used.has(x.key));
   if (!fresh.length) return null;
   for (let i = fresh.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [fresh[i], fresh[j]] = [fresh[j], fresh[i]]; }
-  const cands = fresh.slice(0, 6);
+  const bk = fresh.filter(x => x.origin === 'Книга'), own = fresh.filter(x => x.origin !== 'Книга');
+  const cands = ((bk.length && (!own.length || Math.random() < 0.3)) ? bk : own).slice(0, 6);
   for (const c of cands) if (!c.text) c.text = ((c.hint ? c.hint + '\n' : '') + await apPageText(c.id).catch(() => '')).trim();
   const usable = cands.filter(c => c.text && c.text.length > 150);
   if (!usable.length) return null;
@@ -3593,7 +3619,7 @@ async function apMakeFromSources(kind, recentRows, linkDue = false) {
     const body = t.split(THREADS_INVITE_LINK).join(' ');
     if (!linkDue && (urls.length || AP_TG_MENTION.test(t))) why.push('ссылка или упоминание Telegram не по очереди');
     if (linkDue && (urls.length > 1 || urls.some(u => u !== THREADS_INVITE_LINK))) why.push('чужая ссылка');
-    for (const [re, w] of THREADS_BAD) if (w !== 'выдуманный личный опыт' && re.test(body)) why.push(w);
+    for (const [re, w] of THREADS_BAD) if (w !== 'выдуманный личный опыт' && !(w === 'слово «книга»' && src.origin === 'Книга') && re.test(body)) why.push(w);
     if (findNegContrast(t).length) why.push('конструкция «не X, а Y» или «это не X, это Y»');
     if (/[—–]/.test(t) || /\s-\s/.test(t)) why.push('тире');
     if (US_GAMBLING.test(t) && !PRED_MARKET.test(t)) why.push('США');
