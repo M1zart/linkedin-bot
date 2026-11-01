@@ -4480,7 +4480,7 @@ async function buildStatsReport(days = STATS_REPORT_DAYS) {
     const norm = p => String(p || '').replace(/\/+$/, '') || '/';
     const sumBy = hits => { const m = {}, t = {}; hits.forEach(h => { const k = norm(h.path); m[k] = (m[k] || 0) + h.count; if (h.title && h.title.trim()) t[k] = h.title.trim(); }); return { m, t }; };
     const cur = sumBy(gc.hits), prev = gcPrev.ok ? sumBy(gcPrev.hits) : null;
-    const known = [['/li-bio', 'Linkedin. Info and Featured'], ['/li-post', 'Linkedin. Post'], ['/th-bio', 'Threads bio'], ['/th-post', 'Threads post']];
+    const known = [['/li-bio', 'Linkedin. Info and Featured'], ['/li-post', 'Linkedin. Post'], ['/th-bio', 'Threads bio'], ['/th-post', 'Threads post'], ['/tr-post', 'Tribuna.UA. Post']];
     const extra = Object.keys(cur.m).filter(p => cur.m[p] > 0 && !known.some(k => k[0] === p)).sort((a, b) => cur.m[b] - cur.m[a]).slice(0, 4).map(p => [p, cur.t[p] || p]);
     const sum = Object.values(cur.m).reduce((a, n) => a + n, 0), sumPrev = prev ? Object.values(prev.m).reduce((a, n) => a + n, 0) : 0;
     lines.push('<b>ПЕРЕХОДЫ ПО ИНВАЙТ-ССЫЛКАМ</b>');
