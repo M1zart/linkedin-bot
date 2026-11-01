@@ -4477,14 +4477,15 @@ async function buildStatsReport(days = STATS_REPORT_DAYS) {
   const gc = await statsGoat(yStart, todayStart);
   if (gc.ok) {
     const gcPrev = await statsGoat(yStart - days * 86400000, yStart);
-    const was = {}; if (gcPrev.ok) gcPrev.hits.forEach(h => { was[h.path] = h.count; });
-    const rows = gc.hits.filter(h => h.count > 0).sort((a, b) => b.count - a.count).slice(0, 6);
-    const sum = gc.hits.reduce((a, h) => a + h.count, 0);
-    lines.push('<b>ПЕРЕХОДЫ ПО ССЫЛКАМ</b>');
-    if (rows.length) {
-      lines.push('Всего ' + sum + (gcPrev.ok ? ' (было ' + gcPrev.hits.reduce((a, h) => a + h.count, 0) + ')' : ''));
-      lines.push(rows.map(h => esc(goatLabel(h)) + ' ' + h.count + (gcPrev.ok ? ' (было ' + (was[h.path] || 0) + ')' : '')).join(' · '));
-    } else lines.push('Переходов не было.');
+    const norm = p => String(p || '').replace(/\/+$/, '') || '/';
+    const sumBy = hits => { const m = {}, t = {}; hits.forEach(h => { const k = norm(h.path); m[k] = (m[k] || 0) + h.count; if (h.title && h.title.trim()) t[k] = h.title.trim(); }); return { m, t }; };
+    const cur = sumBy(gc.hits), prev = gcPrev.ok ? sumBy(gcPrev.hits) : null;
+    const known = [['/li-bio', 'Linkedin. Info and Featured'], ['/li-post', 'Linkedin. Post'], ['/th-bio', 'Threads bio'], ['/th-post', 'Threads post']];
+    const extra = Object.keys(cur.m).filter(p => cur.m[p] > 0 && !known.some(k => k[0] === p)).sort((a, b) => cur.m[b] - cur.m[a]).slice(0, 4).map(p => [p, cur.t[p] || p]);
+    const sum = Object.values(cur.m).reduce((a, n) => a + n, 0), sumPrev = prev ? Object.values(prev.m).reduce((a, n) => a + n, 0) : 0;
+    lines.push('<b>ПЕРЕХОДЫ ПО ИНВАЙТ-ССЫЛКАМ</b>');
+    lines.push('Всего ' + sum + (prev ? ' (было ' + sumPrev + ')' : ''));
+    known.concat(extra).forEach(([p, name]) => lines.push(esc(name) + ' (' + esc(p) + '): ' + (cur.m[p] || 0) + (prev ? ' (было ' + (prev.m[p] || 0) + ')' : '')));
     lines.push('');
   } else if (!gc.off) errs.push('GoatCounter: ' + gc.error);
 
