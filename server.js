@@ -4350,6 +4350,22 @@ async function statsThreads(fromMs, toMs) {
 
 // Недельный отчет: короткий, для решений (около 20 строк). Подробности по ссылкам: /sources, рубрики: /rubrics.
 // Снимки t_stats бот пишет каждый день, отправляет отчет раз в неделю.
+// ── GoatCounter: переходы по ссылкам-редиректам (страницы вроде /li-bio, /th-bio). Нужен GOATCOUNTER_TOKEN (Settings, API, право на чтение статистики)
+const GOATCOUNTER_URL = (process.env.GOATCOUNTER_URL || 'https://mizart.goatcounter.com').replace(/\/+$/, '');
+const GOATCOUNTER_TOKEN = (process.env.GOATCOUNTER_TOKEN || '').trim();
+async function statsGoat(fromMs, toMs) {
+  if (!GOATCOUNTER_TOKEN) return { ok: false, off: true };
+  try {
+    const q = new URLSearchParams({ start: new Date(fromMs).toISOString(), end: new Date(toMs - 1000).toISOString(), limit: '50' });
+    const resp = await fetch(`${GOATCOUNTER_URL}/api/v0/stats/hits?${q}`, { headers: { 'Authorization': 'Bearer ' + GOATCOUNTER_TOKEN, 'Content-Type': 'application/json' }, signal: AbortSignal.timeout(15000) });
+    const data = await resp.json().catch(() => null);
+    if (!resp.ok) throw new Error(resp.status === 401 || resp.status === 403 ? 'токен не принят' : (data && data.error) || 'HTTP ' + resp.status);
+    const hits = ((data && data.hits) || []).filter(h => !h.event).map(h => ({ path: String(h.path || ''), title: String(h.title || ''), count: Number(h.count) || 0 }));
+    return { ok: true, hits };
+  } catch (e) { return { ok: false, error: scrubToken(e.message).slice(0, 120) }; }
+}
+const goatLabel = h => (h.title && h.title.trim()) || h.path || '?';
+
 async function buildStatsReport(days = STATS_REPORT_DAYS) {
   const nowMs = Date.now(), np = warsawParts(nowMs);
   const todayStart = warsawToUtcMs(np.y, np.mo, np.d, 0, 0);
@@ -4456,6 +4472,21 @@ async function buildStatsReport(days = STATS_REPORT_DAYS) {
   if (namedN) lines.push(Object.entries(named).sort((a, b) => b[1] - a[1]).slice(0, 4).map(([k, n]) => esc(k) + ' ' + n).join(' · '));
   if (partial) lines.push('<i>Названия ссылок и выходы учитываются с 19.10, источники можно сравнивать со следующей недели.</i>');
   lines.push('');
+
+  // ПЕРЕХОДЫ ПО ССЫЛКАМ (GoatCounter): только если задан GOATCOUNTER_TOKEN
+  const gc = await statsGoat(yStart, todayStart);
+  if (gc.ok) {
+    const gcPrev = await statsGoat(yStart - days * 86400000, yStart);
+    const was = {}; if (gcPrev.ok) gcPrev.hits.forEach(h => { was[h.path] = h.count; });
+    const rows = gc.hits.filter(h => h.count > 0).sort((a, b) => b.count - a.count).slice(0, 6);
+    const sum = gc.hits.reduce((a, h) => a + h.count, 0);
+    lines.push('<b>ПЕРЕХОДЫ ПО ССЫЛКАМ</b>');
+    if (rows.length) {
+      lines.push('Всего ' + sum + (gcPrev.ok ? ' (было ' + gcPrev.hits.reduce((a, h) => a + h.count, 0) + ')' : ''));
+      lines.push(rows.map(h => esc(goatLabel(h)) + ' ' + h.count + (gcPrev.ok ? ' (было ' + (was[h.path] || 0) + ')' : '')).join(' · '));
+    } else lines.push('Переходов не было.');
+    lines.push('');
+  } else if (!gc.off) errs.push('GoatCounter: ' + gc.error);
 
   // 3. THREADS
   lines.push('<b>THREADS</b>');
