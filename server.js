@@ -2305,6 +2305,7 @@ async function schedulerTick() {
   try {
     const due = await schedQuery({ and: [statusIs('scheduled'), { property: 'Publish At', date: { on_or_before: new Date().toISOString() } }] }, 25);
     schedulerState.lastError = null;
+    if (due.length) console.log('tick: к публикации ' + due.map(r => `${r.id} publishAt=${r.publishAt} link=${r.link ? 'есть' : 'нет'}`).join('; '));
     for (const row of due) await runScheduledPost(row, { checkStale: true, notify: true });
   } catch (e) {
     schedulerState.lastError = scrubToken(e.message);
