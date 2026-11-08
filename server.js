@@ -2249,6 +2249,11 @@ async function runScheduledPost(row, { checkStale = true, notify = true } = {}) 
   if (schedInFlight.has(row.id)) return { status: 'busy' };
   schedInFlight.add(row.id);
   try {
+    // Пост уже вышел в канал (ссылка записана), но запись осталась в очереди: закрываем её, а не объявляем пропущенным
+    if (checkStale && row.link) {
+      await schedUpdate(row.id, { status: 'published', error: '' });
+      return { status: 'published', link: row.link };
+    }
     const late = Date.now() - Date.parse(row.publishAt);
     if (checkStale && late > SCHEDULE_STALE_MS) {
       const err = `Просрочен на ${Math.round(late / 60000)} мин (сервер был недоступен). Автоматически не опубликован`;
