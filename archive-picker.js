@@ -1,10 +1,10 @@
 'use strict';
-// Еженедельная подборка «Что почитать из архива» для канала.
+// Ежемесячная подборка «Что почитать из архива» за прошлый месяц для канала.
 // Без внешних зависимостей. Подключается из server.js: require('./archive-picker')(deps).
 // Callback-префикс «ar:» (префикс «ap:» занят автопилотом).
 
 const ARCHIVE_CHANNEL = (process.env.ARCHIVE_CHANNEL || 'skakunov_igaming').replace(/^@/, '').trim();
-const WEEKDAY = clampInt(process.env.ARCHIVE_WEEKDAY, 0, 6, 0);              // 0 воскресенье, 1 понедельник, 6 суббота
+const MONTH_DAY = clampInt(process.env.ARCHIVE_MONTH_DAY, 1, 28, 1); // число месяца, когда приходит подборка за прошлый месяц
 const WEEKLY_TIME = /^\d{1,2}:\d{2}$/.test(process.env.ARCHIVE_TIME || '') ? process.env.ARCHIVE_TIME : '11:00';
 const TIME_ZONE = process.env.TIME_ZONE || 'Europe/Warsaw';
 const MIN_AGE_DAYS = Number(process.env.MIN_AGE_DAYS) || 14;
@@ -98,6 +98,59 @@ function firstLine(text, max = TITLE_MAX) {
   return (sp > max * 0.5 ? cut.slice(0, sp) : cut).replace(/[\s.,;:!?]+$/, '') + '…';
 }
 
+const MONTHS_RU = ['январь', 'февраль', 'март', 'апрель', 'май', 'июнь', 'июль', 'август', 'сентябрь', 'октябрь', 'ноябрь', 'декабрь'];
+
+// «Голос #1, Часть 3/3» → { title: 'Голос #1', base: 'голос #1', part: 3, total: 3 }; не серия → null
+function seriesInfo(text) {
+  const line = String(text || '').split('\n').map(x => x.trim()).find(Boolean) || '';
+  const m = /(?:часть|part|ч\.)\s*(\d{1,2})\s*(?:\/|из|of)\s*(\d{1,2})/i.exec(line) || /[(\[]\s*(\d{1,2})\s*\/\s*(\d{1,2})\s*[)\]]/.exec(line);
+  if (!m) return null;
+  const part = Number(m[1]);
+  const total = Number(m[2]);
+  if (total < 2 || total > 12 || part < 1 || part > total) return null;
+  const edge = /^[\s,.:;\-–—()\[\]]+|[\s,.:;\-–—()\[\]]+$/g;
+  const title = line.replace(m[0], ' ').replace(/\s+/g, ' ').replace(edge, '');
+  return title ? { title, base: title.toLowerCase(), part, total } : null;
+}
+
+// Описание поста: текст после первой строки (заголовка), до max символов по границе слова
+function snippetOf(text, max = 150) {
+  const lines = String(text || '').split('\n').map(x => x.trim()).filter(Boolean);
+  if (lines.length < 2) return '';
+  const rest = lines.slice(1).join(' ').replace(/\s+/g, ' ');
+  if (rest.length <= max) return rest;
+  const cut = rest.slice(0, max);
+  const sp = cut.lastIndexOf(' ');
+  return (sp > max * 0.5 ? cut.slice(0, sp) : cut).replace(/[\s.,;:!?]+$/, '') + '…';
+}
+
+// Части одной серии («Часть 1/3», «2/3»…) сводятся в один пост: ссылка на первую часть, просмотры и реакции в среднем на часть
+function groupSeries(posts) {
+  const groups = new Map();
+  const out = [];
+  for (const p of posts) {
+    const info = seriesInfo(p.text);
+    if (!info) { out.push(p); continue; }
+    if (!groups.has(info.base)) groups.set(info.base, { title: info.title, parts: [] });
+    groups.get(info.base).parts.push({ ...p, part: info.part, total: info.total });
+  }
+  for (const g of groups.values()) {
+    g.parts.sort((a, b) => a.part - b.part || a.id - b.id);
+    const n = g.parts.length;
+    const avg = k => Math.round(g.parts.reduce((acc, x) => acc + x[k], 0) / n);
+    out.push({ ...g.parts[0], title: g.title, views: avg('views'), reactions: avg('reactions'), parts: g.parts, partsTotal: Math.max(...g.parts.map(x => x.total)) });
+  }
+  return out;
+}
+
+// Прошлый календарный месяц в часовом поясе канала: { key: '2026-10', label: 'октябрь' }
+function prevMonthInfo(ms = Date.now()) {
+  let [y, m] = zonedNow(ms).ymd.split('-').map(Number);
+  m -= 1;
+  if (m === 0) { m = 12; y -= 1; }
+  return { key: y + '-' + String(m).padStart(2, '0'), label: MONTHS_RU[m - 1] };
+}
+
 function escHtml(s) {
   return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
@@ -142,9 +195,20 @@ function formatDateRu(d) {
   return new Intl.DateTimeFormat('ru-RU', { timeZone: TIME_ZONE, day: 'numeric', month: 'long', ...(sameYear ? {} : { year: 'numeric' }) }).format(d);
 }
 
-function buildDigestText(items) {
-  const blocks = items.map(p => `<a href="${escHtml(p.url)}">${escHtml(p.title || firstLine(p.text) || 'Пост ' + p.id)}</a>\n${escHtml(formatDateRu(p.date))}`.trim());
-  return `${HEADER}\n\n${blocks.join('\n\n')}`;
+function buildDigestText(items, monthLabel) {
+  const head = monthLabel ? HEADER + ' за ' + monthLabel : HEADER;
+  const blocks = items.map(p => {
+    const title = p.title || firstLine(p.text) || 'Пост ' + p.id;
+    let b = '<a href="' + escHtml(p.url) + '">' + escHtml(title) + '</a>';
+    if (p.parts && p.parts.length > 1) {
+      b += '\nСерия из ' + (p.partsTotal || p.parts.length) + ' частей: ' + p.parts.map(x => '<a href="' + escHtml(x.url) + '">' + x.part + '</a>').join(', ');
+    } else if (p.parts && p.parts.length === 1 && p.partsTotal > 1) {
+      b += '\n(часть ' + p.parts[0].part + ' из ' + p.partsTotal + ')';
+    }
+    if (p.snippet) b += '\n' + escHtml(p.snippet);
+    return b;
+  });
+  return head + '\n\n' + blocks.join('\n\n');
 }
 
 // Время в часовом поясе: { weekday 0..6, hh, mm, ymd }
@@ -217,7 +281,7 @@ function createArchivePicker(deps) {
 
   async function saveUsed(items) {
     const today = new Date().toISOString().slice(0, 10);
-    for (const p of items) {
+    for (const p of items.flatMap(x => (x.parts && x.parts.length ? x.parts : [x]))) {
       await notionReq('POST', '/v1/pages', {
         parent: { type: 'data_source_id', data_source_id: HISTORY_DS_ID },
         properties: {
@@ -235,11 +299,14 @@ function createArchivePicker(deps) {
     const s = session;
     const lines = s.candidates.map((p, i) => {
       const mark = s.selected.some(x => x.id === p.id) ? '✅ ' : '';
-      return `${mark}${i + 1}. ${p.title}\n${formatDateRu(p.date)}, просмотров ${p.views}, реакций ${p.reactions}\n${p.url}`;
+      const series = p.parts && p.parts.length > 1;
+      const kind = series ? `серия из ${p.partsTotal || p.parts.length} частей, ` : '';
+      const sn = p.snippet ? `\n${p.snippet}` : '';
+      return `${mark}${i + 1}. ${p.title}${sn}\n${formatDateRu(p.date)}, ${kind}просмотров ${p.views}${series ? ' на часть' : ''}, реакций ${p.reactions}\n${p.url}`;
     });
     const extras = s.selected.filter(x => !s.candidates.some(c => c.id === x.id));
     const extraLine = extras.length ? `\n\nСвои ссылки: ${extras.map(x => x.title).join('; ')}` : '';
-    return `${HEADER}: кандидаты на неделю\nВыбери три, выбрано ${s.selected.length} из ${PICK}.\n\n${lines.join('\n\n')}${extraLine}`;
+    return `${HEADER}${s.monthLabel ? ' за ' + s.monthLabel : ''}: кандидаты\nВыбери три, выбрано ${s.selected.length} из ${PICK}.\n\n${lines.join('\n\n')}${extraLine}`;
   }
 
   function candidatesKeyboard() {
@@ -274,11 +341,11 @@ function createArchivePicker(deps) {
         loadUsedIds().catch(e => { log('история недоступна', e); botSend(chatId, 'База истории в Notion недоступна, повторы не отсеиваются. Открой базу «PostBot: архив, использованные посты» интеграции (меню «…» → Connections).').catch(() => {}); return new Set(); })
       ]);
       if (!posts.length) throw new Error('со страницы канала не пришло ни одного поста');
-      const minAge = Date.now() - MIN_AGE_DAYS * 86400000;
-      const pool = posts.filter(p => (!p.date || p.date.getTime() <= minAge) && !used.has(p.id));
-      const picked = pickCandidates(pool).map(p => ({ ...p, title: firstLine(p.text) || 'Пост ' + p.id }));
-      if (!picked.length) return botSend(chatId, `Подходящих постов нет: все свежее ${MIN_AGE_DAYS} дн. или уже использованы за ${REPEAT_COOLDOWN_DAYS} дн.`);
-      session = { chatId, messageId: null, candidates: picked, selected: [], awaitingLink: false, pendingExtra: null, mode: 'pick' };
+      const mi = prevMonthInfo();
+      const pool = groupSeries(posts.filter(p => p.date && dayKey(p.date).slice(0, 7) === mi.key && !used.has(p.id)));
+      const picked = pickCandidates(pool).map(p => ({ ...p, title: p.title || firstLine(p.text) || 'Пост ' + p.id, snippet: snippetOf(p.text) }));
+      if (!picked.length) return botSend(chatId, `Подходящих постов за ${mi.label} нет: либо их не было, либо они уже использованы за последние ${REPEAT_COOLDOWN_DAYS} дн.`);
+      session = { chatId, messageId: null, candidates: picked, selected: [], awaitingLink: false, pendingExtra: null, mode: 'pick', monthLabel: mi.label };
       const sent = await botSend(chatId, candidatesText(), { reply_markup: candidatesKeyboard(), disable_web_page_preview: true });
       session.messageId = sent.message_id;
       lastRunError = null;
@@ -298,7 +365,7 @@ function createArchivePicker(deps) {
       const html = await (await fetch(`https://t.me/${ARCHIVE_CHANNEL}/${id}?embed=1`, { headers: { 'User-Agent': 'Mozilla/5.0 (compatible; PostBot/1.0)' }, signal: AbortSignal.timeout(15000) })).text();
       const p = parseChannelPage('<div class="tgme_widget_message_wrap">' + html, ARCHIVE_CHANNEL).find(x => x.id === id);
       const text = p && p.text;
-      return { id, url: `https://t.me/${ARCHIVE_CHANNEL}/${id}`, date: p && p.date, text: text || '', views: p ? p.views : 0, reactions: p ? p.reactions : 0, title: firstLine(text) || 'Пост ' + id };
+      return { id, url: `https://t.me/${ARCHIVE_CHANNEL}/${id}`, date: p && p.date, text: text || '', views: p ? p.views : 0, reactions: p ? p.reactions : 0, title: firstLine(text) || 'Пост ' + id, snippet: snippetOf(text) };
     } catch {
       return { id, url: `https://t.me/${ARCHIVE_CHANNEL}/${id}`, date: null, text: '', views: 0, reactions: 0, title: 'Пост ' + id };
     }
@@ -316,8 +383,7 @@ function createArchivePicker(deps) {
     const cmd = msg.text.trim().split(/\s|@/)[0].toLowerCase();
     if (cmd === '/suggest') { await suggest(msg.chat.id); return true; }
     if (cmd === '/status') {
-      const w = ['воскресенье', 'понедельник', 'вторник', 'среда', 'четверг', 'пятница', 'суббота'][WEEKDAY];
-      await botSend(msg.chat.id, `Подборка из архива: ${w} в ${WEEKLY_TIME} (${TIME_ZONE}).\nРежим: ${DRY_RUN ? 'DRY_RUN, в канал не публикуется' : 'боевой, публикация после подтверждения'}.\nКанал: ${ARCHIVE_CHANNEL}. Свежее ${MIN_AGE_DAYS} дн. не берется, повтор не раньше чем через ${REPEAT_COOLDOWN_DAYS} дн.\nПоследняя публикация: ${lastPublishedAt ? formatDateRu(lastPublishedAt) : 'с запуска сервера не было'}.${lastRunError ? '\nПоследняя ошибка: ' + lastRunError : ''}`);
+      await botSend(msg.chat.id, `Подборка из архива: ${MONTH_DAY}-го числа каждого месяца в ${WEEKLY_TIME} (${TIME_ZONE}), за прошлый месяц.\nРежим: ${DRY_RUN ? 'DRY_RUN, в канал не публикуется' : 'боевой, публикация после подтверждения'}.\nКанал: ${ARCHIVE_CHANNEL}. Повтор не раньше чем через ${REPEAT_COOLDOWN_DAYS} дн.\nПоследняя публикация: ${lastPublishedAt ? formatDateRu(lastPublishedAt) : 'с запуска сервера не было'}.${lastRunError ? '\nПоследняя ошибка: ' + lastRunError : ''}`);
       return true;
     }
     if (session && session.awaitingLink && !msg.text.startsWith('/')) {
@@ -393,14 +459,14 @@ function createArchivePicker(deps) {
       s.mode = 'preview';
       await answer();
       const label = DRY_RUN ? '[DRY RUN, в канал не уйдет]\n\n' : '';
-      return edit(label + buildDigestText(s.selected), { inline_keyboard: [
+      return edit(label + buildDigestText(s.selected, s.monthLabel), { inline_keyboard: [
         [{ text: DRY_RUN ? 'Отправить мне (DRY RUN)' : 'Опубликовать', callback_data: 'ar:go' }],
         [{ text: 'Изменить выбор', callback_data: 'ar:b' }, { text: 'Отмена', callback_data: 'ar:x' }]
       ] }, { parse_mode: 'HTML' });
     }
     if (kind === 'go') {
       if (s.mode !== 'preview' || s.selected.length !== PICK) return answer('Сначала предпросмотр', true);
-      const text = buildDigestText(s.selected);
+      const text = buildDigestText(s.selected, s.monthLabel);
       const items = s.selected.slice();
       s.mode = 'done';
       await answer(DRY_RUN ? 'DRY RUN' : 'Публикую…');
@@ -432,7 +498,7 @@ function createArchivePicker(deps) {
     const owner = ownerId();
     if (!owner) return;
     const now = zonedNow();
-    if (now.weekday !== WEEKDAY) return;
+    if (Number(now.ymd.slice(8, 10)) !== MONTH_DAY) return;
     const [th, tm] = WEEKLY_TIME.split(':').map(Number);
     const minutesPast = (now.hh * 60 + now.mm) - (th * 60 + tm);
     if (minutesPast < 0 || minutesPast > 60) return;
@@ -444,11 +510,11 @@ function createArchivePicker(deps) {
   function start() {
     if (!ownerId()) { console.log('archive-picker: выключен, нет TELEGRAM_ALLOWED_USER_IDS'); return; }
     setInterval(tick, 60 * 1000);
-    console.log(`archive-picker: включен, ${DRY_RUN ? 'DRY_RUN' : 'боевой режим'}, день ${WEEKDAY}, время ${WEEKLY_TIME} ${TIME_ZONE}`);
+    console.log(`archive-picker: включен, ${DRY_RUN ? 'DRY_RUN' : 'боевой режим'}, число ${MONTH_DAY}, время ${WEEKLY_TIME} ${TIME_ZONE}`);
   }
 
   return { start, handleMessage, handleCallback, _internal: { parseChannelPage, parseCount, pickCandidates, firstLine, buildDigestText, parseOwnLink } };
 }
 
 module.exports = createArchivePicker;
-module.exports._pure = { parseChannelPage, parseCount, pickCandidates, firstLine, buildDigestText, zonedNow, percentileRanks };
+module.exports._pure = { parseChannelPage, parseCount, pickCandidates, firstLine, buildDigestText, zonedNow, percentileRanks, seriesInfo, snippetOf, groupSeries, prevMonthInfo };
