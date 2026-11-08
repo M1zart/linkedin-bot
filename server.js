@@ -2127,6 +2127,8 @@ function pageToRow(p) {
     status: (pr.Status && pr.Status.select && pr.Status.select.name) || null,
     owner: pr.Owner && pr.Owner.number !== undefined ? pr.Owner.number : null,
     link: (pr.Link && pr.Link.url) || null,
+    edited: p.last_edited_time || null,
+    editedBy: (p.last_edited_by && p.last_edited_by.id) || null,
     error: fromRichText(pr.Error && pr.Error.rich_text),
     type: (pr.Type && pr.Type.select && pr.Type.select.name) || null,
     company: fromRichText(pr.Company && pr.Company.rich_text),
@@ -2222,6 +2224,7 @@ async function schedGet(id) {
 }
 
 async function schedUpdate(id, { status, link, error, publishAt, askButton, text }) {
+  if (status) console.log(`schedUpdate: ${id} -> ${status}${publishAt ? ' publishAt=' + publishAt : ''}`);
   const properties = {};
   if (text !== undefined) properties.Text = { rich_text: toRichText(text) };
   if (askButton !== undefined) properties['Кнопка вопроса'] = { checkbox: !!askButton };
@@ -2251,6 +2254,8 @@ async function runScheduledPost(row, { checkStale = true, notify = true } = {}) 
   try {
     // Пост уже вышел в канал (ссылка записана), но запись осталась в очереди: закрываем её, а не объявляем пропущенным
     if (checkStale && row.link) {
+      console.log(`guard: запись ${row.id} со ссылкой ${row.link} стояла в очереди как scheduled; правка в Notion ${row.edited} автор ${row.editedBy}`);
+      await notifyOwner(row, `ℹ️ Этот пост уже вышел в канале (${row.link}), но стоял в очереди как запланированный. Закрыл как опубликованный. Последняя правка записи в Notion: ${row.edited || 'неизвестно'}, автор: ${row.editedBy || 'неизвестно'}.\n\n${shortPreview(row.text)}`);
       await schedUpdate(row.id, { status: 'published', error: '' });
       return { status: 'published', link: row.link };
     }
